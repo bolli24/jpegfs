@@ -1,10 +1,10 @@
-use std::{panic, ptr};
+use std::{panic, ptr, usize};
 
 use anyhow::bail;
 use libc::{c_uchar, c_ulong, c_void, free};
 use mozjpeg_sys::*;
 
-use crate::zigzag::ZigZagExt;
+use crate::{BlockReader, BlockWriter, zigzag::ZigZagExt};
 
 pub struct Block {
 	pub component_index: usize,
@@ -14,44 +14,41 @@ pub struct Block {
 
 pub type BlockData = [i16; 64];
 
-pub fn add_one(jpeg_data: &[u8]) -> anyhow::Result<Vec<u8>> {
-	let mut modified = 0;
-
-	let add = |_: Block, coeffs: &mut BlockData| {
-		for c in coeffs.zigzag_mut().skip(5) {
-			if *c != -1 && *c != 0 && *c != 1 {
-				*c = c.saturating_add(1);
-				modified += 1;
-			}
-		}
-	};
-
-	let result = unsafe { process_jpeg_blocks(jpeg_data, add) };
-
-	println!("Modified {modified} bits");
-	result
-}
-
 pub fn get_capacity(jpeg_data: &[u8]) -> anyhow::Result<usize> {
 	Ok(get_component_capacity(jpeg_data)?.iter().sum())
 }
 
-pub fn get_component_capacity(jpeg_data: &[u8]) -> anyhow::Result<[usize; 3]> {
-	let mut capacity = [0, 0, 0];
+struct CapacityReader {
+	capacities: [usize; 3],
+}
 
-	let non_null_coeefs = |block: Block, coeffs: &BlockData| {
+impl BlockReader for CapacityReader {
+	fn read_block(&mut self, block: Block, coeffs: &BlockData) {
 		for c in coeffs.zigzag().skip(5) {
 			if *c != -1 && *c != 0 && *c != 1 {
-				capacity[block.component_index] += 1;
+				self.capacities[block.component_index] += 1;
 			}
 		}
-	};
+	}
+}
 
+impl Default for CapacityReader {
+	fn default() -> Self {
+		Self { capacities: [0, 0, 0] }
+	}
+}
+
+pub fn get_component_capacity(jpeg_data: &[u8]) -> anyhow::Result<[usize; 3]> {
+	let mut reader = CapacityReader::default();
 	unsafe {
-		read_jpeg_blocks(jpeg_data, non_null_coeefs)?;
+		read_jpeg_blocks(jpeg_data, &mut reader)?;
 	}
 
-	Ok([capacity[0] / 8, capacity[1] / 8, capacity[2] / 8])
+	Ok([
+		reader.capacities[0] / 8,
+		reader.capacities[1] / 8,
+		reader.capacities[2] / 8,
+	])
 }
 
 // JMSG_LENGTH_MAX is typically 200 in libjpeg
@@ -151,9 +148,9 @@ unsafe fn for_each_block_ptr<F>(
 	}
 }
 
-pub unsafe fn process_jpeg_blocks<F>(jpeg_data: &[u8], mut process_block: F) -> anyhow::Result<Vec<u8>>
+pub unsafe fn process_jpeg_blocks<W>(jpeg_data: &[u8], writer: &mut W) -> anyhow::Result<Vec<u8>>
 where
-	F: FnMut(Block, &mut BlockData),
+	W: BlockWriter,
 {
 	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
 		let mut err: jpeg_error_mgr = std::mem::zeroed();
@@ -196,7 +193,7 @@ where
 				}
 
 				for_each_block_ptr(srcinfo, coef_arrays, true, |block, block_ptr| {
-					process_block(block, &mut *block_ptr);
+					writer.write_block(block, &mut *block_ptr);
 				});
 
 				jpeg_finish_compress(&mut dstinfo);
@@ -213,9 +210,9 @@ where
 	handle_jpeg_panic(result)
 }
 
-pub unsafe fn read_jpeg_blocks<F>(jpeg_data: &[u8], mut process_block: F) -> anyhow::Result<()>
+pub unsafe fn read_jpeg_blocks<R>(jpeg_data: &[u8], reader: &mut R) -> anyhow::Result<()>
 where
-	F: FnMut(Block, &BlockData),
+	R: BlockReader,
 {
 	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
 		let mut err: jpeg_error_mgr = std::mem::zeroed();
@@ -233,7 +230,7 @@ where
 				}
 
 				for_each_block_ptr(srcinfo, coef_arrays, false, |block, block_ptr| {
-					process_block(block, &*block_ptr);
+					reader.read_block(block, &*block_ptr);
 				});
 			},
 		);

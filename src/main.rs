@@ -32,28 +32,36 @@ fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
-pub fn init_file(path: &Path) -> anyhow::Result<FileInfo> {
+pub trait BlockWriter {
+	fn write_block(&mut self, block: Block, coeffs: &mut BlockData);
+}
+
+pub trait BlockReader {
+	fn read_block(&mut self, block: Block, coeffs: &BlockData);
+}
+
+pub fn init_file(path: &Path) -> anyhow::Result<FileHandle> {
 	let mut file = File::open(path).context("Error opening input file.")?;
 
-	let content = FileInfo::read_all_from_file(&mut file)?;
+	let content = FileHandle::read_all_from_file(&mut file)?;
 	let capacity = get_capacity(&content).context("Error getting capacity.")?;
 	println!("Opened file '{}' capacity: {}", path.display(), capacity);
 
-	Ok(FileInfo {
+	Ok(FileHandle {
 		file,
 		path: path.to_owned(),
 		capacity,
 	})
 }
 
-pub struct FileInfo {
+pub struct FileHandle {
 	file: File,
 	path: PathBuf,
 	capacity: usize,
 }
 
 fn set_lsb(coeff: i16, bit: u8) -> i16 {
-	let is_skipped = |c: i16| matches!(c, -1 | 0 | 1);
+	let is_skipped = |c: i16| matches!(c, -1..=1);
 	let target = (bit & 1) as i16;
 	let current = coeff & 1;
 
@@ -82,7 +90,74 @@ fn get_lsb(coeff: i16) -> u8 {
 	(coeff & 1) as u8
 }
 
-impl FileInfo {
+pub struct LsbReader {
+	data_bits: BitWriter,
+	remaining: usize,
+}
+
+impl LsbReader {
+	pub fn new(len: usize) -> Self {
+		Self {
+			data_bits: BitWriter::new(),
+			remaining: len * 8,
+		}
+	}
+
+	pub fn finish(self) -> Vec<u8> {
+		self.data_bits.finish()
+	}
+}
+
+impl BlockReader for LsbReader {
+	fn read_block(&mut self, _block: Block, coeffs: &BlockData) {
+		for c in coeffs.zigzag().skip(5) {
+			if self.remaining == 0 {
+				break;
+			}
+			if *c != -1 && *c != 0 && *c != 1 {
+				self.data_bits.write_bit(get_lsb(*c));
+				self.remaining -= 1;
+			}
+		}
+	}
+}
+
+pub struct LsbWriter<'a> {
+	data_bits: BitReader<'a>,
+	done: bool,
+}
+
+impl<'a> LsbWriter<'a> {
+	pub fn new(data: &'a [u8]) -> Self {
+		Self {
+			data_bits: BitReader::new(data),
+			done: false,
+		}
+	}
+}
+
+impl BlockWriter for LsbWriter<'_> {
+	fn write_block(&mut self, _block: Block, coeffs: &mut BlockData) {
+		if self.done {
+			return;
+		}
+
+		for c in coeffs.zigzag_mut().skip(5) {
+			if *c == -1 || *c == 0 || *c == 1 {
+				continue;
+			}
+
+			if let Some(bit) = self.data_bits.read_bit() {
+				*c = set_lsb(*c, bit);
+			} else {
+				self.done = true;
+				break;
+			}
+		}
+	}
+}
+
+impl FileHandle {
 	fn read_all_from_file(file: &mut File) -> anyhow::Result<Vec<u8>> {
 		file.rewind().context("Error rewinding input file")?;
 		let mut content = Vec::<u8>::new();
@@ -94,7 +169,7 @@ impl FileInfo {
 		Self::read_all_from_file(&mut self.file)
 	}
 
-	pub fn copy_to(&self, target_path: &Path) -> anyhow::Result<FileInfo> {
+	pub fn copy_to(&self, target_path: &Path) -> anyhow::Result<FileHandle> {
 		fs::copy(&self.path, target_path).with_context(|| {
 			format!(
 				"Error copying '{}' to '{}'.",
@@ -114,31 +189,11 @@ impl FileInfo {
 			);
 		}
 
-		let mut data_bits = BitReader::new(data);
-		let mut done = false;
-
-		let set_data_bits = |_: Block, coeffs: &mut BlockData| {
-			if done {
-				return;
-			}
-
-			for c in coeffs.zigzag_mut().skip(5) {
-				if *c == -1 || *c == 0 || *c == 1 {
-					continue;
-				}
-
-				if let Some(bit) = data_bits.read_bit() {
-					*c = set_lsb(*c, bit);
-				} else {
-					done = true;
-					break;
-				}
-			}
-		};
+		let mut writer = LsbWriter::new(data);
 
 		let input_jpeg = self.read_all()?;
 
-		let output_jpeg = unsafe { process_jpeg_blocks(&input_jpeg, set_data_bits)? };
+		let output_jpeg = unsafe { process_jpeg_blocks(&input_jpeg, &mut writer)? };
 
 		let mut output_file =
 			File::create(&self.path).with_context(|| format!("Error creating '{}'.", self.path.display()))?;
@@ -161,26 +216,13 @@ impl FileInfo {
 			);
 		}
 
-		let mut data_bits = BitWriter::new();
-		let mut remaining = len * 8;
-
-		let get_data_bits = |_: Block, coeffs: &BlockData| {
-			for c in coeffs.zigzag().skip(5) {
-				if remaining == 0 {
-					break;
-				}
-				if *c != -1 && *c != 0 && *c != 1 {
-					data_bits.write_bit(get_lsb(*c));
-					remaining -= 1;
-				}
-			}
-		};
+		let mut reader = LsbReader::new(len);
 
 		let input_jpeg = self.read_all()?;
 
-		unsafe { read_jpeg_blocks(&input_jpeg, get_data_bits)? };
+		unsafe { read_jpeg_blocks(&input_jpeg, &mut reader)? };
 
-		Ok(data_bits.finish())
+		Ok(reader.finish())
 	}
 }
 

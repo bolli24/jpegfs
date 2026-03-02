@@ -1,4 +1,4 @@
-use std::{panic, ptr, usize};
+use std::{panic, ptr};
 
 use anyhow::bail;
 use libc::{c_uchar, c_ulong, c_void, free};
@@ -18,8 +18,9 @@ pub fn get_capacity(jpeg_data: &[u8]) -> anyhow::Result<usize> {
 	Ok(get_component_capacity(jpeg_data)?.iter().sum())
 }
 
-struct CapacityReader {
-	capacities: [usize; 3],
+#[derive(Default, Debug)]
+pub struct CapacityReader {
+	pub capacities: [usize; 3],
 }
 
 impl BlockReader for CapacityReader {
@@ -29,12 +30,6 @@ impl BlockReader for CapacityReader {
 				self.capacities[block.component_index] += 1;
 			}
 		}
-	}
-}
-
-impl Default for CapacityReader {
-	fn default() -> Self {
-		Self { capacities: [0, 0, 0] }
 	}
 }
 

@@ -1,290 +1,304 @@
 #![allow(unsafe_op_in_unsafe_fn, dead_code)]
 
-use std::io::Write;
-use std::{fs::File, io::Read};
-use std::{panic, ptr};
-
-use libc::{c_uchar, c_ulong, c_void, free};
-use mozjpeg_sys::*;
+use std::io::{Seek, Write};
+use std::path::{Path, PathBuf};
+use std::{fs, fs::File, io::Read};
 
 use anyhow::{Context, bail};
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
+use serde::{Deserialize, Serialize};
 use sha256::digest;
 
+use crate::jpeg::{Block, BlockData, get_capacity, process_jpeg_blocks, read_jpeg_blocks};
 use crate::zigzag::ZigZagExt;
 
+pub mod jpeg;
 pub mod zigzag;
 
 const INPUT_PATH: &str = "./test/CRW_2614_(Elsterflutbecken).jpg";
 const OUTPUT_PATH: &str = "./test/output.jpg";
 
 fn main() -> anyhow::Result<()> {
-	let mut file = File::open(INPUT_PATH).context("Error opening input file.")?;
-	let mut content = Vec::<u8>::new();
-	file.read_to_end(&mut content).context("Error reading input file.")?;
+	let file_info = init_file(PathBuf::from(INPUT_PATH).as_path())?;
+	let mut output_file_info = file_info.copy_to(PathBuf::from(OUTPUT_PATH).as_path())?;
+	let data = vec![1, 2, 3, 4];
+	output_file_info.write_data(&data)?;
 
-	println!("Read '{}': {}KiB", INPUT_PATH, content.len() / 1024);
-	println!("SHA256: {}", digest(&content));
-	let capacity = get_capacity(&content).context("Error getting capacity.")?;
-	println!("Capacity: {} KiB", capacity / 1024);
+	let read_data = output_file_info.read_data(data.len())?;
 
-	let modified_content = add_one(&content)?;
-
-	let mut modified = File::create(OUTPUT_PATH).context("Error creating output file.")?;
-	modified
-		.write_all(&modified_content)
-		.context("Error writing output file.")?;
-
-	println!("Wrote '{}': {}KiB", OUTPUT_PATH, modified_content.len() / 1024);
-	println!("SHA256: {}", digest(modified_content));
+	println!("Read data: {read_data:?}");
 
 	Ok(())
 }
 
-pub fn add_one(jpeg_data: &[u8]) -> anyhow::Result<Vec<u8>> {
-	let mut modified = 0;
+pub fn init_file(path: &Path) -> anyhow::Result<FileInfo> {
+	let mut file = File::open(path).context("Error opening input file.")?;
 
-	let add = |_: Block, coeffs: &mut BlockData| {
-		for c in coeffs.zigzag_mut().skip(5) {
-			if *c != -1 && *c != 0 && *c != 1 {
-				*c = c.saturating_add(1);
-				modified += 1;
-			}
-		}
-	};
+	let content = FileInfo::read_all_from_file(&mut file)?;
+	let capacity = get_capacity(&content).context("Error getting capacity.")?;
+	println!("Opened file '{}' capacity: {}", path.display(), capacity);
 
-	let result = unsafe { process_jpeg_blocks(jpeg_data, add) };
-
-	println!("Modified {modified} bits");
-	result
+	Ok(FileInfo {
+		file,
+		path: path.to_owned(),
+		capacity,
+	})
 }
 
-pub fn get_capacity(jpeg_data: &[u8]) -> anyhow::Result<usize> {
-	Ok(get_component_capacity(jpeg_data)?.iter().sum())
+pub struct FileInfo {
+	file: File,
+	path: PathBuf,
+	capacity: usize,
 }
 
-pub fn get_component_capacity(jpeg_data: &[u8]) -> anyhow::Result<[usize; 3]> {
-	let mut capacity = [0, 0, 0];
+fn set_lsb(coeff: i16, bit: u8) -> i16 {
+	let is_skipped = |c: i16| matches!(c, -1 | 0 | 1);
+	let target = (bit & 1) as i16;
+	let current = coeff & 1;
 
-	let non_null_coeefs = |block: Block, coeffs: &BlockData| {
-		for c in coeffs.zigzag().skip(5) {
-			if *c != -1 && *c != 0 && *c != 1 {
-				capacity[block.component_index] += 1;
-			}
-		}
-	};
-
-	unsafe {
-		read_jpeg_blocks(jpeg_data, non_null_coeefs)?;
+	if current == target && !is_skipped(coeff) {
+		return coeff;
 	}
 
-	Ok([capacity[0] / 8, capacity[1] / 8, capacity[2] / 8])
-}
+	let down = coeff.checked_sub(1).filter(|c| !is_skipped(*c) && ((*c & 1) == target));
+	let up = coeff.checked_add(1).filter(|c| !is_skipped(*c) && ((*c & 1) == target));
 
-pub struct Block {
-	pub component_index: usize,
-	pub row: usize,
-	pub column: usize,
-}
-
-pub type BlockData = [i16; 64];
-
-// JMSG_LENGTH_MAX is typically 200 in libjpeg
-const JMSG_LENGTH_MAX: usize = 200;
-
-extern "C-unwind" fn custom_error_exit(cinfo: &mut jpeg_common_struct) {
-	unsafe {
-		let err = cinfo.err;
-		let msg_code = (*err).msg_code;
-
-		// mozjpeg-sys strictly expects an 80-byte array here
-		let mut buffer: [u8; 80] = [0; 80];
-
-		// Pass the references directly; no raw pointer casting needed
-		((*err).format_message.unwrap())(cinfo, &mut buffer);
-
-		// Find the C-string null terminator to avoid printing trailing zeros
-		let null_pos = buffer.iter().position(|&b| b == 0).unwrap_or(80);
-		let error_msg = String::from_utf8_lossy(&buffer[..null_pos]).into_owned();
-
-		panic!("libjpeg error {}: {}", msg_code, error_msg);
-	}
-}
-
-fn handle_jpeg_panic<T>(result: std::thread::Result<T>) -> anyhow::Result<T> {
-	match result {
-		Ok(value) => Ok(value),
-		Err(err) => {
-			if let Some(msg) = err.downcast_ref::<String>() {
-				bail!(msg.clone());
-			} else if let Some(msg) = err.downcast_ref::<&str>() {
-				bail!(msg.to_string());
+	match (down, up) {
+		(Some(d), Some(u)) => {
+			if (u as i32).abs() < (d as i32).abs() {
+				u
 			} else {
-				bail!("Unknown libjpeg panic occurred");
+				d
 			}
 		}
+		(Some(d), None) => d,
+		(None, Some(u)) => u,
+		(None, None) => unreachable!("set_lsb called with a skipped coefficient"),
 	}
 }
 
-unsafe fn with_decompressor<T, C, F>(jpeg_data: &[u8], err: &mut jpeg_error_mgr, mut configure: C, mut body: F) -> T
-where
-	C: FnMut(&mut jpeg_decompress_struct),
-	F: FnMut(&mut jpeg_decompress_struct, *mut *mut jvirt_barray_control) -> T,
-{
-	let mut srcinfo: jpeg_decompress_struct = std::mem::zeroed();
-	srcinfo.common.err = err;
-	jpeg_create_decompress(&mut srcinfo);
-
-	jpeg_mem_src(&mut srcinfo, jpeg_data.as_ptr(), jpeg_data.len() as c_ulong);
-	configure(&mut srcinfo);
-	jpeg_read_header(&mut srcinfo, 1);
-
-	let coef_arrays = jpeg_read_coefficients(&mut srcinfo);
-	let output = body(&mut srcinfo, coef_arrays);
-
-	jpeg_finish_decompress(&mut srcinfo);
-	jpeg_destroy_decompress(&mut srcinfo);
-
-	output
+fn get_lsb(coeff: i16) -> u8 {
+	(coeff & 1) as u8
 }
 
-unsafe fn for_each_block_ptr<F>(
-	srcinfo: &mut jpeg_decompress_struct,
-	coef_arrays: *mut *mut jvirt_barray_control,
-	writable: bool,
-	mut visit: F,
-) where
-	F: FnMut(Block, *mut BlockData),
-{
-	for comp_idx in 0..srcinfo.num_components {
-		let comp_info = srcinfo.comp_info.add(comp_idx as usize);
-		let height_in_blocks = (*comp_info).height_in_blocks;
-		let width_in_blocks = (*comp_info).width_in_blocks;
-		let comp_coef_array = *coef_arrays.add(comp_idx as usize);
+impl FileInfo {
+	fn read_all_from_file(file: &mut File) -> anyhow::Result<Vec<u8>> {
+		file.rewind().context("Error rewinding input file")?;
+		let mut content = Vec::<u8>::new();
+		file.read_to_end(&mut content).context("Error reading input file")?;
+		Ok(content)
+	}
 
-		for row in 0..height_in_blocks {
-			let block_row = (*srcinfo.common.mem).access_virt_barray.unwrap()(
-				&mut srcinfo.common,
-				comp_coef_array,
-				row,
-				1,
-				if writable { 1 } else { 0 },
+	fn read_all(&mut self) -> anyhow::Result<Vec<u8>> {
+		Self::read_all_from_file(&mut self.file)
+	}
+
+	pub fn copy_to(&self, target_path: &Path) -> anyhow::Result<FileInfo> {
+		fs::copy(&self.path, target_path).with_context(|| {
+			format!(
+				"Error copying '{}' to '{}'.",
+				self.path.display(),
+				target_path.display()
+			)
+		})?;
+		init_file(target_path)
+	}
+
+	pub fn write_data(&mut self, data: &[u8]) -> anyhow::Result<()> {
+		if data.len() > self.capacity {
+			bail!(
+				"Not enough capacity to write {} KiB. Only {} KiB available.",
+				data.len() / 1024,
+				self.capacity / 1024
 			);
-
-			for col in 0..width_in_blocks {
-				let block_ptr = (*block_row).add(col as usize);
-				visit(
-					Block {
-						component_index: comp_idx as usize,
-						row: row as usize,
-						column: col as usize,
-					},
-					block_ptr,
-				);
-			}
 		}
+
+		let mut data_bits = BitReader::new(data);
+		let mut done = false;
+
+		let set_data_bits = |_: Block, coeffs: &mut BlockData| {
+			if done {
+				return;
+			}
+
+			for c in coeffs.zigzag_mut().skip(5) {
+				if *c == -1 || *c == 0 || *c == 1 {
+					continue;
+				}
+
+				if let Some(bit) = data_bits.read_bit() {
+					*c = set_lsb(*c, bit);
+				} else {
+					done = true;
+					break;
+				}
+			}
+		};
+
+		let input_jpeg = self.read_all()?;
+
+		let output_jpeg = unsafe { process_jpeg_blocks(&input_jpeg, set_data_bits)? };
+
+		let mut output_file =
+			File::create(&self.path).with_context(|| format!("Error creating '{}'.", self.path.display()))?;
+		output_file
+			.write_all(&output_jpeg)
+			.context("Error writing output file.")?;
+
+		println!("Wrote '{}': {}KiB", self.path.display(), output_jpeg.len() / 1024);
+		println!("SHA256: {}", digest(output_jpeg));
+
+		Ok(())
+	}
+
+	pub fn read_data(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
+		if len > self.capacity {
+			bail!(
+				"Requested {} KiB exceeds available capacity of {} KiB.",
+				len / 1024,
+				self.capacity / 1024
+			);
+		}
+
+		let mut data_bits = BitWriter::new();
+		let mut remaining = len * 8;
+
+		let get_data_bits = |_: Block, coeffs: &BlockData| {
+			for c in coeffs.zigzag().skip(5) {
+				if remaining == 0 {
+					break;
+				}
+				if *c != -1 && *c != 0 && *c != 1 {
+					data_bits.write_bit(get_lsb(*c));
+					remaining -= 1;
+				}
+			}
+		};
+
+		let input_jpeg = self.read_all()?;
+
+		unsafe { read_jpeg_blocks(&input_jpeg, get_data_bits)? };
+
+		Ok(data_bits.finish())
 	}
 }
 
-pub unsafe fn process_jpeg_blocks<F>(jpeg_data: &[u8], mut process_block: F) -> anyhow::Result<Vec<u8>>
-where
-	F: FnMut(Block, &mut BlockData),
-{
-	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-		let mut err: jpeg_error_mgr = std::mem::zeroed();
-		jpeg_std_error(&mut err);
+pub fn rng_from_passphrase(passphrase: &str, salt: &[u8]) -> anyhow::Result<ChaCha20Rng> {
+	let params = argon2::Params::new(
+		19 * 1024, // m_cost in KiB (19 MiB)
+		2,         // t_cost iterations
+		1,         // p_cost parallelism
+		Some(32),  // output length (seed size)
+	)
+	.expect("valid params");
 
-		// 1. Override the fatal error exit function
-		err.error_exit = Some(custom_error_exit);
+	let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-		with_decompressor(
-			jpeg_data,
-			&mut err,
-			|srcinfo| {
-				// Save the COM (Comment) marker
-				jpeg_save_markers(srcinfo, 0xFE, 0xFFFF);
-				// Save all APP0 through APP15 markers (0xE0 to 0xEF)
-				for m in 0..16 {
-					jpeg_save_markers(srcinfo, 0xE0 + m, 0xFFFF);
-				}
-			},
-			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
-				// 3. Setup Destination (Compressor)
-				let mut dstinfo: jpeg_compress_struct = std::mem::zeroed();
+	let mut seed = [0u8; 32];
+	argon2
+		.hash_password_into(passphrase.as_bytes(), salt, &mut seed)
+		.context("Argon2 failed")?;
 
-				dstinfo.common.err = srcinfo.common.err;
-				jpeg_create_compress(&mut dstinfo);
-
-				// Setup output buffer for the new JPEG
-				let mut out_buffer: *mut c_uchar = ptr::null_mut();
-				let mut out_size: c_ulong = 0;
-
-				jpeg_mem_dest(&mut dstinfo, &mut out_buffer, &mut out_size);
-
-				// Copy tables and parameters to prevent re-quantization
-				jpeg_copy_critical_parameters(srcinfo, &mut dstinfo);
-
-				// Start the compressor and link the arrays.
-				// This writes the SOI marker and readies the writing of data.
-				jpeg_write_coefficients(&mut dstinfo, coef_arrays);
-
-				// Walk the linked list of saved markers and write them to the compressor
-				// in order to preserve the input image's metadata
-				let mut marker = srcinfo.marker_list;
-				while !marker.is_null() {
-					jpeg_write_marker(
-						&mut dstinfo,
-						(*marker).marker as libc::c_int,
-						(*marker).data,
-						(*marker).data_length,
-					);
-					marker = (*marker).next;
-				}
-
-				for_each_block_ptr(srcinfo, coef_arrays, true, |block, block_ptr| {
-					process_block(block, &mut *block_ptr);
-				});
-
-				jpeg_finish_compress(&mut dstinfo);
-				jpeg_destroy_compress(&mut dstinfo);
-
-				// Copy the C-allocated buffer to a Rust Vec, then free the C buffer
-				let result_vec = std::slice::from_raw_parts(out_buffer, out_size as usize).to_vec();
-				free(out_buffer as *mut c_void);
-
-				result_vec
-			},
-		)
-	}));
-
-	handle_jpeg_panic(result)
+	Ok(ChaCha20Rng::from_seed(seed))
 }
 
-pub unsafe fn read_jpeg_blocks<F>(jpeg_data: &[u8], mut process_block: F) -> anyhow::Result<()>
-where
-	F: FnMut(Block, &BlockData),
-{
-	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-		let mut err: jpeg_error_mgr = std::mem::zeroed();
-		jpeg_std_error(&mut err);
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct Header {
+	id: u32,
+	capacity: usize,
+}
 
-		// 1. Override the fatal error exit function
-		err.error_exit = Some(custom_error_exit);
+struct BitReader<'a> {
+	data: &'a [u8],
+	byte_pos: usize,
+	bit_pos: u8,
+}
 
-		with_decompressor(
-			jpeg_data,
-			&mut err,
-			|_| {},
-			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
-				if srcinfo.num_components != 3 {
-					panic!("Only 3-component JPEGs are supported, found {}", srcinfo.num_components);
-				}
+impl<'a> BitReader<'a> {
+	fn new(data: &'a [u8]) -> Self {
+		Self {
+			data,
+			byte_pos: 0,
+			bit_pos: 0,
+		}
+	}
 
-				for_each_block_ptr(srcinfo, coef_arrays, false, |block, block_ptr| {
-					process_block(block, &*block_ptr);
-				});
-			},
-		);
-	}));
+	fn read_bit(&mut self) -> Option<u8> {
+		if self.byte_pos >= self.data.len() {
+			return None;
+		}
 
-	handle_jpeg_panic(result)
+		let byte = self.data[self.byte_pos];
+		let bit = (byte >> (7 - self.bit_pos)) & 1;
+
+		self.bit_pos += 1;
+		if self.bit_pos == 8 {
+			self.bit_pos = 0;
+			self.byte_pos += 1;
+		}
+
+		Some(bit)
+	}
+}
+
+pub struct BitWriter {
+	out: Vec<u8>,
+	cur: u8,   // current byte being built
+	nbits: u8, // number of bits currently in `cur` (0..=7)
+}
+
+impl BitWriter {
+	pub fn new() -> Self {
+		Self {
+			out: Vec::new(),
+			cur: 0,
+			nbits: 0,
+		}
+	}
+
+	pub fn with_capacity(cap: usize) -> Self {
+		Self {
+			out: Vec::with_capacity(cap),
+			cur: 0,
+			nbits: 0,
+		}
+	}
+
+	/// Write a single bit (0 or 1). Bits are packed MSB-first within each byte.
+	pub fn write_bit(&mut self, bit: u8) {
+		self.cur = (self.cur << 1) | (bit & 1);
+		self.nbits += 1;
+
+		if self.nbits == 8 {
+			self.out.push(self.cur);
+			self.cur = 0;
+			self.nbits = 0;
+		}
+	}
+
+	/// Flush remaining bits to the output, padding the last byte with zeros on the right.
+	pub fn finish(mut self) -> Vec<u8> {
+		if self.nbits != 0 {
+			self.cur <<= 8 - self.nbits;
+			self.out.push(self.cur);
+			self.cur = 0;
+			self.nbits = 0;
+		}
+		self.out
+	}
+
+	pub fn as_bytes(&self) -> &[u8] {
+		&self.out
+	}
+
+	pub fn into_inner(self) -> Vec<u8> {
+		self.finish()
+	}
+}
+
+impl Default for BitWriter {
+	fn default() -> Self {
+		Self::new()
+	}
 }

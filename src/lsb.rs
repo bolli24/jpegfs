@@ -1,8 +1,6 @@
-use crate::jpeg::{Block, BlockData};
-use crate::zigzag::ZigZagExt;
-use crate::{BlockReader, BlockWriter};
+use crate::zigzag::ZIGZAG_INDICES;
 
-fn set_lsb(coeff: i16, bit: u8) -> i16 {
+pub fn set_lsb(coeff: i16, bit: u8) -> i16 {
 	let is_skipped = |c: i16| matches!(c, -1..=1);
 	let target = (bit & 1) as i16;
 	let current = coeff & 1;
@@ -28,143 +26,45 @@ fn set_lsb(coeff: i16, bit: u8) -> i16 {
 	}
 }
 
-fn get_lsb(coeff: i16) -> u8 {
+pub fn get_lsb(coeff: i16) -> u8 {
 	(coeff & 1) as u8
 }
 
-pub struct LsbReader {
-	data_bits: BitWriter,
-	remaining: usize,
+pub fn is_embeddable_coeff(coeff: i16) -> bool {
+	!matches!(coeff, -1..=1)
 }
 
-impl LsbReader {
-	pub fn new(len: usize) -> Self {
-		Self {
-			data_bits: BitWriter::new(),
-			remaining: len * 8,
-		}
+pub fn block_capacity_bits(coeffs: &[i16; 64]) -> usize {
+	ZIGZAG_INDICES
+		.iter()
+		.skip(5)
+		.filter(|&&idx| is_embeddable_coeff(coeffs[idx]))
+		.count()
+}
+
+pub fn read_bit_from_bytes(data: &[u8], bit_index: usize) -> Option<u8> {
+	let byte_index = bit_index / 8;
+	if byte_index >= data.len() {
+		return None;
 	}
-
-	pub fn finish(self) -> Vec<u8> {
-		self.data_bits.finish()
-	}
+	let bit_in_byte = (bit_index % 8) as u8;
+	Some((data[byte_index] >> (7 - bit_in_byte)) & 1)
 }
 
-impl BlockReader for LsbReader {
-	fn read_block(&mut self, _block: Block, coeffs: &BlockData) {
-		for c in coeffs.zigzag().skip(5) {
-			if self.remaining == 0 {
-				break;
-			}
-			if *c != -1 && *c != 0 && *c != 1 {
-				self.data_bits.write_bit(get_lsb(*c));
-				self.remaining -= 1;
-			}
-		}
-	}
-}
-
-pub struct LsbWriter<'a> {
-	data_bits: BitReader<'a>,
-	done: bool,
-}
-
-impl<'a> LsbWriter<'a> {
-	pub fn new(data: &'a [u8]) -> Self {
-		Self {
-			data_bits: BitReader::new(data),
-			done: false,
-		}
+pub fn write_bit_to_bytes(data: &mut [u8], bit_index: usize, bit: u8) {
+	let byte_index = bit_index / 8;
+	let bit_in_byte = (bit_index % 8) as u8;
+	let mask = 1u8 << (7 - bit_in_byte);
+	if (bit & 1) == 1 {
+		data[byte_index] |= mask;
+	} else {
+		data[byte_index] &= !mask;
 	}
 }
 
-impl BlockWriter for LsbWriter<'_> {
-	fn write_block(&mut self, _block: Block, coeffs: &mut BlockData) {
-		if self.done {
-			return;
-		}
-
-		for c in coeffs.zigzag_mut().skip(5) {
-			if *c == -1 || *c == 0 || *c == 1 {
-				continue;
-			}
-
-			if let Some(bit) = self.data_bits.read_bit() {
-				*c = set_lsb(*c, bit);
-			} else {
-				self.done = true;
-				break;
-			}
-		}
+pub fn ensure_byte_aligned(bit_offset: usize) -> anyhow::Result<()> {
+	if !bit_offset.is_multiple_of(8) {
+		anyhow::bail!("Bit offset {} is not byte-aligned.", bit_offset);
 	}
-}
-
-struct BitReader<'a> {
-	data: &'a [u8],
-	byte_pos: usize,
-	bit_pos: u8,
-}
-
-impl<'a> BitReader<'a> {
-	fn new(data: &'a [u8]) -> Self {
-		Self {
-			data,
-			byte_pos: 0,
-			bit_pos: 0,
-		}
-	}
-
-	fn read_bit(&mut self) -> Option<u8> {
-		if self.byte_pos >= self.data.len() {
-			return None;
-		}
-
-		let byte = self.data[self.byte_pos];
-		let bit = (byte >> (7 - self.bit_pos)) & 1;
-
-		self.bit_pos += 1;
-		if self.bit_pos == 8 {
-			self.bit_pos = 0;
-			self.byte_pos += 1;
-		}
-
-		Some(bit)
-	}
-}
-
-struct BitWriter {
-	out: Vec<u8>,
-	cur: u8,
-	nbits: u8,
-}
-
-impl BitWriter {
-	fn new() -> Self {
-		Self {
-			out: Vec::new(),
-			cur: 0,
-			nbits: 0,
-		}
-	}
-
-	fn write_bit(&mut self, bit: u8) {
-		self.cur = (self.cur << 1) | (bit & 1);
-		self.nbits += 1;
-
-		if self.nbits == 8 {
-			self.out.push(self.cur);
-			self.cur = 0;
-			self.nbits = 0;
-		}
-	}
-
-	fn finish(mut self) -> Vec<u8> {
-		if self.nbits != 0 {
-			self.cur <<= 8 - self.nbits;
-			self.out.push(self.cur);
-			self.cur = 0;
-			self.nbits = 0;
-		}
-		self.out
-	}
+	Ok(())
 }

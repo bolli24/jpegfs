@@ -1,49 +1,226 @@
 use std::{panic, ptr};
 
 use anyhow::bail;
+use arbitrary::{Arbitrary, Unstructured};
 use libc::{c_uchar, c_ulong, c_void, free};
 use mozjpeg_sys::*;
 
-use crate::{BlockReader, BlockWriter, zigzag::ZigZagExt};
-
-pub struct Block {
-	pub component_index: usize,
-	pub row: usize,
-	pub column: usize,
-}
+use crate::lsb::block_capacity_bits;
 
 pub type BlockData = [i16; 64];
 
-pub fn get_capacity(jpeg_data: &[u8]) -> anyhow::Result<usize> {
-	Ok(get_component_capacity(jpeg_data)?.iter().sum())
+#[derive(Clone, Debug)]
+pub struct OwnedComponent {
+	pub width_in_blocks: usize,
+	pub height_in_blocks: usize,
+	pub blocks: Vec<BlockData>,
 }
 
-#[derive(Default, Debug)]
-pub struct CapacityReader {
-	pub capacities: [usize; 3],
-}
-
-impl BlockReader for CapacityReader {
-	fn read_block(&mut self, block: Block, coeffs: &BlockData) {
-		for c in coeffs.zigzag().skip(5) {
-			if *c != -1 && *c != 0 && *c != 1 {
-				self.capacities[block.component_index] += 1;
-			}
-		}
+impl OwnedComponent {
+	fn index(&self, row: usize, column: usize) -> usize {
+		row * self.width_in_blocks + column
 	}
+}
+
+#[derive(Clone, Debug)]
+pub struct OwnedJpeg {
+	pub components: [OwnedComponent; 3],
+}
+
+impl<'a> Arbitrary<'a> for OwnedComponent {
+	fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+		let width_in_blocks = usize::from(u.int_in_range::<u8>(1..=8)?);
+		let height_in_blocks = usize::from(u.int_in_range::<u8>(1..=8)?);
+		let block_count = width_in_blocks * height_in_blocks;
+		let mut blocks = Vec::with_capacity(block_count);
+		for _ in 0..block_count {
+			blocks.push(<BlockData as Arbitrary>::arbitrary(u)?);
+		}
+		Ok(Self {
+			width_in_blocks,
+			height_in_blocks,
+			blocks,
+		})
+	}
+}
+
+impl<'a> Arbitrary<'a> for OwnedJpeg {
+	fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+		Ok(Self {
+			components: [
+				OwnedComponent::arbitrary(u)?,
+				OwnedComponent::arbitrary(u)?,
+				OwnedComponent::arbitrary(u)?,
+			],
+		})
+	}
+}
+
+impl OwnedJpeg {
+	pub fn capacity(&self) -> usize {
+		let total_bits = self
+			.components
+			.iter()
+			.flat_map(|component| component.blocks.iter())
+			.map(block_capacity_bits)
+			.sum::<usize>();
+		total_bits / 8
+	}
+
+	pub fn component_capacity(&self) -> [usize; 3] {
+		let mut component_bits = [0usize; 3];
+		for (idx, component) in self.components.iter().enumerate() {
+			component_bits[idx] = component.blocks.iter().map(block_capacity_bits).sum::<usize>() / 8;
+		}
+		component_bits
+	}
+}
+
+pub fn get_capacity(jpeg_data: &[u8]) -> anyhow::Result<usize> {
+	let owned = unsafe { read_owned_jpeg(jpeg_data)? };
+	Ok(owned.capacity())
 }
 
 pub fn get_component_capacity(jpeg_data: &[u8]) -> anyhow::Result<[usize; 3]> {
-	let mut reader = CapacityReader::default();
-	unsafe {
-		read_jpeg_blocks(jpeg_data, &mut reader)?;
-	}
+	let owned = unsafe { read_owned_jpeg(jpeg_data)? };
+	Ok(owned.component_capacity())
+}
 
-	Ok([
-		reader.capacities[0] / 8,
-		reader.capacities[1] / 8,
-		reader.capacities[2] / 8,
-	])
+pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> anyhow::Result<OwnedJpeg> {
+	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+		let mut err: jpeg_error_mgr = std::mem::zeroed();
+		jpeg_std_error(&mut err);
+		err.error_exit = Some(custom_error_exit);
+
+		with_decompressor(
+			jpeg_data,
+			&mut err,
+			|_| {},
+			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
+				if srcinfo.num_components != 3 {
+					panic!("Only 3-component JPEGs are supported, found {}", srcinfo.num_components);
+				}
+
+				let mut components = std::array::from_fn(|comp_idx| {
+					let comp_info = srcinfo.comp_info.add(comp_idx);
+					let width_in_blocks = (*comp_info).width_in_blocks as usize;
+					let height_in_blocks = (*comp_info).height_in_blocks as usize;
+					OwnedComponent {
+						width_in_blocks,
+						height_in_blocks,
+						blocks: vec![[0; 64]; width_in_blocks * height_in_blocks],
+					}
+				});
+
+				for_each_block_ptr(
+					srcinfo,
+					coef_arrays,
+					false,
+					|component_index, row, column, block_ptr| {
+						let component = &mut components[component_index];
+						let idx = component.index(row, column);
+						component.blocks[idx] = *block_ptr;
+					},
+				);
+
+				OwnedJpeg { components }
+			},
+		)
+	}));
+
+	handle_jpeg_panic(result)
+}
+
+pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> anyhow::Result<Vec<u8>> {
+	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+		let mut err: jpeg_error_mgr = std::mem::zeroed();
+		jpeg_std_error(&mut err);
+		err.error_exit = Some(custom_error_exit);
+
+		with_decompressor(
+			template_jpeg,
+			&mut err,
+			|srcinfo| {
+				jpeg_save_markers(srcinfo, 0xFE, 0xFFFF);
+				for m in 0..16 {
+					jpeg_save_markers(srcinfo, 0xE0 + m, 0xFFFF);
+				}
+			},
+			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
+				if srcinfo.num_components != 3 {
+					panic!("Only 3-component JPEGs are supported, found {}", srcinfo.num_components);
+				}
+
+				for comp_idx in 0..3usize {
+					let comp_info = srcinfo.comp_info.add(comp_idx);
+					let width_in_blocks = (*comp_info).width_in_blocks as usize;
+					let height_in_blocks = (*comp_info).height_in_blocks as usize;
+					let expected = &owned_jpeg.components[comp_idx];
+					if width_in_blocks != expected.width_in_blocks || height_in_blocks != expected.height_in_blocks {
+						panic!(
+							"Component {} dimensions mismatch. Template: {}x{}, owned: {}x{}",
+							comp_idx,
+							width_in_blocks,
+							height_in_blocks,
+							expected.width_in_blocks,
+							expected.height_in_blocks
+						);
+					}
+				}
+
+				let mut dstinfo: jpeg_compress_struct = std::mem::zeroed();
+
+				dstinfo.common.err = srcinfo.common.err;
+				jpeg_create_compress(&mut dstinfo);
+
+				let mut out_buffer: *mut c_uchar = ptr::null_mut();
+				let mut out_size: c_ulong = 0;
+
+				jpeg_mem_dest(&mut dstinfo, &mut out_buffer, &mut out_size);
+
+				jpeg_copy_critical_parameters(srcinfo, &mut dstinfo);
+				// Force baseline/sequential encoding; avoids progressive AC first/refine passes.
+				// 6x performance
+				jpeg_c_set_int_param(
+					&mut dstinfo,
+					J_INT_PARAM::JINT_COMPRESS_PROFILE,
+					JINT_COMPRESS_PROFILE_VALUE::JCP_FASTEST as libc::c_int,
+				);
+				dstinfo.num_scans = 0;
+				dstinfo.scan_info = ptr::null();
+				dstinfo.optimize_coding = 0;
+				jpeg_c_set_bool_param(&mut dstinfo, J_BOOLEAN_PARAM::JBOOLEAN_OPTIMIZE_SCANS, 0);
+				jpeg_write_coefficients(&mut dstinfo, coef_arrays);
+
+				let mut marker = srcinfo.marker_list;
+				while !marker.is_null() {
+					jpeg_write_marker(
+						&mut dstinfo,
+						(*marker).marker as libc::c_int,
+						(*marker).data,
+						(*marker).data_length,
+					);
+					marker = (*marker).next;
+				}
+
+				for_each_block_ptr(srcinfo, coef_arrays, true, |component_index, row, column, block_ptr| {
+					let component = &owned_jpeg.components[component_index];
+					let idx = component.index(row, column);
+					*block_ptr = component.blocks[idx];
+				});
+
+				jpeg_finish_compress(&mut dstinfo);
+				jpeg_destroy_compress(&mut dstinfo);
+
+				let result_vec = std::slice::from_raw_parts(out_buffer, out_size as usize).to_vec();
+				free(out_buffer as *mut c_void);
+
+				result_vec
+			},
+		)
+	}));
+
+	handle_jpeg_panic(result)
 }
 
 // JMSG_LENGTH_MAX is typically 200 in libjpeg
@@ -111,7 +288,7 @@ unsafe fn for_each_block_ptr<F>(
 	writable: bool,
 	mut visit: F,
 ) where
-	F: FnMut(Block, *mut BlockData),
+	F: FnMut(usize, usize, usize, *mut BlockData),
 {
 	for comp_idx in 0..srcinfo.num_components {
 		let comp_info = srcinfo.comp_info.add(comp_idx as usize);
@@ -130,106 +307,8 @@ unsafe fn for_each_block_ptr<F>(
 
 			for col in 0..width_in_blocks {
 				let block_ptr = (*block_row).add(col as usize);
-				visit(
-					Block {
-						component_index: comp_idx as usize,
-						row: row as usize,
-						column: col as usize,
-					},
-					block_ptr,
-				);
+				visit(comp_idx as usize, row as usize, col as usize, block_ptr);
 			}
 		}
 	}
-}
-
-pub unsafe fn process_jpeg_blocks<W>(jpeg_data: &[u8], writer: &mut W) -> anyhow::Result<Vec<u8>>
-where
-	W: BlockWriter,
-{
-	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-		let mut err: jpeg_error_mgr = std::mem::zeroed();
-		jpeg_std_error(&mut err);
-
-		err.error_exit = Some(custom_error_exit);
-
-		with_decompressor(
-			jpeg_data,
-			&mut err,
-			|srcinfo| {
-				jpeg_save_markers(srcinfo, 0xFE, 0xFFFF);
-				for m in 0..16 {
-					jpeg_save_markers(srcinfo, 0xE0 + m, 0xFFFF);
-				}
-			},
-			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
-				let mut dstinfo: jpeg_compress_struct = std::mem::zeroed();
-
-				dstinfo.common.err = srcinfo.common.err;
-				jpeg_create_compress(&mut dstinfo);
-
-				let mut out_buffer: *mut c_uchar = ptr::null_mut();
-				let mut out_size: c_ulong = 0;
-
-				jpeg_mem_dest(&mut dstinfo, &mut out_buffer, &mut out_size);
-
-				jpeg_copy_critical_parameters(srcinfo, &mut dstinfo);
-				jpeg_write_coefficients(&mut dstinfo, coef_arrays);
-
-				let mut marker = srcinfo.marker_list;
-				while !marker.is_null() {
-					jpeg_write_marker(
-						&mut dstinfo,
-						(*marker).marker as libc::c_int,
-						(*marker).data,
-						(*marker).data_length,
-					);
-					marker = (*marker).next;
-				}
-
-				for_each_block_ptr(srcinfo, coef_arrays, true, |block, block_ptr| {
-					writer.write_block(block, &mut *block_ptr);
-				});
-
-				jpeg_finish_compress(&mut dstinfo);
-				jpeg_destroy_compress(&mut dstinfo);
-
-				let result_vec = std::slice::from_raw_parts(out_buffer, out_size as usize).to_vec();
-				free(out_buffer as *mut c_void);
-
-				result_vec
-			},
-		)
-	}));
-
-	handle_jpeg_panic(result)
-}
-
-pub unsafe fn read_jpeg_blocks<R>(jpeg_data: &[u8], reader: &mut R) -> anyhow::Result<()>
-where
-	R: BlockReader,
-{
-	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-		let mut err: jpeg_error_mgr = std::mem::zeroed();
-		jpeg_std_error(&mut err);
-
-		err.error_exit = Some(custom_error_exit);
-
-		with_decompressor(
-			jpeg_data,
-			&mut err,
-			|_| {},
-			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
-				if srcinfo.num_components != 3 {
-					panic!("Only 3-component JPEGs are supported, found {}", srcinfo.num_components);
-				}
-
-				for_each_block_ptr(srcinfo, coef_arrays, false, |block, block_ptr| {
-					reader.read_block(block, &*block_ptr);
-				});
-			},
-		);
-	}));
-
-	handle_jpeg_panic(result)
 }

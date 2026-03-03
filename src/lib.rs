@@ -5,16 +5,7 @@ pub mod jpeg;
 pub mod lsb;
 pub mod zigzag;
 
-use jpeg::{Block, BlockData};
 use serde::{Deserialize, Serialize};
-
-pub trait BlockWriter {
-	fn write_block(&mut self, block: Block, coeffs: &mut BlockData);
-}
-
-pub trait BlockReader {
-	fn read_block(&mut self, block: Block, coeffs: &BlockData);
-}
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct Header {

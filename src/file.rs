@@ -5,8 +5,9 @@ use std::{fs, fs::File, io::Read};
 use anyhow::{Context, bail};
 use sha256::digest;
 
-use crate::jpeg::{get_capacity, process_jpeg_blocks, read_jpeg_blocks};
-use crate::lsb::{LsbReader, LsbWriter};
+use crate::jpeg::{OwnedJpeg, get_capacity, read_owned_jpeg, write_owned_jpeg};
+use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
+use crate::zigzag::ZIGZAG_INDICES;
 
 pub fn init_file(path: &Path) -> anyhow::Result<FileHandle> {
 	let mut file = File::open(path).context("Error opening input file.")?;
@@ -26,6 +27,172 @@ pub struct FileHandle {
 	file: File,
 	path: PathBuf,
 	capacity: usize,
+}
+
+pub struct JpegSession {
+	path: PathBuf,
+	source_jpeg: Vec<u8>,
+	owned_jpeg: OwnedJpeg,
+	bit_slots: Vec<BitSlot>,
+	cursor_bits: usize,
+	dirty: bool,
+}
+
+#[derive(Clone, Copy)]
+struct BitSlot {
+	component_index: usize,
+	block_index: usize,
+	coeff_index: usize,
+}
+
+impl JpegSession {
+	pub fn new(path: PathBuf, source_jpeg: Vec<u8>) -> anyhow::Result<Self> {
+		let owned_jpeg = unsafe { read_owned_jpeg(&source_jpeg)? };
+		let bit_slots = Self::collect_bit_slots(&owned_jpeg);
+		Ok(Self {
+			path,
+			source_jpeg,
+			owned_jpeg,
+			bit_slots,
+			cursor_bits: 0,
+			dirty: false,
+		})
+	}
+
+	pub fn capacity(&self) -> usize {
+		self.bit_slots.len() / 8
+	}
+
+	pub fn seek_bits(&mut self, bit_offset: usize) -> anyhow::Result<()> {
+		if bit_offset > self.bit_slots.len() {
+			bail!(
+				"Bit offset {} exceeds available capacity of {} bits.",
+				bit_offset,
+				self.bit_slots.len()
+			);
+		}
+		self.cursor_bits = bit_offset;
+		Ok(())
+	}
+
+	pub fn seek(&mut self, byte_offset: usize) -> anyhow::Result<()> {
+		self.seek_bits(byte_offset * 8)
+	}
+
+	pub fn remaining_bytes(&self) -> usize {
+		(self.bit_slots.len().saturating_sub(self.cursor_bits)) / 8
+	}
+
+	pub fn read(&mut self, out: &mut [u8]) -> usize {
+		let n = out.len().min(self.remaining_bytes());
+		out[..n].fill(0);
+
+		for (byte_idx, out_byte) in out[..n].iter_mut().enumerate() {
+			for bit_in_byte in 0..8usize {
+				let absolute_bit = self.cursor_bits + (byte_idx * 8) + bit_in_byte;
+				let slot = self.bit_slots[absolute_bit];
+				let coeff = self.owned_jpeg.components[slot.component_index].blocks[slot.block_index][slot.coeff_index];
+				let bit = get_lsb(coeff);
+				if bit == 1 {
+					*out_byte |= 1 << (7 - bit_in_byte);
+				}
+			}
+		}
+
+		self.cursor_bits += n * 8;
+		n
+	}
+
+	pub fn write(&mut self, data: &[u8]) -> usize {
+		let n = data.len().min(self.remaining_bytes());
+
+		for byte_idx in 0..n {
+			for bit_in_byte in 0..8usize {
+				let absolute_bit = self.cursor_bits + (byte_idx * 8) + bit_in_byte;
+				let slot = self.bit_slots[absolute_bit];
+				let bit = read_bit_from_bytes(data, (byte_idx * 8) + bit_in_byte).unwrap_or(0);
+				let coeff =
+					&mut self.owned_jpeg.components[slot.component_index].blocks[slot.block_index][slot.coeff_index];
+				*coeff = set_lsb(*coeff, bit);
+			}
+		}
+
+		if n > 0 {
+			self.dirty = true;
+		}
+		self.cursor_bits += n * 8;
+		n
+	}
+
+	pub fn read_data(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
+		ensure_byte_aligned(self.cursor_bits)?;
+		if len > self.remaining_bytes() {
+			bail!(
+				"Requested {} KiB exceeds available capacity of {} KiB.",
+				len / 1024,
+				self.remaining_bytes() / 1024
+			);
+		}
+
+		let mut out = vec![0u8; len];
+		let read = self.read(&mut out);
+		debug_assert_eq!(read, len);
+		Ok(out)
+	}
+
+	pub fn write_data(&mut self, data: &[u8]) -> anyhow::Result<()> {
+		ensure_byte_aligned(self.cursor_bits)?;
+		if data.len() > self.remaining_bytes() {
+			bail!(
+				"Not enough capacity to write {} KiB. Only {} KiB available.",
+				data.len() / 1024,
+				self.remaining_bytes() / 1024
+			);
+		}
+
+		let written = self.write(data);
+		debug_assert_eq!(written, data.len());
+		Ok(())
+	}
+
+	pub fn flush(&mut self) -> anyhow::Result<()> {
+		if !self.dirty {
+			return Ok(());
+		}
+
+		let output_jpeg = unsafe { write_owned_jpeg(&self.source_jpeg, &self.owned_jpeg)? };
+
+		let mut output_file =
+			File::create(&self.path).with_context(|| format!("Error creating '{}'.", self.path.display()))?;
+		output_file
+			.write_all(&output_jpeg)
+			.context("Error writing output file.")?;
+
+		println!("Wrote '{}': {}KiB", self.path.display(), output_jpeg.len() / 1024);
+		println!("SHA256: {}", digest(&output_jpeg));
+
+		self.source_jpeg = output_jpeg;
+		self.dirty = false;
+		Ok(())
+	}
+
+	fn collect_bit_slots(owned_jpeg: &OwnedJpeg) -> Vec<BitSlot> {
+		let mut bit_slots = Vec::new();
+		for (component_index, component) in owned_jpeg.components.iter().enumerate() {
+			for (block_index, block) in component.blocks.iter().enumerate() {
+				for &coeff_index in ZIGZAG_INDICES.iter().skip(5) {
+					if is_embeddable_coeff(block[coeff_index]) {
+						bit_slots.push(BitSlot {
+							component_index,
+							block_index,
+							coeff_index,
+						});
+					}
+				}
+			}
+		}
+		bit_slots
+	}
 }
 
 impl FileHandle {
@@ -56,47 +223,19 @@ impl FileHandle {
 	}
 
 	pub fn write_data(&mut self, data: &[u8]) -> anyhow::Result<()> {
-		if data.len() > self.capacity {
-			bail!(
-				"Not enough capacity to write {} KiB. Only {} KiB available.",
-				data.len() / 1024,
-				self.capacity / 1024
-			);
-		}
-
-		let mut writer = LsbWriter::new(data);
-
 		let input_jpeg = self.read_all()?;
-
-		let output_jpeg = unsafe { process_jpeg_blocks(&input_jpeg, &mut writer)? };
-
-		let mut output_file =
-			File::create(&self.path).with_context(|| format!("Error creating '{}'.", self.path.display()))?;
-		output_file
-			.write_all(&output_jpeg)
-			.context("Error writing output file.")?;
-
-		println!("Wrote '{}': {}KiB", self.path.display(), output_jpeg.len() / 1024);
-		println!("SHA256: {}", digest(output_jpeg));
+		let mut session = JpegSession::new(self.path.clone(), input_jpeg)?;
+		session.seek(0)?;
+		session.write_data(data)?;
+		session.flush()?;
 
 		Ok(())
 	}
 
 	pub fn read_data(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
-		if len > self.capacity {
-			bail!(
-				"Requested {} KiB exceeds available capacity of {} KiB.",
-				len / 1024,
-				self.capacity / 1024
-			);
-		}
-
-		let mut reader = LsbReader::new(len);
-
 		let input_jpeg = self.read_all()?;
-
-		unsafe { read_jpeg_blocks(&input_jpeg, &mut reader)? };
-
-		Ok(reader.finish())
+		let mut session = JpegSession::new(self.path.clone(), input_jpeg)?;
+		session.seek(0)?;
+		session.read_data(len)
 	}
 }

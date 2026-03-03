@@ -17,3 +17,4 @@ rand_chacha = "0.10"
 serde = "1.0"
 postcard = { version = "1.1", features = ["use-std", "use-crc"] }
 crc = "3.4"
+arbitrary = "1.4"

@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn, dead_code)]
 
 pub mod file;
+pub mod filesystem;
 pub mod jpeg;
 pub mod lsb;
 pub mod zigzag;

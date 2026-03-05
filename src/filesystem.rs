@@ -227,20 +227,6 @@ impl Inode {
 	}
 }
 
-/* Minimum:
-	1. lookup   +
-	2. getattr  +
-	3. readdir  +
-	4. mkdir    +
-	5. rmdir    +
-	6. create   +
-	7. open     +
-	8. release  +
-	9. read     +
-	10. write   +
-	11. unlink  +
-*/
-
 const ONE_SEC: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +258,76 @@ impl FileSystemState {
 		Ok(())
 	}
 
+	fn reject_dot_entries(name: &OsStr) -> FsOpResult<()> {
+		if name == OsStr::new(".") || name == OsStr::new("..") {
+			return Err(Errno::EINVAL);
+		}
+		Ok(())
+	}
+
+	fn ensure_parent_dir(&self, parent: INodeNo) -> FsOpResult<&BTreeMap<OsString, INodeNo>> {
+		if !self.inodes.contains_key(&parent) {
+			return Err(Errno::ENOENT);
+		}
+		self.dirs.get(&parent).ok_or(Errno::ENOTDIR)
+	}
+
+	fn lookup_child_ino(&self, parent: INodeNo, name: &OsStr) -> FsOpResult<INodeNo> {
+		let parent_dir = self.ensure_parent_dir(parent)?;
+		parent_dir.get(name).copied().ok_or(Errno::ENOENT)
+	}
+
+	fn validate_file_handle(&self, ino: INodeNo, fh: FileHandle) -> FsOpResult<()> {
+		let Some(handle_ino) = self.handles.get(&fh) else {
+			return Err(Errno::EBADF);
+		};
+		if *handle_ino != ino {
+			return Err(Errno::EBADF);
+		}
+
+		let Some(inode) = self.inodes.get(&ino) else {
+			return Err(Errno::ENOENT);
+		};
+		if inode.kind == FileType::Directory {
+			return Err(Errno::EISDIR);
+		}
+		Ok(())
+	}
+
+	fn alloc_file_handle_for(&mut self, ino: INodeNo) -> FsOpResult<FileHandle> {
+		let file_handle = FileHandle(self.next_fh);
+		let Some(next_fh) = self.next_fh.checked_add(1) else {
+			return Err(Errno::ENFILE);
+		};
+		self.next_fh = next_fh;
+		self.handles.insert(file_handle, ino);
+		Ok(file_handle)
+	}
+
+	fn resize_file_len(&mut self, ino: INodeNo, new_len: usize) -> FsOpResult<()> {
+		let old_len = self.file_data.get(&ino).map_or(0usize, Vec::len);
+		if new_len > old_len {
+			let growth = new_len - old_len;
+			let Some(new_used_bytes) = self.used_bytes.checked_add(growth as u64) else {
+				return Err(Errno::ENOSPC);
+			};
+			if new_used_bytes > self.total_bytes_limit as u64 {
+				return Err(Errno::ENOSPC);
+			}
+			self.used_bytes = new_used_bytes;
+		} else {
+			let shrink = old_len - new_len;
+			self.used_bytes = self.used_bytes.saturating_sub(shrink as u64);
+		}
+
+		let entry = self.file_data.entry(ino).or_default();
+		entry.resize(new_len, 0);
+
+		let inode = self.inodes.get_mut(&ino).ok_or(Errno::EIO)?;
+		inode.size = new_len as u64;
+		Ok(())
+	}
+
 	pub fn op_getattr(&self, ino: INodeNo) -> FsOpResult<Inode> {
 		self.inodes.get(&ino).copied().ok_or(Errno::ENOENT)
 	}
@@ -286,13 +342,7 @@ impl FileSystemState {
 		gid: u32,
 	) -> FsOpResult<Inode> {
 		self.ensure_name_len(name)?;
-
-		if !self.inodes.contains_key(&parent) {
-			return Err(Errno::ENOENT);
-		}
-		let Some(parent_dir_view) = self.dirs.get(&parent) else {
-			return Err(Errno::ENOTDIR);
-		};
+		let parent_dir_view = self.ensure_parent_dir(parent)?;
 		if parent_dir_view.contains_key(name) {
 			return Err(Errno::EEXIST);
 		}
@@ -335,22 +385,8 @@ impl FileSystemState {
 	}
 
 	pub fn op_unlink(&mut self, parent: INodeNo, name: &OsStr) -> FsOpResult<()> {
-		if name == OsStr::new(".") || name == OsStr::new("..") {
-			return Err(Errno::EINVAL);
-		}
-		if !self.inodes.contains_key(&parent) {
-			return Err(Errno::ENOENT);
-		}
-
-		let child_ino = {
-			let Some(parent_dir_view) = self.dirs.get(&parent) else {
-				return Err(Errno::ENOTDIR);
-			};
-			let Some(child_ino) = parent_dir_view.get(name) else {
-				return Err(Errno::ENOENT);
-			};
-			*child_ino
-		};
+		Self::reject_dot_entries(name)?;
+		let child_ino = self.lookup_child_ino(parent, name)?;
 
 		let child_inode = self.inodes.get(&child_ino).ok_or(Errno::EIO)?;
 		if child_inode.kind == FileType::Directory {
@@ -381,22 +417,8 @@ impl FileSystemState {
 	}
 
 	pub fn op_rmdir(&mut self, parent: INodeNo, name: &OsStr) -> FsOpResult<()> {
-		if name == OsStr::new(".") || name == OsStr::new("..") {
-			return Err(Errno::EINVAL);
-		}
-		if !self.inodes.contains_key(&parent) {
-			return Err(Errno::ENOENT);
-		}
-
-		let child_ino = {
-			let Some(parent_dir_view) = self.dirs.get(&parent) else {
-				return Err(Errno::ENOTDIR);
-			};
-			let Some(child_ino) = parent_dir_view.get(name) else {
-				return Err(Errno::ENOENT);
-			};
-			*child_ino
-		};
+		Self::reject_dot_entries(name)?;
+		let child_ino = self.lookup_child_ino(parent, name)?;
 
 		if child_ino == INodeNo(1) {
 			return Err(Errno::EBUSY);
@@ -436,30 +458,11 @@ impl FileSystemState {
 		if inode.kind == FileType::Directory {
 			return Err(Errno::EISDIR);
 		}
-
-		let file_handle = FileHandle(self.next_fh);
-		let Some(next_fh) = self.next_fh.checked_add(1) else {
-			return Err(Errno::ENFILE);
-		};
-		self.next_fh = next_fh;
-		self.handles.insert(file_handle, ino);
-		Ok(file_handle)
+		self.alloc_file_handle_for(ino)
 	}
 
 	pub fn op_read(&mut self, ino: INodeNo, fh: FileHandle, offset: u64, size: u32) -> FsOpResult<Vec<u8>> {
-		let Some(handle_ino) = self.handles.get(&fh) else {
-			return Err(Errno::EBADF);
-		};
-		if *handle_ino != ino {
-			return Err(Errno::EBADF);
-		}
-
-		let Some(inode) = self.inodes.get(&ino) else {
-			return Err(Errno::ENOENT);
-		};
-		if inode.kind == FileType::Directory {
-			return Err(Errno::EISDIR);
-		}
+		self.validate_file_handle(ino, fh)?;
 
 		let data = self.file_data.entry(ino).or_default();
 		let start = (offset as usize).min(data.len());
@@ -472,19 +475,7 @@ impl FileSystemState {
 	}
 
 	pub fn op_write(&mut self, ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8]) -> FsOpResult<u32> {
-		let Some(handle_ino) = self.handles.get(&fh) else {
-			return Err(Errno::EBADF);
-		};
-		if *handle_ino != ino {
-			return Err(Errno::EBADF);
-		}
-
-		let Some(inode_view) = self.inodes.get(&ino) else {
-			return Err(Errno::ENOENT);
-		};
-		if inode_view.kind == FileType::Directory {
-			return Err(Errno::EISDIR);
-		}
+		self.validate_file_handle(ino, fh)?;
 
 		let Ok(start) = usize::try_from(offset) else {
 			return Err(Errno::EFBIG);
@@ -497,27 +488,14 @@ impl FileSystemState {
 		}
 
 		let current_len = self.file_data.get(&ino).map_or(0, Vec::len);
-		let growth = end.saturating_sub(current_len);
-		let Some(new_used_bytes) = self.used_bytes.checked_add(growth as u64) else {
-			return Err(Errno::ENOSPC);
-		};
-		if new_used_bytes > self.total_bytes_limit as u64 {
-			return Err(Errno::ENOSPC);
+		if end > current_len {
+			self.resize_file_len(ino, end)?;
 		}
+		let file = self.file_data.entry(ino).or_default();
+		file[start..end].copy_from_slice(data);
 
-		let new_file_len = {
-			let file = self.file_data.entry(ino).or_default();
-			if end > file.len() {
-				file.resize(end, 0);
-			}
-			file[start..end].copy_from_slice(data);
-			file.len()
-		};
-
-		self.used_bytes = new_used_bytes;
 		let now = SystemTime::now();
 		let inode = self.inodes.get_mut(&ino).ok_or(Errno::EIO)?;
-		inode.size = new_file_len as u64;
 		inode.mtime = now;
 		inode.ctime = now;
 
@@ -564,13 +542,7 @@ impl FileSystemState {
 		gid: u32,
 	) -> FsOpResult<(Inode, FileHandle)> {
 		self.ensure_name_len(name)?;
-
-		if !self.inodes.contains_key(&parent) {
-			return Err(Errno::ENOENT);
-		}
-		let Some(parent_dir_view) = self.dirs.get(&parent) else {
-			return Err(Errno::ENOTDIR);
-		};
+		let parent_dir_view = self.ensure_parent_dir(parent)?;
 		if parent_dir_view.contains_key(name) {
 			return Err(Errno::EEXIST);
 		}
@@ -600,12 +572,7 @@ impl FileSystemState {
 		self.inodes.insert(new_ino, new_inode);
 		self.file_data.insert(new_ino, Vec::new());
 
-		let file_handle = FileHandle(self.next_fh);
-		let Some(next_fh) = self.next_fh.checked_add(1) else {
-			return Err(Errno::ENFILE);
-		};
-		self.next_fh = next_fh;
-		self.handles.insert(file_handle, new_ino);
+		let file_handle = self.alloc_file_handle_for(new_ino)?;
 
 		let parent_inode = self.inodes.get_mut(&parent).ok_or(Errno::EIO)?;
 		parent_inode.mtime = now;
@@ -633,27 +600,8 @@ impl FileSystemState {
 			return Err(Errno::EFBIG);
 		}
 
-		let old_len = self.file_data.get(&ino).map_or(0usize, Vec::len);
-		let new_len = size as usize;
-		if new_len > old_len {
-			let growth = new_len - old_len;
-			let Some(new_used_bytes) = self.used_bytes.checked_add(growth as u64) else {
-				return Err(Errno::ENOSPC);
-			};
-			if new_used_bytes > self.total_bytes_limit as u64 {
-				return Err(Errno::ENOSPC);
-			}
-			self.used_bytes = new_used_bytes;
-		} else {
-			let shrink = old_len - new_len;
-			self.used_bytes = self.used_bytes.saturating_sub(shrink as u64);
-		}
-
-		let entry = self.file_data.entry(ino).or_default();
-		entry.resize(new_len, 0);
-
+		self.resize_file_len(ino, size as usize)?;
 		let inode = self.inodes.get_mut(&ino).ok_or(Errno::EIO)?;
-		inode.size = size;
 		inode.mtime = now;
 		inode.ctime = now;
 		Ok(*inode)
@@ -769,7 +717,7 @@ impl FileSystemState {
 	}
 }
 
-impl fuser::Filesystem for FileSystem {
+impl Filesystem for FileSystem {
 	fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
 		info!("init()");
 		Ok(())
@@ -858,28 +806,10 @@ impl fuser::Filesystem for FileSystem {
 				return reply.error(Errno::EFBIG);
 			}
 
-			let old_len = state.file_data.get(&ino).map_or(0usize, Vec::len);
-			let new_len = size as usize;
-
-			if new_len > old_len {
-				let growth = new_len - old_len;
-				let Some(new_used_bytes) = state.used_bytes.checked_add(growth as u64) else {
-					return reply.error(Errno::ENOSPC);
-				};
-				if new_used_bytes > state.total_bytes_limit as u64 {
-					return reply.error(Errno::ENOSPC);
-				}
-				state.used_bytes = new_used_bytes;
-			} else {
-				let shrink = old_len - new_len;
-				state.used_bytes = state.used_bytes.saturating_sub(shrink as u64);
+			if let Err(err) = state.resize_file_len(ino, size as usize) {
+				return reply.error(err);
 			}
-
-			let entry = state.file_data.entry(ino).or_default();
-			entry.resize(new_len, 0);
-
 			let inode = state.inodes.get_mut(&ino).expect("validated inode must exist");
-			inode.size = size;
 			inode.mtime = now;
 			changed = true;
 		}

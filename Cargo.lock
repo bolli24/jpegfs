@@ -446,6 +446,8 @@ dependencies = [
  "serde",
  "sha256",
  "simplelog",
+ "thiserror",
+ "zerocopy",
 ]
 
 [[package]]

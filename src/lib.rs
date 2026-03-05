@@ -4,6 +4,7 @@ pub mod file;
 pub mod filesystem;
 pub mod jpeg;
 pub mod lsb;
+pub mod store;
 pub mod zigzag;
 
 use serde::{Deserialize, Serialize};

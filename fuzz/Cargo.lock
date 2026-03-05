@@ -460,6 +460,8 @@ dependencies = [
  "serde",
  "sha256",
  "simplelog",
+ "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
@@ -471,6 +473,7 @@ dependencies = [
  "jpegfs",
  "libfuzzer-sys",
  "postcard",
+ "zerocopy",
 ]
 
 [[package]]

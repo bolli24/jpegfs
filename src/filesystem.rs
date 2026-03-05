@@ -272,6 +272,18 @@ impl FileSystemState {
 		self.dirs.get(&parent).ok_or(Errno::ENOTDIR)
 	}
 
+	fn inode_or_enoent(&self, ino: INodeNo) -> FsOpResult<&Inode> {
+		self.inodes.get(&ino).ok_or(Errno::ENOENT)
+	}
+
+	fn ensure_regular_file_inode(&self, ino: INodeNo) -> FsOpResult<&Inode> {
+		let inode = self.inode_or_enoent(ino)?;
+		if inode.kind == FileType::Directory {
+			return Err(Errno::EISDIR);
+		}
+		Ok(inode)
+	}
+
 	fn lookup_child_ino(&self, parent: INodeNo, name: &OsStr) -> FsOpResult<INodeNo> {
 		let parent_dir = self.ensure_parent_dir(parent)?;
 		parent_dir.get(name).copied().ok_or(Errno::ENOENT)
@@ -284,13 +296,7 @@ impl FileSystemState {
 		if *handle_ino != ino {
 			return Err(Errno::EBADF);
 		}
-
-		let Some(inode) = self.inodes.get(&ino) else {
-			return Err(Errno::ENOENT);
-		};
-		if inode.kind == FileType::Directory {
-			return Err(Errno::EISDIR);
-		}
+		self.ensure_regular_file_inode(ino)?;
 		Ok(())
 	}
 
@@ -329,7 +335,7 @@ impl FileSystemState {
 	}
 
 	pub fn op_getattr(&self, ino: INodeNo) -> FsOpResult<Inode> {
-		self.inodes.get(&ino).copied().ok_or(Errno::ENOENT)
+		self.inode_or_enoent(ino).copied()
 	}
 
 	pub fn op_mkdir(
@@ -452,12 +458,7 @@ impl FileSystemState {
 	}
 
 	pub fn op_open(&mut self, ino: INodeNo) -> FsOpResult<FileHandle> {
-		let Some(inode) = self.inodes.get(&ino) else {
-			return Err(Errno::ENOENT);
-		};
-		if inode.kind == FileType::Directory {
-			return Err(Errno::EISDIR);
-		}
+		self.ensure_regular_file_inode(ino)?;
 		self.alloc_file_handle_for(ino)
 	}
 
@@ -584,18 +585,7 @@ impl FileSystemState {
 	pub fn op_setattr_size(&mut self, ino: INodeNo, size: u64) -> FsOpResult<Inode> {
 		let now = SystemTime::now();
 		let max_file_size = self.max_file_size;
-		if !self.inodes.contains_key(&ino) {
-			return Err(Errno::ENOENT);
-		}
-
-		let is_dir = self
-			.inodes
-			.get(&ino)
-			.map(|inode| inode.kind == FileType::Directory)
-			.unwrap_or(false);
-		if is_dir {
-			return Err(Errno::EISDIR);
-		}
+		self.ensure_regular_file_inode(ino)?;
 		if size as usize > max_file_size {
 			return Err(Errno::EFBIG);
 		}

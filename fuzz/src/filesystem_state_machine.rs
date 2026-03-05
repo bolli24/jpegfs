@@ -4,7 +4,7 @@ use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 use arbitrary::Arbitrary;
 use fuser::{FileHandle, INodeNo};
-use jpegfs::filesystem::{FileSystem, MAX_FILE_SIZE};
+use jpegfs::filesystem::{FileSystem, FileSystemState, MAX_FILE_SIZE};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_OPS: usize = 256;
@@ -85,8 +85,7 @@ fn fuzz_name(bytes: &[u8]) -> OsString {
 	OsString::from_vec(name)
 }
 
-fn refresh_pools(fs: &FileSystem, inodes: &mut Vec<INodeNo>, handles: &mut Vec<FileHandle>) {
-	let state = fs.state.read();
+fn refresh_pools(state: &FileSystemState, inodes: &mut Vec<INodeNo>, handles: &mut Vec<FileHandle>) {
 	inodes.clear();
 	handles.clear();
 	inodes.extend(state.inodes.keys().copied());
@@ -95,6 +94,7 @@ fn refresh_pools(fs: &FileSystem, inodes: &mut Vec<INodeNo>, handles: &mut Vec<F
 
 fuzz_target!(|program: Program| {
 	let fs = FileSystem::new();
+	let mut state = fs.state.write();
 	let mut inodes = vec![INodeNo(1)];
 	let mut handles = Vec::new();
 
@@ -107,7 +107,7 @@ fuzz_target!(|program: Program| {
 				umask,
 			} => {
 				if let Some(parent) = pick(&inodes, *parent_slot) {
-					let _ = fs.op_mkdir(
+					let _ = state.op_mkdir(
 						parent,
 						&fuzz_name(name),
 						u32::from(*mode),
@@ -124,7 +124,7 @@ fuzz_target!(|program: Program| {
 				umask,
 			} => {
 				if let Some(parent) = pick(&inodes, *parent_slot) {
-					let _ = fs.op_create(
+					let _ = state.op_create(
 						parent,
 						&fuzz_name(name),
 						u32::from(*mode),
@@ -136,7 +136,7 @@ fuzz_target!(|program: Program| {
 			}
 			Op::Open { inode_slot } => {
 				if let Some(ino) = pick(&inodes, *inode_slot) {
-					let _ = fs.op_open(ino);
+					let _ = state.op_open(ino);
 				}
 			}
 			Op::Write {
@@ -147,7 +147,7 @@ fuzz_target!(|program: Program| {
 			} => {
 				if let (Some(ino), Some(fh)) = (pick(&inodes, *inode_slot), pick(&handles, *fh_slot)) {
 					let payload_len = data.len().min(MAX_WRITE_BYTES);
-					let _ = fs.op_write(ino, fh, u64::from(*offset), &data[..payload_len]);
+					let _ = state.op_write(ino, fh, u64::from(*offset), &data[..payload_len]);
 				}
 			}
 			Op::Read {
@@ -157,50 +157,50 @@ fuzz_target!(|program: Program| {
 				size,
 			} => {
 				if let (Some(ino), Some(fh)) = (pick(&inodes, *inode_slot), pick(&handles, *fh_slot)) {
-					let _ = fs.op_read(ino, fh, u64::from(*offset), u32::from(*size));
+					let _ = state.op_read(ino, fh, u64::from(*offset), u32::from(*size));
 				}
 			}
 			Op::Release { fh_slot } => {
 				if let Some(fh) = pick(&handles, *fh_slot) {
-					fs.op_release(fh);
+					state.op_release(fh);
 				}
 			}
 			Op::Unlink { parent_slot, name } => {
 				if let Some(parent) = pick(&inodes, *parent_slot) {
-					let _ = fs.op_unlink(parent, &fuzz_name(name));
+					let _ = state.op_unlink(parent, &fuzz_name(name));
 				}
 			}
 			Op::Rmdir { parent_slot, name } => {
 				if let Some(parent) = pick(&inodes, *parent_slot) {
-					let _ = fs.op_rmdir(parent, &fuzz_name(name));
+					let _ = state.op_rmdir(parent, &fuzz_name(name));
 				}
 			}
 			Op::SetattrSize { inode_slot, size } => {
 				if let Some(ino) = pick(&inodes, *inode_slot) {
 					let max = (MAX_FILE_SIZE as u64) + 1024;
 					let requested = u64::from(*size) % max;
-					let _ = fs.op_setattr_size(ino, requested);
+					let _ = state.op_setattr_size(ino, requested);
 				}
 			}
 			Op::Readdir { inode_slot, offset } => {
 				if let Some(ino) = pick(&inodes, *inode_slot) {
-					let _ = fs.op_readdir(ino, u64::from(*offset));
+					let _ = state.op_readdir(ino, u64::from(*offset));
 				}
 			}
 			Op::Getattr { inode_slot } => {
 				if let Some(ino) = pick(&inodes, *inode_slot) {
-					let _ = fs.op_getattr(ino);
+					let _ = state.op_getattr(ino);
 				}
 			}
 			Op::Statfs => {
-				let _ = fs.op_statfs();
+				let _ = state.op_statfs();
 			}
 		}
 
-		if let Err(msg) = fs.check_invariants() {
+		if let Err(msg) = state.check_invariants() {
 			panic!("invariant violation after {op:?}: {msg}");
 		}
 
-		refresh_pools(&fs, &mut inodes, &mut handles);
+		refresh_pools(&state, &mut inodes, &mut handles);
 	}
 });

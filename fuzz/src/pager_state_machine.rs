@@ -286,4 +286,8 @@ fuzz_target!(|program: Program| {
 
 		check_consistency(&pager, &inode_model, &dir_model, &bytes_model);
 	}
+
+	let encoded = pager.encode_blocks().expect("encoding pager blocks should succeed");
+	pager = Pager::decode_blocks(&encoded, MAX_PAGES).expect("decoding pager blocks should succeed");
+	check_consistency(&pager, &inode_model, &dir_model, &bytes_model);
 });

@@ -53,8 +53,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "pager_inode_state_machine"
-path = "src/pager_inode_state_machine.rs"
+name = "pager_state_machine"
+path = "src/pager_state_machine.rs"
 test = false
 doc = false
 bench = false

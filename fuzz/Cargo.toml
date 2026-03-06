@@ -44,3 +44,17 @@ path = "src/store_block_persistence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "inode_roundtrip"
+path = "src/inode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pager_inode_state_machine"
+path = "src/pager_inode_state_machine.rs"
+test = false
+doc = false
+bench = false

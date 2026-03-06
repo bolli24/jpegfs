@@ -8,6 +8,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
+use crate::inode::Inode;
 use fuser::*;
 use log::{info, warn};
 use parking_lot::RwLock;
@@ -75,7 +76,6 @@ impl FileSystem {
 		let root_gid = unsafe { libc::getegid() };
 
 		let root_inode = Inode {
-			ino: root_ino,
 			kind: FileType::Directory,
 			perm: 0o755,
 			uid: root_uid,
@@ -188,38 +188,22 @@ impl Default for FileSystem {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Inode {
-	pub ino: INodeNo,
-	pub kind: FileType,
-	pub perm: u16,
-	pub uid: u32,
-	pub gid: u32,
-	pub size: u64,
-	pub nlink: u32,
-
-	pub atime: SystemTime,
-	pub mtime: SystemTime,
-	pub ctime: SystemTime,
-	pub crtime: SystemTime,
-}
-
 impl Inode {
-	pub fn to_file_attr(&self) -> FileAttr {
-		let blocks = self.size.div_ceil(POSIX_BLOCK);
+	pub fn to_file_attr(ino: INodeNo, inode: &Self) -> FileAttr {
+		let blocks = inode.size.div_ceil(POSIX_BLOCK);
 		FileAttr {
-			ino: self.ino,
-			size: self.size,
+			ino,
+			size: inode.size,
 			blocks,
-			atime: self.atime,
-			mtime: self.mtime,
-			ctime: self.ctime,
-			crtime: self.crtime,
-			kind: self.kind,
-			perm: self.perm,
-			nlink: self.nlink,
-			uid: self.uid,
-			gid: self.gid,
+			atime: inode.atime,
+			mtime: inode.mtime,
+			ctime: inode.ctime,
+			crtime: inode.crtime,
+			kind: inode.kind,
+			perm: inode.perm,
+			nlink: inode.nlink,
+			uid: inode.uid,
+			gid: inode.gid,
 			rdev: 0,
 			blksize: BLOCK_SIZE as u32,
 			flags: 0,
@@ -346,7 +330,7 @@ impl FileSystemState {
 		umask: u32,
 		uid: u32,
 		gid: u32,
-	) -> FsOpResult<Inode> {
+	) -> FsOpResult<(INodeNo, Inode)> {
 		self.ensure_name_len(name)?;
 		let parent_dir_view = self.ensure_parent_dir(parent)?;
 		if parent_dir_view.contains_key(name) {
@@ -360,7 +344,6 @@ impl FileSystemState {
 
 		let now = SystemTime::now();
 		let new_inode = Inode {
-			ino: new_ino,
 			kind: FileType::Directory,
 			perm: ((mode & 0o7777) & !umask) as u16,
 			uid,
@@ -387,7 +370,7 @@ impl FileSystemState {
 
 		self.dirs.insert(new_ino, dir_entries);
 		self.inodes.insert(new_ino, new_inode);
-		Ok(new_inode)
+		Ok((new_ino, new_inode))
 	}
 
 	pub fn op_unlink(&mut self, parent: INodeNo, name: &OsStr) -> FsOpResult<()> {
@@ -541,7 +524,7 @@ impl FileSystemState {
 		umask: u32,
 		uid: u32,
 		gid: u32,
-	) -> FsOpResult<(Inode, FileHandle)> {
+	) -> FsOpResult<(INodeNo, Inode, FileHandle)> {
 		self.ensure_name_len(name)?;
 		let parent_dir_view = self.ensure_parent_dir(parent)?;
 		if parent_dir_view.contains_key(name) {
@@ -555,7 +538,6 @@ impl FileSystemState {
 
 		let now = SystemTime::now();
 		let new_inode = Inode {
-			ino: new_ino,
 			kind: FileType::RegularFile,
 			perm: ((mode & 0o7777) & !umask) as u16,
 			uid,
@@ -579,7 +561,7 @@ impl FileSystemState {
 		parent_inode.mtime = now;
 		parent_inode.ctime = now;
 
-		Ok((new_inode, file_handle))
+		Ok((new_ino, new_inode, file_handle))
 	}
 
 	pub fn op_setattr_size(&mut self, ino: INodeNo, size: u64) -> FsOpResult<Inode> {
@@ -739,7 +721,7 @@ impl Filesystem for FileSystem {
 			"directory entry points to missing inode: parent={parent:?}, name={name:?}, child={file:?}"
 		);
 
-		reply.entry(&ONE_SEC, &inode.to_file_attr(), Generation(0));
+		reply.entry(&ONE_SEC, &Inode::to_file_attr(*file, inode), Generation(0));
 	}
 
 	fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
@@ -750,7 +732,7 @@ impl Filesystem for FileSystem {
 		info!("getattr(ino={ino:?})");
 		let state = self.state.read();
 		match state.op_getattr(ino) {
-			Ok(inode) => reply.attr(&ONE_SEC, &inode.to_file_attr()),
+			Ok(inode) => reply.attr(&ONE_SEC, &Inode::to_file_attr(ino, &inode)),
 			Err(err) => reply.error(err),
 		}
 	}
@@ -856,7 +838,7 @@ impl Filesystem for FileSystem {
 			inode.ctime = now;
 		}
 
-		reply.attr(&ONE_SEC, &inode.to_file_attr());
+		reply.attr(&ONE_SEC, &Inode::to_file_attr(ino, inode));
 	}
 
 	fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
@@ -887,7 +869,7 @@ impl Filesystem for FileSystem {
 		info!("mkdir(parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})");
 		let mut state = self.state.write();
 		match state.op_mkdir(parent, name, mode, umask, req.uid(), req.gid()) {
-			Ok(inode) => reply.entry(&ONE_SEC, &inode.to_file_attr(), Generation(0)),
+			Ok((ino, inode)) => reply.entry(&ONE_SEC, &Inode::to_file_attr(ino, &inode), Generation(0)),
 			Err(err) => reply.error(err),
 		}
 	}
@@ -1136,9 +1118,9 @@ impl Filesystem for FileSystem {
 		info!("create(parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})");
 		let mut state = self.state.write();
 		match state.op_create(parent, name, mode, umask, req.uid(), req.gid()) {
-			Ok((new_inode, file_handle)) => reply.created(
+			Ok((ino, new_inode, file_handle)) => reply.created(
 				&ONE_SEC,
-				&new_inode.to_file_attr(),
+				&Inode::to_file_attr(ino, &new_inode),
 				Generation(0),
 				file_handle,
 				FopenFlags::empty(),
@@ -1344,23 +1326,23 @@ mod tests {
 	#[test]
 	fn unlinked_inode_lives_until_last_handle_release() {
 		let fs = FileSystem::new();
-		let inode = {
+		let ino = {
 			let mut state = fs.state.write();
-			let (inode, fh) = state
+			let (ino, _inode, fh) = state
 				.op_create(INodeNo(1), OsStr::new("file"), 0o644, 0, 1000, 1000)
 				.expect("create should succeed");
-			state.op_write(inode.ino, fh, 0, b"abc").expect("write should succeed");
+			state.op_write(ino, fh, 0, b"abc").expect("write should succeed");
 			state
 				.op_unlink(INodeNo(1), OsStr::new("file"))
 				.expect("unlink should succeed");
-			assert!(state.op_getattr(inode.ino).is_ok());
+			assert!(state.op_getattr(ino).is_ok());
 			state.op_release(fh);
-			inode
+			ino
 		};
 		let state = fs.state.read();
 		assert_eq!(
 			state
-				.op_getattr(inode.ino)
+				.op_getattr(ino)
 				.map_err(i32::from)
 				.expect_err("inode should be removed"),
 			i32::from(Errno::ENOENT)
@@ -1372,15 +1354,15 @@ mod tests {
 	fn setattr_size_updates_used_bytes_for_growth_and_shrink() {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
-		let (inode, fh) = state
+		let (ino, _inode, fh) = state
 			.op_create(INodeNo(1), OsStr::new("growshrink"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		state.op_release(fh);
 
-		state.op_setattr_size(inode.ino, 10).expect("grow should succeed");
+		state.op_setattr_size(ino, 10).expect("grow should succeed");
 		assert_eq!(state.used_bytes, 10);
 
-		state.op_setattr_size(inode.ino, 3).expect("shrink should succeed");
+		state.op_setattr_size(ino, 3).expect("shrink should succeed");
 		assert_eq!(state.used_bytes, 3);
 		assert!(state.check_invariants().is_ok());
 	}
@@ -1389,11 +1371,11 @@ mod tests {
 	fn rmdir_rejects_non_empty_directory() {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
-		let dir = state
+		let (dir_ino, _dir) = state
 			.op_mkdir(INodeNo(1), OsStr::new("dir"), 0o755, 0, 1000, 1000)
 			.expect("mkdir should succeed");
-		let (_file, fh) = state
-			.op_create(dir.ino, OsStr::new("child"), 0o644, 0, 1000, 1000)
+		let (_file_ino, _file, fh) = state
+			.op_create(dir_ino, OsStr::new("child"), 0o644, 0, 1000, 1000)
 			.expect("create in dir should succeed");
 		state.op_release(fh);
 
@@ -1411,11 +1393,11 @@ mod tests {
 	fn write_with_huge_offset_returns_efbig() {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
-		let (inode, fh) = state
+		let (ino, _inode, fh) = state
 			.op_create(INodeNo(1), OsStr::new("offset"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		let err = state
-			.op_write(inode.ino, fh, u64::MAX, b"x")
+			.op_write(ino, fh, u64::MAX, b"x")
 			.expect_err("write should fail with huge offset");
 		assert_eq!(i32::from(err), i32::from(Errno::EFBIG));
 		assert!(state.check_invariants().is_ok());
@@ -1425,7 +1407,7 @@ mod tests {
 	fn freed_inode_is_reused_without_collision() {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
-		let (first, fh_first) = state
+		let (first, _first_inode, fh_first) = state
 			.op_create(INodeNo(1), OsStr::new("first"), 0o644, 0, 1000, 1000)
 			.expect("first create should succeed");
 		state.op_release(fh_first);
@@ -1433,12 +1415,12 @@ mod tests {
 			.op_unlink(INodeNo(1), OsStr::new("first"))
 			.expect("unlink should succeed");
 
-		let (second, fh_second) = state
+		let (second, _second_inode, fh_second) = state
 			.op_create(INodeNo(1), OsStr::new("second"), 0o644, 0, 1000, 1000)
 			.expect("second create should succeed");
 		state.op_release(fh_second);
 
-		assert_eq!(first.ino, second.ino);
+		assert_eq!(first, second);
 		assert!(state.check_invariants().is_ok());
 	}
 }

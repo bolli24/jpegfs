@@ -2,8 +2,10 @@
 
 pub mod file;
 pub mod filesystem;
+pub mod inode;
 pub mod jpeg;
 pub mod lsb;
+pub mod pager;
 pub mod store;
 pub mod zigzag;
 

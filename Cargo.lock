@@ -291,6 +291,7 @@ dependencies = [
  "parking_lot",
  "pkg-config",
  "ref-cast",
+ "serde",
  "smallvec",
  "zerocopy",
 ]

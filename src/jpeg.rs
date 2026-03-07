@@ -98,7 +98,7 @@ pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> anyhow::Result<OwnedJpeg> {
 			|_| {},
 			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
 				if srcinfo.num_components != 3 {
-					panic!("Only 3-component JPEGs are supported, found {}", srcinfo.num_components);
+					panic!("only 3-component JPEGs are supported, found {}", srcinfo.num_components);
 				}
 
 				let mut components = std::array::from_fn(|comp_idx| {
@@ -148,7 +148,7 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 			},
 			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
 				if srcinfo.num_components != 3 {
-					panic!("Only 3-component JPEGs are supported, found {}", srcinfo.num_components);
+					panic!("only 3-component JPEGs are supported, found {}", srcinfo.num_components);
 				}
 
 				for comp_idx in 0..3usize {
@@ -158,12 +158,8 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 					let expected = &owned_jpeg.components[comp_idx];
 					if width_in_blocks != expected.width_in_blocks || height_in_blocks != expected.height_in_blocks {
 						panic!(
-							"Component {} dimensions mismatch. Template: {}x{}, owned: {}x{}",
-							comp_idx,
-							width_in_blocks,
-							height_in_blocks,
-							expected.width_in_blocks,
-							expected.height_in_blocks
+							"component {comp_idx} dimensions mismatch: template={}x{}, owned={}x{}",
+							width_in_blocks, height_in_blocks, expected.width_in_blocks, expected.height_in_blocks
 						);
 					}
 				}
@@ -254,7 +250,7 @@ fn handle_jpeg_panic<T>(result: std::thread::Result<T>) -> anyhow::Result<T> {
 			} else if let Some(msg) = err.downcast_ref::<&str>() {
 				bail!(msg.to_string());
 			} else {
-				bail!("Unknown libjpeg panic occurred");
+				bail!("unknown libjpeg panic");
 			}
 		}
 	}

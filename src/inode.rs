@@ -20,7 +20,7 @@ pub struct Inode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum InodeConversionError {
-	#[error("Timestamp conversion failed for seconds={seconds} nanos={nanos}")]
+	#[error("timestamp conversion failed for seconds={seconds} nanos={nanos}")]
 	InvalidTimestamp { seconds: i64, nanos: u32 },
 	#[error("timestamp seconds out of range: {0}")]
 	SecondsOutOfRange(u64),
@@ -218,5 +218,17 @@ mod tests {
 
 		assert_eq!(restored_ino, ino);
 		assert_eq!(restored, inode);
+	}
+
+	#[test]
+	fn invalid_timestamp_error_display_uses_pager_style() {
+		assert_eq!(
+			InodeConversionError::InvalidTimestamp {
+				seconds: -1,
+				nanos: 1_000_000_000,
+			}
+			.to_string(),
+			"timestamp conversion failed for seconds=-1 nanos=1000000000"
+		);
 	}
 }

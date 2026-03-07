@@ -64,7 +64,7 @@ pub fn write_bit_to_bytes(data: &mut [u8], bit_index: usize, bit: u8) {
 
 pub fn ensure_byte_aligned(bit_offset: usize) -> anyhow::Result<()> {
 	if !bit_offset.is_multiple_of(8) {
-		anyhow::bail!("Bit offset {} is not byte-aligned.", bit_offset);
+		anyhow::bail!("bit offset {} is not byte-aligned", bit_offset);
 	}
 	Ok(())
 }

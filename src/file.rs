@@ -10,10 +10,10 @@ use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_fro
 use crate::zigzag::ZIGZAG_INDICES;
 
 pub fn init_file(path: &Path) -> anyhow::Result<FileHandle> {
-	let mut file = File::open(path).context("Error opening input file.")?;
+	let mut file = File::open(path).context("failed to open input file")?;
 
 	let content = FileHandle::read_all_from_file(&mut file)?;
-	let capacity = get_capacity(&content).context("Error getting capacity.")?;
+	let capacity = get_capacity(&content).context("failed to compute capacity")?;
 	println!("Opened file '{}' capacity: {}", path.display(), capacity);
 
 	Ok(FileHandle {
@@ -66,7 +66,7 @@ impl JpegSession {
 	pub fn seek_bits(&mut self, bit_offset: usize) -> anyhow::Result<()> {
 		if bit_offset > self.bit_slots.len() {
 			bail!(
-				"Bit offset {} exceeds available capacity of {} bits.",
+				"bit offset {} exceeds available capacity of {} bits",
 				bit_offset,
 				self.bit_slots.len()
 			);
@@ -128,7 +128,7 @@ impl JpegSession {
 		ensure_byte_aligned(self.cursor_bits)?;
 		if len > self.remaining_bytes() {
 			bail!(
-				"Requested {} KiB exceeds available capacity of {} KiB.",
+				"requested {} KiB exceeds available capacity of {} KiB",
 				len / 1024,
 				self.remaining_bytes() / 1024
 			);
@@ -144,7 +144,7 @@ impl JpegSession {
 		ensure_byte_aligned(self.cursor_bits)?;
 		if data.len() > self.remaining_bytes() {
 			bail!(
-				"Not enough capacity to write {} KiB. Only {} KiB available.",
+				"not enough capacity to write {} KiB; only {} KiB available",
 				data.len() / 1024,
 				self.remaining_bytes() / 1024
 			);
@@ -163,10 +163,10 @@ impl JpegSession {
 		let output_jpeg = unsafe { write_owned_jpeg(&self.source_jpeg, &self.owned_jpeg)? };
 
 		let mut output_file =
-			File::create(&self.path).with_context(|| format!("Error creating '{}'.", self.path.display()))?;
+			File::create(&self.path).with_context(|| format!("failed to create '{}'", self.path.display()))?;
 		output_file
 			.write_all(&output_jpeg)
-			.context("Error writing output file.")?;
+			.context("failed to write output file")?;
 
 		println!("Wrote '{}': {}KiB", self.path.display(), output_jpeg.len() / 1024);
 		println!("SHA256: {}", digest(&output_jpeg));
@@ -201,9 +201,9 @@ impl FileHandle {
 	}
 
 	fn read_all_from_file(file: &mut File) -> anyhow::Result<Vec<u8>> {
-		file.rewind().context("Error rewinding input file")?;
+		file.rewind().context("failed to rewind input file")?;
 		let mut content = Vec::<u8>::new();
-		file.read_to_end(&mut content).context("Error reading input file")?;
+		file.read_to_end(&mut content).context("failed to read input file")?;
 		Ok(content)
 	}
 
@@ -214,7 +214,7 @@ impl FileHandle {
 	pub fn copy_to(&self, target_path: &Path) -> anyhow::Result<FileHandle> {
 		fs::copy(&self.path, target_path).with_context(|| {
 			format!(
-				"Error copying '{}' to '{}'.",
+				"failed to copy '{}' to '{}'",
 				self.path.display(),
 				target_path.display()
 			)

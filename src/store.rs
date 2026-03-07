@@ -29,19 +29,19 @@ where
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-	#[error("Not enough free space to store entry.")]
+	#[error("not enough free space to store entry")]
 	NoSpace,
 
-	#[error("Invalid block layout: {0}")]
+	#[error("invalid block layout: {0}")]
 	InvalidLayout(&'static str),
 
-	#[error("Unable to serialize.")]
+	#[error("serialize failed: {0}")]
 	Serialize(postcard::Error),
 
-	#[error("Unable to deserialize.")]
+	#[error("deserialize failed: {0}")]
 	Deserialize(postcard::Error),
 
-	#[error("Index out of bounds")]
+	#[error("index out of bounds")]
 	NoEntry,
 }
 
@@ -327,5 +327,21 @@ mod test {
 		assert_eq!(remap, None);
 		assert_eq!(store.active_slots(), 1);
 		assert_eq!(store.get(0).expect("slot 0 should exist"), 11);
+	}
+
+	#[test]
+	fn error_display_uses_pager_style() {
+		assert_eq!(Error::NoSpace.to_string(), "not enough free space to store entry");
+	}
+
+	#[test]
+	fn deserialize_error_display_includes_source_detail() {
+		let source = postcard::from_bytes::<u8>(&[]).expect_err("empty input should fail to deserialize");
+		let source_text = source.to_string();
+
+		assert_eq!(
+			Error::Deserialize(source).to_string(),
+			format!("deserialize failed: {source_text}")
+		);
 	}
 }

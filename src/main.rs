@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
 		TerminalMode::Mixed,
 		ColorChoice::Auto,
 	)
-	.context("Error initializing terminal logger.")?;
+	.context("failed to initialize terminal logger")?;
 
 	let fs = FileSystem::new();
 	let mut config = FuseConfig::default();
@@ -37,23 +37,23 @@ fn main() -> anyhow::Result<()> {
 		Ok(()) => {}
 		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
 		Err(e) => {
-			return Err(e).with_context(|| format!("Failed to create mount directory at {}", mount_path.display()));
+			return Err(e).with_context(|| format!("failed to create mount directory at {}", mount_path.display()));
 		}
 	}
 	anyhow::ensure!(
 		mount_path.is_dir(),
-		"Mount path exists but is not a directory: {}",
+		"mount path exists but is not a directory: {}",
 		mount_path.display()
 	);
 
-	let session = spawn_mount2(fs, &mount_path, &config).context("Error mounting file system.")?;
+	let session = spawn_mount2(fs, &mount_path, &config).context("failed to mount file system")?;
 	let (shutdown_tx, shutdown_rx) = mpsc::channel();
 	ctrlc::set_handler(move || {
 		let _ = shutdown_tx.send(());
 	})
-	.context("Error setting shutdown signal handler.")?;
+	.context("failed to set shutdown signal handler")?;
 
-	shutdown_rx.recv().context("Error waiting for shutdown signal.")?;
+	shutdown_rx.recv().context("failed to wait for shutdown signal")?;
 	drop(session);
 
 	Ok(())
@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
 		capacity: file_info.capacity() as usize,
 	};
 
-	let data = postcard::to_stdvec_crc32(&header, crc.digest()).context("Error serializing header.")?;
+	let data = postcard::to_stdvec_crc32(&header, crc.digest()).context("failed to serialize header")?;
 
 	println!("{data:?}");
 
@@ -78,7 +78,7 @@ fn main() -> anyhow::Result<()> {
 
 	let read_data = output_file_info.read_data(data.len())?;
 	let decoded_header: Header =
-		postcard::from_bytes_crc32(&read_data, crc.digest()).context("Error deserializing header.")?;
+		postcard::from_bytes_crc32(&read_data, crc.digest()).context("failed to deserialize header")?;
 	println!("Read header: {decoded_header:?}");
 
 	Ok(())
@@ -98,7 +98,7 @@ pub fn rng_from_passphrase(passphrase: &str, salt: &[u8]) -> anyhow::Result<ChaC
 	let mut seed = [0u8; 32];
 	argon2
 		.hash_password_into(passphrase.as_bytes(), salt, &mut seed)
-		.context("Argon2 failed")?;
+		.context("argon2 failed")?;
 
 	Ok(ChaCha20Rng::from_seed(seed))
 }

@@ -335,8 +335,6 @@ impl Pager {
 				pager.bytes.entry(ino).or_default().push(index);
 			}
 		}
-
-		pager.check_invariants();
 		Ok(pager)
 	}
 
@@ -492,7 +490,6 @@ impl Pager {
 		for page_index in page_indices {
 			self.release_dir_entries_page(page_index);
 		}
-		self.check_invariants();
 	}
 
 	fn allocate_dir_entries_page(&mut self, inode: INodeNo) -> Result<DirEntriesIndex, ()> {
@@ -535,7 +532,6 @@ impl Pager {
 				match page.entries.try_store((name.clone(), child)) {
 					Ok(slot) => {
 						page.indices.insert(name, (slot, child));
-						self.check_invariants();
 						return Ok(());
 					}
 					Err(StoreError::NoSpace) => continue,
@@ -555,7 +551,6 @@ impl Pager {
 		};
 		page.indices.insert(name, (slot, child));
 		self.dir_entries.entry(inode).or_default().push(page_index);
-		self.check_invariants();
 		Ok(())
 	}
 
@@ -580,7 +575,6 @@ impl Pager {
 
 			if let Some(child) = removed {
 				self.prune_empty_dir_pages(inode);
-				self.check_invariants();
 				return Ok(Some(child));
 			}
 		}
@@ -702,8 +696,6 @@ impl Pager {
 			data_cursor += take;
 			write_cursor += take;
 		}
-
-		self.check_invariants();
 		Ok(data.len())
 	}
 
@@ -718,7 +710,6 @@ impl Pager {
 		for page_index in page_indices {
 			self.release_bytes_page(page_index);
 		}
-		self.check_invariants();
 	}
 
 	fn bytes_resize(&mut self, inode: INodeNo, new_len: usize) -> Result<(), ()> {
@@ -783,8 +774,6 @@ impl Pager {
 				page.length = desired;
 			}
 		}
-
-		self.check_invariants();
 		Ok(())
 	}
 
@@ -1094,7 +1083,9 @@ impl Pager {
 		digest.finalize()
 	}
 
-	fn check_invariants(&self) {
+	/// Expensive consistency validation for tests, fuzzing, and diagnostics.
+	/// Normal pager operations must not call this implicitly.
+	pub fn check_invariants(&self) {
 		debug_assert!(self.page_count() <= self.max_pages);
 
 		let mut active_dir_pages = HashSet::new();
@@ -1169,6 +1160,7 @@ mod tests {
 		assert!(pager.inodes_contains(INodeNo(1)));
 		assert_eq!(pager.inodes_len(), 1);
 		assert!(pager.inode_get(INodeNo(1)).is_some());
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1182,6 +1174,7 @@ mod tests {
 		assert!(!pager.inodes_contains(INodeNo(2)));
 		assert!(pager.inode_get(INodeNo(2)).is_none());
 		assert_eq!(pager.inodes_len(), 0);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1197,6 +1190,7 @@ mod tests {
 
 		assert_eq!(pager.inodes_len(), 1);
 		assert_eq!(pager.inode_get(INodeNo(3)).expect("inode should exist").size, 99);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1222,6 +1216,7 @@ mod tests {
 		assert_eq!(removed, Some(INodeNo(12)));
 		assert_eq!(pager.dir_entries_get(parent, &name), None);
 		assert!(!pager.dir_entries_exists(parent));
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1241,6 +1236,7 @@ mod tests {
 
 		let snapshot = pager.dir_entries_get_dir(parent).expect("directory should exist");
 		assert_eq!(snapshot.len(), 100);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1258,6 +1254,7 @@ mod tests {
 			}
 		}
 		assert!(hit_limit, "directory inserts should eventually exhaust a single page");
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1268,6 +1265,7 @@ mod tests {
 		pager.bytes_write(ino, 0, b"hello").expect("write should succeed");
 		assert_eq!(pager.bytes_len(ino), 5);
 		assert_eq!(pager.bytes_read(ino, 0, 5), b"hello");
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1284,6 +1282,7 @@ mod tests {
 
 		let out = pager.bytes_read(ino, DATA_PAGE_CAPACITY - 4, 12);
 		assert_eq!(out, vec![0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22]);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1294,6 +1293,7 @@ mod tests {
 		pager.bytes_write(ino, 4, b"xy").expect("sparse write should succeed");
 		assert_eq!(pager.bytes_len(ino), 6);
 		assert_eq!(pager.bytes_read(ino, 0, 6), vec![0, 0, 0, 0, b'x', b'y']);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1309,6 +1309,7 @@ mod tests {
 
 		pager.bytes_truncate(ino, 6).expect("extend should succeed");
 		assert_eq!(pager.bytes_read(ino, 0, 8), vec![b'a', b'b', b'c', 0, 0, 0]);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1324,6 +1325,7 @@ mod tests {
 
 		assert_eq!(pager.bytes_len(ino), 6);
 		assert_eq!(pager.bytes_read(ino, 0, 6), b"abZZef");
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1336,6 +1338,7 @@ mod tests {
 		pager.bytes_remove(ino);
 		assert_eq!(pager.bytes_len(ino), 0);
 		assert!(pager.bytes_read(ino, 0, 8).is_empty());
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1344,6 +1347,7 @@ mod tests {
 		let ino = INodeNo(46);
 		let data = vec![0x55; DATA_PAGE_CAPACITY + 1];
 		assert!(pager.bytes_write(ino, 0, &data).is_err());
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1366,6 +1370,7 @@ mod tests {
 			pager.bytes_write(b, 0, &one_page).is_ok(),
 			"failed write must not leak partially allocated pages"
 		);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1383,6 +1388,7 @@ mod tests {
 			pager.bytes_write(ino, 0, &payload).is_ok(),
 			"second write should reuse freed page instead of failing max_pages"
 		);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1408,6 +1414,7 @@ mod tests {
 				.is_ok(),
 			"insert after clear should reuse page capacity"
 		);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1426,6 +1433,7 @@ mod tests {
 		}
 		assert_eq!(pager.page_count(), 1);
 		assert_eq!(pager.dir_entries_get(inode, name.as_os_str()), Some(INodeNo(10_001)));
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1467,6 +1475,7 @@ mod tests {
 			"replacing with larger varint should fail gracefully on full page"
 		);
 		assert_eq!(pager.dir_entries_get(inode, target.as_os_str()), Some(original_child));
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1482,6 +1491,7 @@ mod tests {
 				.is_ok(),
 			"failed oversized insert must release the allocated directory page"
 		);
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1503,6 +1513,7 @@ mod tests {
 			let removed = pager.dir_entries_remove(inode, name.as_os_str());
 			assert_eq!(removed, Some(INodeNo(1_000 + i)));
 		}
+		pager.check_invariants();
 	}
 
 	#[test]
@@ -1541,6 +1552,8 @@ mod tests {
 		assert_eq!(decoded.dir_entries_get(dir_ino, OsStr::new("file.bin")), Some(file_ino));
 		assert_eq!(decoded.bytes_len(file_ino), payload.len());
 		assert_eq!(decoded.bytes_read(file_ino, 0, payload.len() + 16), payload);
+		pager.check_invariants();
+		decoded.check_invariants();
 	}
 
 	#[test]
@@ -1569,6 +1582,8 @@ mod tests {
 			decoded.dir_entries_get(second_inode, OsStr::new("fresh")),
 			Some(first_inode)
 		);
+		pager.check_invariants();
+		decoded.check_invariants();
 	}
 
 	#[test]
@@ -1578,6 +1593,7 @@ mod tests {
 		pager.bytes_write(ino, 0, b"crc-check").expect("write should succeed");
 		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
 		assert!(!encoded.is_empty(), "encoding should emit at least one block");
+		pager.check_invariants();
 
 		encoded[0][HEADER_SIZE] ^= 0x01;
 		match Pager::decode_blocks(&encoded, 8) {
@@ -1595,6 +1611,7 @@ mod tests {
 		pager.bytes_write(ino, 0, &payload).expect("write should succeed");
 		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
 		assert!(encoded.len() >= 2, "payload must produce at least two blocks");
+		pager.check_invariants();
 
 		let second_block = &mut encoded[1];
 		let mut header = PageHeaderV1::read_from_bytes(&second_block[..HEADER_SIZE]).expect("header should parse");
@@ -1619,6 +1636,7 @@ mod tests {
 		pager.bytes_write(ino, 0, b"max-page-id").expect("write should succeed");
 		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
 		assert!(!encoded.is_empty(), "encoding should emit at least one block");
+		pager.check_invariants();
 
 		let first_block = &mut encoded[0];
 		let mut header = PageHeaderV1::read_from_bytes(&first_block[..HEADER_SIZE]).expect("header should parse");
@@ -1654,6 +1672,7 @@ mod tests {
 
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
 		let mut pager = Pager::decode_blocks(&encoded, 16).expect("decoding should succeed");
+		pager.check_invariants();
 
 		// This allocation used to collide with an existing page_id after roundtrip.
 		pager
@@ -1663,5 +1682,7 @@ mod tests {
 		let encoded = pager.encode_blocks().expect("encoding after allocation should succeed");
 		let decoded = Pager::decode_blocks(&encoded, 16).expect("decoding after allocation should succeed");
 		assert_eq!(decoded.dir_entries_get(dir_ino, OsStr::new("entry")), Some(data_ino_b));
+		pager.check_invariants();
+		decoded.check_invariants();
 	}
 }

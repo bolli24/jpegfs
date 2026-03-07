@@ -25,49 +25,17 @@ struct Program {
 #[derive(Arbitrary, Debug)]
 enum Op {
 	InodeInsert(FuzzInode),
-	InodeRemove {
-		ino: u64,
-	},
-	InodeRead {
-		ino: u64,
-	},
-	InodeMutateSize {
-		ino: u64,
-		delta: u16,
-	},
-	DirInsert {
-		inode: u64,
-		name: Vec<u8>,
-		child: u64,
-	},
-	DirRemove {
-		inode: u64,
-		name: Vec<u8>,
-	},
-	DirRead {
-		inode: u64,
-		name: Vec<u8>,
-	},
-	DirClear {
-		inode: u64,
-	},
-	BytesWrite {
-		inode: u64,
-		offset: u16,
-		data: Vec<u8>,
-	},
-	BytesRead {
-		inode: u64,
-		offset: u16,
-		size: u16,
-	},
-	BytesTruncate {
-		inode: u64,
-		len: u16,
-	},
-	BytesRemove {
-		inode: u64,
-	},
+	InodeRemove { ino: u64 },
+	InodeRead { ino: u64 },
+	InodeMutateSize { ino: u64, delta: u16 },
+	DirInsert { inode: u64, name: Vec<u8>, child: u64 },
+	DirRemove { inode: u64, name: Vec<u8> },
+	DirRead { inode: u64, name: Vec<u8> },
+	DirClear { inode: u64 },
+	BytesWrite { inode: u64, offset: u16, data: Vec<u8> },
+	BytesRead { inode: u64, offset: u16, size: u16 },
+	BytesTruncate { inode: u64, len: u16 },
+	BytesRemove { inode: u64 },
 }
 
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -223,7 +191,9 @@ fuzz_target!(|program: Program| {
 				let ino = INodeNo(inode);
 				let name = as_name(&name);
 				let got = pager.dir_entries_remove(ino, name.as_os_str());
-				let expected = dir_model.get_mut(&ino).and_then(|entries| entries.remove(name.as_os_str()));
+				let expected = dir_model
+					.get_mut(&ino)
+					.and_then(|entries| entries.remove(name.as_os_str()));
 				if dir_model.get(&ino).is_some_and(BTreeMap::is_empty) {
 					dir_model.remove(&ino);
 				}
@@ -233,7 +203,10 @@ fuzz_target!(|program: Program| {
 				let ino = INodeNo(inode);
 				let name = as_name(&name);
 				let got = pager.dir_entries_get(ino, name.as_os_str());
-				let expected = dir_model.get(&ino).and_then(|entries| entries.get(name.as_os_str())).copied();
+				let expected = dir_model
+					.get(&ino)
+					.and_then(|entries| entries.get(name.as_os_str()))
+					.copied();
 				assert_eq!(got, expected);
 			}
 			Op::DirClear { inode } => {
@@ -283,11 +256,12 @@ fuzz_target!(|program: Program| {
 				bytes_model.remove(&ino);
 			}
 		}
-
+		pager.check_invariants();
 		check_consistency(&pager, &inode_model, &dir_model, &bytes_model);
 	}
 
 	let encoded = pager.encode_blocks().expect("encoding pager blocks should succeed");
 	pager = Pager::decode_blocks(&encoded, MAX_PAGES).expect("decoding pager blocks should succeed");
+	pager.check_invariants();
 	check_consistency(&pager, &inode_model, &dir_model, &bytes_model);
 });

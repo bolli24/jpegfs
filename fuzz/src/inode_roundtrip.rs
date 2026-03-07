@@ -94,8 +94,7 @@ fuzz_target!(|program: Program| {
 		assert_eq!(restored_ino, ino);
 		assert_eq!(restored, inode);
 
-		let raw_from_bytes =
-			InodeRaw::try_read_from_bytes(raw.as_bytes()).expect("valid InodeRaw bytes should decode");
+		let raw_from_bytes = InodeRaw::try_read_from_bytes(raw.as_bytes()).expect("valid InodeRaw bytes should decode");
 		let (ino_from_bytes, inode_from_bytes) = raw_from_bytes.into_parts().expect("decoded raw inode should convert");
 		assert_eq!(ino_from_bytes, ino);
 		assert_eq!(inode_from_bytes, inode);

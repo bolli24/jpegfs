@@ -1,3 +1,4 @@
+use crate::pager::PageId;
 use serde::{Serialize, de::DeserializeOwned};
 use std::mem::size_of;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -5,7 +6,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct Header {
-	pub block_id: u32,
+	pub page_id: PageId,
 	pub active_slots: u32,
 	pub free_space_offset: u32,
 	pub free_space: u32,
@@ -49,7 +50,7 @@ impl<T, const SIZE: usize> StoreBlock<T, SIZE>
 where
 	T: Serialize + DeserializeOwned,
 {
-	pub fn new(block_id: u32) -> Self {
+	pub fn new(page_id: PageId) -> Self {
 		assert!(
 			SIZE >= size_of::<Header>(),
 			"StoreBlock SIZE ({SIZE}) must be at least Header size ({})",
@@ -62,7 +63,7 @@ where
 
 		let mut new_block = Self {
 			header: Header {
-				block_id,
+				page_id,
 				active_slots: 0,
 				free_space_offset: SIZE as u32,
 				free_space: (SIZE - size_of::<Header>()) as u32,
@@ -282,7 +283,7 @@ mod test {
 
 	#[test]
 	fn test_store() {
-		let mut store = StoreBlock::<String, 1024>::new(0);
+		let mut store = StoreBlock::<String, 1024>::new(PageId(0));
 
 		let a = store
 			.try_store("Hello world".to_owned())
@@ -297,7 +298,7 @@ mod test {
 
 	#[test]
 	fn remove_compacts_payload_and_slots() {
-		let mut store = StoreBlock::<u64, 256>::new(0);
+		let mut store = StoreBlock::<u64, 256>::new(PageId(0));
 		let a = store.try_store(11).expect("insert should succeed");
 		let b = store.try_store(22).expect("insert should succeed");
 		let c = store.try_store(33).expect("insert should succeed");
@@ -318,7 +319,7 @@ mod test {
 
 	#[test]
 	fn remove_last_slot_reports_no_remap() {
-		let mut store = StoreBlock::<u64, 256>::new(0);
+		let mut store = StoreBlock::<u64, 256>::new(PageId(0));
 		store.try_store(11).expect("insert should succeed");
 		let b = store.try_store(22).expect("insert should succeed");
 

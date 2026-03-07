@@ -1,4 +1,5 @@
 use crate::{
+	MAGIC,
 	filesystem::BLOCK_SIZE,
 	inode::{Inode, InodeRaw},
 	store::{Error as StoreError, StoreBlock},
@@ -9,8 +10,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::mem::size_of;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
-
-const PAGE_MAGIC: [u8; 4] = *b"JPGF";
 const PAGE_VERSION: u16 = 1;
 const PAGE_CRC: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
@@ -41,11 +40,15 @@ impl PageType {
 	}
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct PageId(pub u32);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 struct PageHeaderV1 {
 	magic: [u8; 4],
-	page_id: u32,
+	page_id: PageId,
 	owner_ino: u64,
 	file_page_no: u32,
 	crc32: u32,
@@ -61,7 +64,7 @@ const BLOCK_PAYLOAD_CAPACITY: usize = BLOCK_SIZE - HEADER_SIZE;
 // Ensure entries.len() * size_of::<InodeRaw>() + 2 <= BLOCK_PAYLOAD_CAPACITY
 // Persists to header + flattened data as bytes
 pub struct InodesPage {
-	page_id: u32,
+	page_id: PageId,
 	entries: HashMap<INodeNo, Inode>,
 	free_entries: usize,
 }
@@ -71,7 +74,7 @@ const DIRENTRIES_CAPACITY: usize = BLOCK_PAYLOAD_CAPACITY;
 
 // Persists to header + entries.data
 pub struct DirEntriesPage {
-	page_id: u32,
+	page_id: PageId,
 	inode: INodeNo,
 	indices: BTreeMap<OsString, (u32, INodeNo)>,
 	entries: StoreBlock<(OsString, INodeNo), DIRENTRIES_CAPACITY>,
@@ -81,7 +84,7 @@ const DATA_PAGE_CAPACITY: usize = BLOCK_PAYLOAD_CAPACITY;
 
 // Persists to header + data
 pub struct DataBytesPage {
-	page_id: u32,
+	page_id: PageId,
 	inode: INodeNo,
 	length: usize,
 	data: [u8; DATA_PAGE_CAPACITY],
@@ -107,7 +110,7 @@ pub struct Pager {
 	free_dir_entry_pages: Vec<DirEntriesIndex>,
 	free_bytes_pages: Vec<DataBytesIndex>,
 
-	next_page_id: u32,
+	next_page_id: PageId,
 	max_pages: usize,
 }
 
@@ -141,10 +144,10 @@ pub enum PagerCodecError {
 	InodesEntryCountTooLarge(usize),
 	#[error("duplicate inode {0:?} while decoding inode pages")]
 	DuplicateInode(INodeNo),
-	#[error("duplicate page id {0}")]
-	DuplicatePageId(u32),
-	#[error("decoded page id space exhausted at {0}")]
-	PageIdSpaceExhausted(u32),
+	#[error("duplicate page id {0:?}")]
+	DuplicatePageId(PageId),
+	#[error("decoded page id space exhausted")]
+	PageIdSpaceExhausted,
 	#[error("block padding bytes must be zero")]
 	NonZeroPadding,
 	#[error("inode payload is malformed")]
@@ -165,24 +168,74 @@ pub enum PagerCodecError {
 	Store(#[from] StoreError),
 }
 
-enum DecodedPageBlock {
+pub enum DecodedPage {
 	Inodes {
-		page_id: u32,
+		page_id: PageId,
 		entries: HashMap<INodeNo, Inode>,
 	},
 	DirEntries {
-		page_id: u32,
+		page_id: PageId,
 		inode: INodeNo,
 		entries: StoreBlock<(OsString, INodeNo), DIRENTRIES_CAPACITY>,
 		indices: BTreeMap<OsString, (u32, INodeNo)>,
 	},
 	DataBytes {
-		page_id: u32,
+		page_id: PageId,
 		inode: INodeNo,
 		file_page_no: u32,
 		length: usize,
 		data: [u8; DATA_PAGE_CAPACITY],
 	},
+}
+
+impl DecodedPage {
+	pub fn page_id(&self) -> PageId {
+		match self {
+			Self::Inodes { page_id, .. } => *page_id,
+			Self::DirEntries { page_id, .. } => *page_id,
+			Self::DataBytes { page_id, .. } => *page_id,
+		}
+	}
+}
+
+pub struct ValidatedPages {
+	pages: Vec<DecodedPage>,
+}
+
+impl ValidatedPages {
+	pub fn empty() -> Self {
+		Self { pages: Vec::new() }
+	}
+
+	pub fn decode_blocks(blocks: &[[u8; BLOCK_SIZE]], max_pages: usize) -> Result<Self, PagerCodecError> {
+		let pages = Pager::decode_page_blocks(blocks)?;
+		Self::from_pages(pages, max_pages)
+	}
+
+	fn from_pages(pages: Vec<DecodedPage>, max_pages: usize) -> Result<Self, PagerCodecError> {
+		Pager::validate_decoded_pages(&pages, max_pages)?;
+		Ok(Self { pages })
+	}
+
+	pub fn len(&self) -> usize {
+		self.pages.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.pages.is_empty()
+	}
+
+	pub fn page_ids(&self) -> impl Iterator<Item = PageId> + '_ {
+		self.pages.iter().map(DecodedPage::page_id)
+	}
+
+	pub fn append(&mut self, mut other: Self) {
+		self.pages.append(&mut other.pages);
+	}
+
+	pub fn validate(self, max_pages: usize) -> Result<Self, PagerCodecError> {
+		Self::from_pages(self.pages, max_pages)
+	}
 }
 
 impl Pager {
@@ -201,7 +254,7 @@ impl Pager {
 			free_inode_slots: Default::default(),
 			free_dir_entry_pages: Default::default(),
 			free_bytes_pages: Default::default(),
-			next_page_id: 0,
+			next_page_id: PageId(0),
 			max_pages,
 		}
 	}
@@ -231,44 +284,25 @@ impl Pager {
 	}
 
 	pub fn decode_blocks(blocks: &[[u8; BLOCK_SIZE]], max_pages: usize) -> Result<Self, PagerCodecError> {
-		if blocks.len() > max_pages {
-			return Err(PagerCodecError::TooManyPages(blocks.len()));
-		}
+		let decoded = ValidatedPages::decode_blocks(blocks, max_pages)?;
 
-		let mut decoded = Vec::with_capacity(blocks.len());
-		let mut page_ids = HashSet::new();
-		let mut max_page_id: Option<u32> = None;
-		for block in blocks {
-			let page = Self::decode_block(block)?;
-			let page_id = match &page {
-				DecodedPageBlock::Inodes { page_id, .. } => *page_id,
-				DecodedPageBlock::DirEntries { page_id, .. } => *page_id,
-				DecodedPageBlock::DataBytes { page_id, .. } => *page_id,
-			};
-			if !page_ids.insert(page_id) {
-				return Err(PagerCodecError::DuplicatePageId(page_id));
-			}
-			max_page_id = Some(max_page_id.map_or(page_id, |current| current.max(page_id)));
-			decoded.push(page);
+		let mut max_page_id: Option<PageId> = None;
+		for page in &decoded.pages {
+			max_page_id = Some(max_page_id.map_or(page.page_id(), |current| PageId(current.0.max(page.page_id().0))));
 		}
 
 		let mut pager = Self::new(max_pages);
 		pager.next_page_id = match max_page_id {
-			Some(u32::MAX) => return Err(PagerCodecError::PageIdSpaceExhausted(u32::MAX)),
-			Some(id) => id + 1,
-			None => 0,
+			Some(PageId(u32::MAX)) => return Err(PagerCodecError::PageIdSpaceExhausted),
+			Some(id) => PageId(id.0 + 1),
+			None => PageId(0),
 		};
 		let mut grouped_data_pages: HashMap<INodeNo, Vec<(u32, DataBytesPage)>> = HashMap::new();
-		for page in decoded {
+		for page in decoded.pages {
 			match page {
-				DecodedPageBlock::Inodes { page_id, entries } => {
+				DecodedPage::Inodes { page_id, entries } => {
 					let index = INodesIndex(pager.inodes_pages.len());
 					let free_entries = INODES_PAGE_CAPACITY.saturating_sub(entries.len());
-					for ino in entries.keys() {
-						if pager.inodes.contains_key(ino) {
-							return Err(PagerCodecError::DuplicateInode(*ino));
-						}
-					}
 					for ino in entries.keys() {
 						pager.inodes.insert(*ino, index);
 					}
@@ -281,7 +315,7 @@ impl Pager {
 						pager.free_inode_slots.insert(index);
 					}
 				}
-				DecodedPageBlock::DirEntries {
+				DecodedPage::DirEntries {
 					page_id,
 					inode,
 					entries,
@@ -296,7 +330,7 @@ impl Pager {
 					});
 					pager.dir_entries.entry(inode).or_default().push(index);
 				}
-				DecodedPageBlock::DataBytes {
+				DecodedPage::DataBytes {
 					page_id,
 					inode,
 					file_page_no,
@@ -318,17 +352,6 @@ impl Pager {
 
 		for (ino, mut pages) in grouped_data_pages {
 			pages.sort_by_key(|(file_page_no, _)| *file_page_no);
-			for (expected, (found, _)) in pages.iter().enumerate() {
-				let expected = expected as u32;
-				if *found != expected {
-					return Err(PagerCodecError::NonContiguousDataPages {
-						ino,
-						expected,
-						found: *found,
-					});
-				}
-			}
-
 			for (_, page) in pages {
 				let index = DataBytesIndex(pager.bytes_pages.len());
 				pager.bytes_pages.push(page);
@@ -338,13 +361,73 @@ impl Pager {
 		Ok(pager)
 	}
 
+	fn validate_decoded_pages(decoded: &[DecodedPage], max_pages: usize) -> Result<(), PagerCodecError> {
+		if decoded.len() > max_pages {
+			return Err(PagerCodecError::TooManyPages(decoded.len()));
+		}
+
+		let mut page_ids = HashSet::new();
+		let mut seen_inodes = HashSet::new();
+		let mut grouped_data_pages: HashMap<INodeNo, Vec<u32>> = HashMap::new();
+
+		for page in decoded {
+			let page_id = page.page_id();
+			if !page_ids.insert(page_id) {
+				return Err(PagerCodecError::DuplicatePageId(page_id));
+			}
+			if page_id == PageId(u32::MAX) {
+				return Err(PagerCodecError::PageIdSpaceExhausted);
+			}
+
+			match page {
+				DecodedPage::Inodes { entries, .. } => {
+					for ino in entries.keys() {
+						if !seen_inodes.insert(*ino) {
+							return Err(PagerCodecError::DuplicateInode(*ino));
+						}
+					}
+				}
+				DecodedPage::DataBytes {
+					inode, file_page_no, ..
+				} => {
+					grouped_data_pages.entry(*inode).or_default().push(*file_page_no);
+				}
+				DecodedPage::DirEntries { .. } => {}
+			}
+		}
+
+		for (ino, mut pages) in grouped_data_pages {
+			pages.sort_unstable();
+			for (expected, found) in pages.iter().enumerate() {
+				let expected = expected as u32;
+				if *found != expected {
+					return Err(PagerCodecError::NonContiguousDataPages {
+						ino,
+						expected,
+						found: *found,
+					});
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	pub fn decode_page_blocks(blocks: &[[u8; BLOCK_SIZE]]) -> Result<Vec<DecodedPage>, PagerCodecError> {
+		let mut decoded = Vec::with_capacity(blocks.len());
+		for block in blocks {
+			decoded.push(Self::decode_block(block)?);
+		}
+		Ok(decoded)
+	}
+
 	pub fn page_count(&self) -> usize {
 		self.inodes_pages.len() + self.dir_entries_pages.len() + self.bytes_pages.len()
 	}
 
-	fn alloc_page_id(&mut self) -> u32 {
+	fn alloc_page_id(&mut self) -> PageId {
 		let id = self.next_page_id;
-		self.next_page_id = self.next_page_id.checked_add(1).expect("page id space exhausted");
+		self.next_page_id = PageId(self.next_page_id.0.checked_add(1).expect("page id space exhausted"));
 		id
 	}
 
@@ -882,7 +965,7 @@ impl Pager {
 
 	fn encode_wire_block(
 		page_type: PageType,
-		page_id: u32,
+		page_id: PageId,
 		owner_ino: u64,
 		file_page_no: u32,
 		payload: &[u8],
@@ -900,7 +983,7 @@ impl Pager {
 			capacity: max_payload,
 		})?;
 		let mut header = PageHeaderV1 {
-			magic: PAGE_MAGIC,
+			magic: MAGIC,
 			version: PAGE_VERSION,
 			page_type: page_type.to_wire(),
 			page_id,
@@ -918,9 +1001,9 @@ impl Pager {
 		Ok(out)
 	}
 
-	fn decode_block(block: &[u8; BLOCK_SIZE]) -> Result<DecodedPageBlock, PagerCodecError> {
+	fn decode_block(block: &[u8; BLOCK_SIZE]) -> Result<DecodedPage, PagerCodecError> {
 		let header = PageHeaderV1::read_from_bytes(&block[..HEADER_SIZE]).map_err(|_| PagerCodecError::ShortBlock)?;
-		if header.magic != PAGE_MAGIC {
+		if header.magic != MAGIC {
 			return Err(PagerCodecError::InvalidMagic(header.magic));
 		}
 		if header.version != PAGE_VERSION {
@@ -979,11 +1062,7 @@ impl Pager {
 		}
 	}
 
-	fn decode_inodes_page(
-		page_id: u32,
-		payload_len: usize,
-		payload: &[u8],
-	) -> Result<DecodedPageBlock, PagerCodecError> {
+	fn decode_inodes_page(page_id: PageId, payload_len: usize, payload: &[u8]) -> Result<DecodedPage, PagerCodecError> {
 		if payload_len < size_of::<u16>() {
 			return Err(PagerCodecError::MalformedInodesPayload);
 		}
@@ -1012,15 +1091,15 @@ impl Pager {
 				return Err(PagerCodecError::DuplicateInode(ino));
 			}
 		}
-		Ok(DecodedPageBlock::Inodes { page_id, entries })
+		Ok(DecodedPage::Inodes { page_id, entries })
 	}
 
 	fn decode_dir_entries_page(
-		page_id: u32,
+		page_id: PageId,
 		inode: INodeNo,
 		payload_len: usize,
 		payload: &[u8],
-	) -> Result<DecodedPageBlock, PagerCodecError> {
+	) -> Result<DecodedPage, PagerCodecError> {
 		if payload_len != DIRENTRIES_CAPACITY {
 			return Err(PagerCodecError::InvalidPayloadLength {
 				page_type: PageType::DirEntries,
@@ -1042,7 +1121,7 @@ impl Pager {
 				return Err(PagerCodecError::DuplicateDirEntryName(name));
 			}
 		}
-		Ok(DecodedPageBlock::DirEntries {
+		Ok(DecodedPage::DirEntries {
 			page_id,
 			inode,
 			entries,
@@ -1051,12 +1130,12 @@ impl Pager {
 	}
 
 	fn decode_data_bytes_page(
-		page_id: u32,
+		page_id: PageId,
 		inode: INodeNo,
 		file_page_no: u32,
 		payload_len: usize,
 		payload: &[u8],
-	) -> Result<DecodedPageBlock, PagerCodecError> {
+	) -> Result<DecodedPage, PagerCodecError> {
 		if payload_len > DATA_PAGE_CAPACITY {
 			return Err(PagerCodecError::PayloadTooLarge {
 				payload_len,
@@ -1065,7 +1144,7 @@ impl Pager {
 		}
 		let mut data = [0u8; DATA_PAGE_CAPACITY];
 		data[..payload_len].copy_from_slice(payload);
-		Ok(DecodedPageBlock::DataBytes {
+		Ok(DecodedPage::DataBytes {
 			page_id,
 			inode,
 			file_page_no,
@@ -1640,7 +1719,7 @@ mod tests {
 
 		let first_block = &mut encoded[0];
 		let mut header = PageHeaderV1::read_from_bytes(&first_block[..HEADER_SIZE]).expect("header should parse");
-		header.page_id = u32::MAX;
+		header.page_id = PageId(u32::MAX);
 		header.crc32 = Pager::compute_crc(
 			&header,
 			&first_block[HEADER_SIZE..HEADER_SIZE + header.payload_len as usize],
@@ -1648,7 +1727,7 @@ mod tests {
 		first_block[..HEADER_SIZE].copy_from_slice(header.as_bytes());
 
 		match Pager::decode_blocks(&encoded, 8) {
-			Err(PagerCodecError::PageIdSpaceExhausted(u32::MAX)) => {}
+			Err(PagerCodecError::PageIdSpaceExhausted) => {}
 			Err(other) => panic!("expected page-id exhaustion error, got {other:?}"),
 			Ok(_) => panic!("decode must fail"),
 		}

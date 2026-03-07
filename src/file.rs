@@ -196,6 +196,10 @@ impl JpegSession {
 }
 
 impl FileHandle {
+	pub fn from_parts(file: File, path: PathBuf, capacity: usize) -> Self {
+		Self { file, path, capacity }
+	}
+
 	pub fn capacity(&self) -> usize {
 		self.capacity
 	}

@@ -3,6 +3,7 @@
 use std::mem::size_of;
 
 use arbitrary::Arbitrary;
+use jpegfs::pager::PageId;
 use jpegfs::store::{Error, Header, StoreBlock};
 use libfuzzer_sys::fuzz_target;
 use zerocopy::FromBytes;
@@ -23,7 +24,7 @@ fn persisted_active_slots(block: &StoreBlock<Vec<u8>, BLOCK_SIZE>) -> u32 {
 }
 
 fuzz_target!(|program: Program| {
-	let mut block = StoreBlock::<Vec<u8>, BLOCK_SIZE>::new(7);
+	let mut block = StoreBlock::<Vec<u8>, BLOCK_SIZE>::new(PageId(7));
 	let mut expected = Vec::new();
 
 	for value in program.values.into_iter().take(MAX_VALUES) {

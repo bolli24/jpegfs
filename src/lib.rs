@@ -6,10 +6,13 @@ pub mod inode;
 pub mod jpeg;
 pub mod lsb;
 pub mod pager;
+pub mod persistence;
 pub mod store;
 pub mod zigzag;
 
 use serde::{Deserialize, Serialize};
+
+pub const MAGIC: [u8; 4] = *b"JPGF";
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct Header {

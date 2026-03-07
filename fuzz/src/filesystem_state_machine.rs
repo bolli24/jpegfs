@@ -88,8 +88,8 @@ fn fuzz_name(bytes: &[u8]) -> OsString {
 fn refresh_pools(state: &FileSystemState, inodes: &mut Vec<INodeNo>, handles: &mut Vec<FileHandle>) {
 	inodes.clear();
 	handles.clear();
-	inodes.extend(state.inodes.keys().copied());
-	handles.extend(state.handles.keys().copied());
+	inodes.extend(state.inode_numbers());
+	handles.extend(state.handle_ids());
 }
 
 fuzz_target!(|program: Program| {
@@ -196,6 +196,12 @@ fuzz_target!(|program: Program| {
 				let _ = state.op_statfs();
 			}
 		}
+
+		assert_eq!(
+			state.used_bytes(),
+			state.recompute_used_bytes(),
+			"used_bytes accounting mismatch after {op:?}"
+		);
 
 		if let Err(msg) = state.check_invariants() {
 			panic!("invariant violation after {op:?}: {msg}");

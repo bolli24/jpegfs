@@ -354,6 +354,17 @@ impl Pager {
 		self.inodes.len()
 	}
 
+	pub fn inodes_snapshot(&self) -> Vec<(INodeNo, Inode)> {
+		let mut out = Vec::with_capacity(self.inodes.len());
+		for ino in self.inodes.keys().copied() {
+			if let Some(inode) = self.inode_get(ino).copied() {
+				out.push((ino, inode));
+			}
+		}
+		out.sort_by_key(|(ino, _)| ino.0);
+		out
+	}
+
 	pub fn inode_get(&self, inode: INodeNo) -> Option<&Inode> {
 		let index = self.inodes.get(&inode)?;
 		self.inodes_pages.get(index.0)?.entries.get(&inode)
@@ -425,6 +436,10 @@ impl Pager {
 
 	pub fn dir_entries_contains(&self, inode: INodeNo, name: &OsStr) -> bool {
 		self.dir_entries_get(inode, name).is_some()
+	}
+
+	pub fn dir_entries_exists(&self, inode: INodeNo) -> bool {
+		self.dir_entries.contains_key(&inode)
 	}
 
 	pub fn dir_entries_get(&self, inode: INodeNo, name: &OsStr) -> Option<INodeNo> {
@@ -1189,10 +1204,12 @@ mod tests {
 		let mut pager = Pager::new(8);
 		let name = OsString::from("child");
 		let parent = INodeNo(10);
+		assert!(!pager.dir_entries_exists(parent));
 
 		pager
 			.dir_entries_insert(parent, name.clone(), INodeNo(11))
 			.expect("initial insert should succeed");
+		assert!(pager.dir_entries_exists(parent));
 		assert!(pager.dir_entries_contains(parent, &name));
 		assert_eq!(pager.dir_entries_get(parent, &name), Some(INodeNo(11)));
 
@@ -1204,6 +1221,7 @@ mod tests {
 		let removed = pager.dir_entries_remove(parent, &name);
 		assert_eq!(removed, Some(INodeNo(12)));
 		assert_eq!(pager.dir_entries_get(parent, &name), None);
+		assert!(!pager.dir_entries_exists(parent));
 	}
 
 	#[test]

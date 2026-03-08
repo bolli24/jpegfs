@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::{fs, fs::File, io::Read};
 
 use anyhow::{Context, bail};
-use sha256::digest;
 
 use crate::jpeg::{OwnedJpeg, get_capacity, read_owned_jpeg, write_owned_jpeg};
 use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
@@ -169,7 +168,6 @@ impl JpegSession {
 			.context("failed to write output file")?;
 
 		println!("Wrote '{}': {}KiB", self.path.display(), output_jpeg.len() / 1024);
-		println!("SHA256: {}", digest(&output_jpeg));
 
 		self.source_jpeg = output_jpeg;
 		self.dirty = false;

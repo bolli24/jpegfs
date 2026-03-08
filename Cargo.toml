@@ -29,6 +29,7 @@ simplelog = "0.12"
 ctrlc = "3.4"
 ratatui = "0.29"
 crossterm = "0.29"
+rayon = "1.11"
 
 [profile.release]
 debug = true

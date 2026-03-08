@@ -1,11 +1,14 @@
 use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use fuser::{Config as FuseConfig, MountOption, spawn_mount2};
-use log::{error, info};
+use log::{error, info, warn};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use rayon::ThreadPool;
+use rayon::prelude::*;
 
 use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
 use jpegfs::jpeg_file::init_file;
@@ -61,6 +64,12 @@ fn main() -> anyhow::Result<()> {
 
 	let jpeg_dir = parse_jpeg_dir_arg()?;
 	let jpeg_paths = discover_jpeg_paths(&jpeg_dir)?;
+	let jpeg_threads = configured_jpeg_threads(jpeg_paths.len())?;
+	info!(
+		"JPEG worker threads configured: {} (stores: {})",
+		jpeg_threads,
+		jpeg_paths.len()
+	);
 
 	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(&jpeg_paths)?;
 	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
@@ -98,7 +107,12 @@ fn main() -> anyhow::Result<()> {
 	tui::run_tui(&persistence.fs, &mount_path, &log_rx, &shutdown_rx)?;
 	drop(session);
 	log_filesystem_capacity("before exit", &persistence.fs, total_page_capacity);
+	let shutdown_persist_started_at = Instant::now();
 	persistence.persist_once()?;
+	println!(
+		"Shutdown persistence completed in {:?}",
+		shutdown_persist_started_at.elapsed()
+	);
 
 	Ok(())
 }
@@ -155,21 +169,26 @@ fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>, ValidatedPages, usize)> {
+	let decode_started_at = Instant::now();
+	let pool = jpeg_thread_pool(paths.len())?;
+	let loaded: Vec<anyhow::Result<(usize, JpegBlockStore, ValidatedPages, usize)>> = pool.install(|| {
+		paths
+			.par_iter()
+			.enumerate()
+			.map(|(index, path)| load_one_store(index, path.as_path()))
+			.collect()
+	});
+
+	let mut loaded = loaded.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+	loaded.sort_by_key(|(index, _, _, _)| *index);
+
 	let mut stores = Vec::with_capacity(paths.len());
 	let mut decoded_pages = ValidatedPages::empty();
 	let mut total_page_capacity = 0usize;
 
-	for path in paths {
-		let mut file =
-			init_file(path.as_path()).with_context(|| format!("failed to open JPEG store at {}", path.display()))?;
-		let data = file
-			.read_data(file.capacity())
-			.with_context(|| format!("failed to read JPEG store data from {}", path.display()))?;
-		let (store, pages) = JpegBlockStore::from_bytes_or_init_strict(file, &data)
-			.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
-
+	for (_, store, pages, page_capacity) in loaded {
 		total_page_capacity = total_page_capacity
-			.checked_add(store.page_capacity())
+			.checked_add(page_capacity)
 			.context("total page capacity overflow while loading JPEG stores")?;
 		decoded_pages.append(pages);
 		stores.push(store);
@@ -179,7 +198,24 @@ fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>
 		.validate(total_page_capacity)
 		.context("combined persisted pages are invalid")?;
 
+	info!(
+		"Decoded {} JPEG stores in {:?}",
+		paths.len(),
+		decode_started_at.elapsed()
+	);
+
 	Ok((stores, decoded_pages, total_page_capacity))
+}
+
+fn load_one_store(index: usize, path: &Path) -> anyhow::Result<(usize, JpegBlockStore, ValidatedPages, usize)> {
+	let mut file = init_file(path).with_context(|| format!("failed to open JPEG store at {}", path.display()))?;
+	let data = file
+		.read_data(file.capacity())
+		.with_context(|| format!("failed to read JPEG store data from {}", path.display()))?;
+	let (store, pages) = JpegBlockStore::from_bytes_or_init_strict(file, &data)
+		.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
+	let page_capacity = store.page_capacity();
+	Ok((index, store, pages, page_capacity))
 }
 
 fn init_filesystem(decoded_pages: ValidatedPages, total_page_capacity: usize) -> anyhow::Result<FileSystem> {
@@ -226,6 +262,7 @@ fn persist_filesystem(
 	fs: &FileSystem,
 	total_page_capacity: usize,
 ) -> anyhow::Result<()> {
+	let encode_started_at = Instant::now();
 	let encoded_pages = {
 		let state = fs.state.read();
 		state
@@ -245,21 +282,85 @@ fn persist_filesystem(
 		total_page_capacity
 	);
 
-	let mut cursor = 0usize;
-	for store in stores {
-		let end = (cursor + store.page_capacity()).min(encoded_pages.len());
-		store
-			.persist_blocks(&encoded_pages[cursor..end])
-			.context("failed to persist encoded pages to JPEG store")?;
-		cursor = end;
-	}
+	let capacities: Vec<usize> = stores.iter().map(JpegBlockStore::page_capacity).collect();
+	let (ranges, cursor) = assign_page_ranges(&capacities, encoded_pages.len());
+	let pool = jpeg_thread_pool(stores.len())?;
+	let persist_results: Vec<anyhow::Result<()>> = pool.install(|| {
+		stores
+			.par_iter_mut()
+			.zip(ranges.par_iter())
+			.map(|(store, (start, end))| {
+				store
+					.persist_blocks(&encoded_pages[*start..*end])
+					.context("failed to persist encoded pages to JPEG store")
+			})
+			.collect()
+	});
+	persist_results
+		.into_iter()
+		.collect::<anyhow::Result<Vec<_>>>()
+		.map(|_| ())?;
 
 	anyhow::ensure!(
 		cursor == encoded_pages.len(),
 		"internal error: {} encoded pages were not persisted",
 		encoded_pages.len().saturating_sub(cursor)
 	);
+	info!(
+		"Encoded and persisted {} pages across {} JPEG stores in {:?}",
+		encoded_pages.len(),
+		stores.len(),
+		encode_started_at.elapsed()
+	);
 	Ok(())
+}
+
+fn assign_page_ranges(capacities: &[usize], total_pages: usize) -> (Vec<(usize, usize)>, usize) {
+	let mut ranges = Vec::with_capacity(capacities.len());
+	let mut cursor = 0usize;
+	for &capacity in capacities {
+		let end = (cursor + capacity).min(total_pages);
+		ranges.push((cursor, end));
+		cursor = end;
+	}
+	(ranges, cursor)
+}
+
+fn jpeg_thread_pool(job_count: usize) -> anyhow::Result<ThreadPool> {
+	let threads = configured_jpeg_threads(job_count)?;
+	rayon::ThreadPoolBuilder::new()
+		.num_threads(threads)
+		.build()
+		.context("failed to build JPEG worker thread pool")
+}
+
+fn configured_jpeg_threads(job_count: usize) -> anyhow::Result<usize> {
+	if job_count == 0 {
+		return Ok(1);
+	}
+
+	let auto_threads = std::thread::available_parallelism()
+		.map(std::num::NonZeroUsize::get)
+		.unwrap_or(1);
+	let max_threads = auto_threads.max(1).min(job_count);
+
+	match std::env::var("JPEGFS_JPEG_THREADS") {
+		Ok(raw) => match raw.parse::<usize>() {
+			Ok(parsed) if parsed > 0 => Ok(parsed.min(job_count)),
+			_ => {
+				warn!(
+					"invalid JPEGFS_JPEG_THREADS='{}'; using auto thread count ({})",
+					raw, max_threads
+				);
+				Ok(max_threads)
+			}
+		},
+		Err(std::env::VarError::NotPresent) => Ok(max_threads),
+		Err(err) => {
+			warn!("failed reading JPEGFS_JPEG_THREADS ({err}); using auto thread count ({max_threads})");
+			Ok(max_threads)
+		}
+	}
 }
 
 pub fn rng_from_passphrase(passphrase: &str, salt: &[u8]) -> anyhow::Result<ChaCha20Rng> {

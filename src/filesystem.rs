@@ -1,5 +1,5 @@
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	ffi::{OsStr, OsString},
 	io,
 	os::unix::ffi::OsStrExt,
@@ -298,6 +298,25 @@ impl FileSystemState {
 		self.pager.dir_entries_get(parent, name).ok_or(Errno::ENOENT)
 	}
 
+	fn is_descendant_dir(&self, candidate: INodeNo, ancestor: INodeNo) -> FsOpResult<bool> {
+		let mut cursor = candidate;
+		let mut visited = HashSet::new();
+		loop {
+			if cursor == ancestor {
+				return Ok(true);
+			}
+			if !visited.insert(cursor) {
+				return Err(Errno::EIO);
+			}
+			if cursor == INodeNo(1) {
+				return Ok(false);
+			}
+
+			let parent = self.pager.dir_entries_get(cursor, OsStr::new("..")).ok_or(Errno::EIO)?;
+			cursor = parent;
+		}
+	}
+
 	fn validate_file_handle(&self, ino: INodeNo, fh: FileHandle) -> FsOpResult<()> {
 		let Some(handle_ino) = self.handles.get(&fh) else {
 			return Err(Errno::EBADF);
@@ -338,6 +357,28 @@ impl FileSystemState {
 
 		let inode = self.pager.inode_get_mut(ino).ok_or(Errno::EIO)?;
 		inode.size = new_len as u64;
+		Ok(())
+	}
+
+	fn apply_dir_nlink_delta(&mut self, ino: INodeNo, delta: i32) -> FsOpResult<()> {
+		if delta == 0 {
+			return Ok(());
+		}
+
+		// Keep rename link accounting centralized and explicit for directory moves/replacements.
+		let inode = self.pager.inode_get_mut(ino).ok_or(Errno::EIO)?;
+		match delta {
+			-1 => {
+				if inode.nlink == 0 {
+					return Err(Errno::EIO);
+				}
+				inode.nlink -= 1;
+			}
+			1 => {
+				inode.nlink += 1;
+			}
+			_ => return Err(Errno::EIO),
+		}
 		Ok(())
 	}
 
@@ -632,6 +673,152 @@ impl FileSystemState {
 		inode.mtime = now;
 		inode.ctime = now;
 		Ok(*inode)
+	}
+
+	pub fn op_rename(
+		&mut self,
+		parent: INodeNo,
+		name: &OsStr,
+		newparent: INodeNo,
+		newname: &OsStr,
+		flags: RenameFlags,
+	) -> FsOpResult<()> {
+		if !flags.is_empty() {
+			return Err(Errno::EINVAL);
+		}
+		Self::reject_dot_entries(name)?;
+		Self::reject_dot_entries(newname)?;
+		self.ensure_name_len(newname)?;
+		self.ensure_parent_dir(parent)?;
+		self.ensure_parent_dir(newparent)?;
+
+		if parent == newparent && name == newname {
+			return Ok(());
+		}
+
+		let source_ino = self.lookup_child_ino(parent, name)?;
+		if source_ino == INodeNo(1) {
+			return Err(Errno::EBUSY);
+		}
+		let source_inode = self.pager.inode_get(source_ino).ok_or(Errno::EIO)?;
+		let source_is_dir = source_inode.kind == FileType::Directory;
+
+		if source_is_dir && parent != newparent && self.is_descendant_dir(newparent, source_ino)? {
+			return Err(Errno::EINVAL);
+		}
+
+		let target_ino = self.pager.dir_entries_get(newparent, newname);
+		if target_ino == Some(source_ino) {
+			return Ok(());
+		}
+
+		let mut target_is_dir = false;
+		if let Some(existing_ino) = target_ino {
+			if existing_ino == INodeNo(1) {
+				return Err(Errno::EBUSY);
+			}
+			let existing_inode = self.pager.inode_get(existing_ino).ok_or(Errno::EIO)?;
+			target_is_dir = existing_inode.kind == FileType::Directory;
+
+			if source_is_dir && !target_is_dir {
+				return Err(Errno::ENOTDIR);
+			}
+			if !source_is_dir && target_is_dir {
+				return Err(Errno::EISDIR);
+			}
+			if target_is_dir {
+				let target_dir = self.pager.dir_entries_get_dir(existing_ino).ok_or(Errno::EIO)?;
+				if target_dir.len() > 2 {
+					return Err(Errno::ENOTEMPTY);
+				}
+			}
+		}
+
+		if self
+			.pager
+			.dir_entries_insert(newparent, newname.to_owned(), source_ino)
+			.is_err()
+		{
+			return Err(Errno::ENOSPC);
+		}
+
+		let removed_source = self.pager.dir_entries_remove(parent, name);
+		if removed_source != Some(source_ino) {
+			// Best-effort rollback on unexpected state.
+			let _ = self.pager.dir_entries_remove(newparent, newname);
+			if let Some(existing_ino) = target_ino {
+				let _ = self
+					.pager
+					.dir_entries_insert(newparent, newname.to_owned(), existing_ino);
+			}
+			let _ = self.pager.dir_entries_insert(parent, name.to_owned(), source_ino);
+			return Err(Errno::EIO);
+		}
+
+		let now = SystemTime::now();
+		let mut old_parent_dir_delta = 0i32;
+		let mut new_parent_dir_delta = 0i32;
+
+		if let Some(existing_ino) = target_ino {
+			if target_is_dir {
+				self.pager.dir_entries_clear(existing_ino);
+				self.pager.inode_remove(existing_ino).ok_or(Errno::EIO)?;
+				self.free_inos.push(existing_ino);
+				// Replacing an existing directory removes one subdirectory edge from newparent.
+				new_parent_dir_delta -= 1;
+			} else {
+				let remove_inode = {
+					let target_inode = self.pager.inode_get_mut(existing_ino).ok_or(Errno::EIO)?;
+					if target_inode.nlink == 0 {
+						return Err(Errno::EIO);
+					}
+					target_inode.nlink -= 1;
+					target_inode.ctime = now;
+					target_inode.nlink == 0
+				};
+				if remove_inode {
+					FileSystem::cleanup_unlinked_inode_if_releasable(self, existing_ino);
+				}
+			}
+		}
+
+		if source_is_dir && parent != newparent {
+			if self
+				.pager
+				.dir_entries_insert(source_ino, OsString::from(".."), newparent)
+				.is_err()
+			{
+				return Err(Errno::EIO);
+			}
+			old_parent_dir_delta -= 1;
+			new_parent_dir_delta += 1;
+		}
+
+		self.apply_dir_nlink_delta(parent, old_parent_dir_delta)?;
+		self.apply_dir_nlink_delta(newparent, new_parent_dir_delta)?;
+
+		if parent == newparent {
+			let parent_inode = self.pager.inode_get_mut(parent).ok_or(Errno::EIO)?;
+			parent_inode.mtime = now;
+			parent_inode.ctime = now;
+		} else {
+			let parent_inode = self.pager.inode_get_mut(parent).ok_or(Errno::EIO)?;
+			parent_inode.mtime = now;
+			parent_inode.ctime = now;
+
+			let new_parent_inode = self.pager.inode_get_mut(newparent).ok_or(Errno::EIO)?;
+			new_parent_inode.mtime = now;
+			new_parent_inode.ctime = now;
+		}
+
+		let source_inode = self.pager.inode_get_mut(source_ino).ok_or(Errno::EIO)?;
+		source_inode.ctime = now;
+		Ok(())
+	}
+
+	pub fn op_access(&self, ino: INodeNo, _mask: AccessFlags) -> FsOpResult<()> {
+		self.inode_or_enoent(ino)?;
+		Ok(())
 	}
 
 	pub fn check_invariants(&self) -> Result<(), String> {
@@ -955,11 +1142,11 @@ impl Filesystem for FileSystem {
 		info!(
 			"rename(parent={parent:?}, name={name:?}, newparent={newparent:?}, newname={newname:?}, flags={flags:?})"
 		);
-		warn!(
-			"[Not Implemented] rename(parent: {parent:#x?}, name: {name:?}, \
-            newparent: {newparent:#x?}, newname: {newname:?}, flags: {flags})",
-		);
-		reply.error(Errno::ENOSYS);
+		let mut state = self.state.write();
+		match state.op_rename(parent, name, newparent, newname, flags) {
+			Ok(()) => reply.ok(),
+			Err(err) => reply.error(err),
+		}
 	}
 
 	fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
@@ -1018,8 +1205,7 @@ impl Filesystem for FileSystem {
 
 	fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
 		info!("flush(ino={ino:?}, fh={fh}, lock_owner={lock_owner:?})");
-		warn!("[Not Implemented] flush(ino: {ino:#x?}, fh: {fh}, lock_owner: {lock_owner:?})");
-		reply.error(Errno::ENOSYS);
+		reply.ok();
 	}
 
 	fn release(
@@ -1040,8 +1226,7 @@ impl Filesystem for FileSystem {
 
 	fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
 		info!("fsync(ino={ino:?}, fh={fh}, datasync={datasync})");
-		warn!("[Not Implemented] fsync(ino: {ino:#x?}, fh: {fh}, datasync: {datasync})");
-		reply.error(Errno::ENOSYS);
+		reply.ok();
 	}
 
 	fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -1087,8 +1272,7 @@ impl Filesystem for FileSystem {
 
 	fn fsyncdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
 		info!("fsyncdir(ino={ino:?}, fh={fh}, datasync={datasync})");
-		warn!("[Not Implemented] fsyncdir(ino: {ino:#x?}, fh: {fh}, datasync: {datasync})");
-		reply.error(Errno::ENOSYS);
+		reply.ok();
 	}
 
 	fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
@@ -1145,8 +1329,11 @@ impl Filesystem for FileSystem {
 
 	fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
 		info!("access(ino={ino:?}, mask={mask:?})");
-		warn!("[Not Implemented] access(ino: {ino:#x?}, mask: {mask})");
-		reply.error(Errno::ENOSYS);
+		let state = self.state.read();
+		match state.op_access(ino, mask) {
+			Ok(()) => reply.ok(),
+			Err(err) => reply.error(err),
+		}
 	}
 
 	fn create(
@@ -1477,6 +1664,258 @@ mod tests {
 		state.op_release(fh_second);
 
 		assert_eq!(first, second);
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn rename_file_same_dir_changes_name() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (ino, _inode, fh) = state
+			.op_create(INodeNo(1), OsStr::new("old"), 0o644, 0, 1000, 1000)
+			.expect("create should succeed");
+		state.op_release(fh);
+
+		state
+			.op_rename(
+				INodeNo(1),
+				OsStr::new("old"),
+				INodeNo(1),
+				OsStr::new("new"),
+				RenameFlags::empty(),
+			)
+			.expect("rename should succeed");
+
+		assert_eq!(state.pager.dir_entries_get(INodeNo(1), OsStr::new("old")), None);
+		assert_eq!(state.pager.dir_entries_get(INodeNo(1), OsStr::new("new")), Some(ino));
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn rename_replace_file_unlinks_old_target() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (src_ino, _src_inode, src_fh) = state
+			.op_create(INodeNo(1), OsStr::new("src"), 0o644, 0, 1000, 1000)
+			.expect("create src should succeed");
+		state.op_release(src_fh);
+
+		let (dst_ino, _dst_inode, dst_fh) = state
+			.op_create(INodeNo(1), OsStr::new("dst"), 0o644, 0, 1000, 1000)
+			.expect("create dst should succeed");
+		state
+			.op_write(dst_ino, dst_fh, 0, b"payload")
+			.expect("write should succeed");
+		state.op_release(dst_fh);
+
+		state
+			.op_rename(
+				INodeNo(1),
+				OsStr::new("src"),
+				INodeNo(1),
+				OsStr::new("dst"),
+				RenameFlags::empty(),
+			)
+			.expect("rename should succeed");
+
+		assert_eq!(state.pager.dir_entries_get(INodeNo(1), OsStr::new("src")), None);
+		assert_eq!(
+			state.pager.dir_entries_get(INodeNo(1), OsStr::new("dst")),
+			Some(src_ino)
+		);
+		assert_eq!(
+			state
+				.op_getattr(dst_ino)
+				.map_err(i32::from)
+				.expect_err("old dst inode should be removed"),
+			i32::from(Errno::ENOENT)
+		);
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn rename_dir_across_dirs_updates_dotdot_and_nlink() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (a, _) = state
+			.op_mkdir(INodeNo(1), OsStr::new("a"), 0o755, 0, 1000, 1000)
+			.expect("mkdir a should succeed");
+		let (b, _) = state
+			.op_mkdir(INodeNo(1), OsStr::new("b"), 0o755, 0, 1000, 1000)
+			.expect("mkdir b should succeed");
+		let (child, _) = state
+			.op_mkdir(a, OsStr::new("child"), 0o755, 0, 1000, 1000)
+			.expect("mkdir child should succeed");
+
+		state
+			.op_rename(a, OsStr::new("child"), b, OsStr::new("moved"), RenameFlags::empty())
+			.expect("rename should succeed");
+
+		assert_eq!(state.pager.dir_entries_get(a, OsStr::new("child")), None);
+		assert_eq!(state.pager.dir_entries_get(b, OsStr::new("moved")), Some(child));
+		assert_eq!(state.pager.dir_entries_get(child, OsStr::new("..")), Some(b));
+		assert_eq!(state.pager.inode_get(a).expect("a should exist").nlink, 2);
+		assert_eq!(state.pager.inode_get(b).expect("b should exist").nlink, 3);
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn rename_replace_empty_dir_same_parent_decrements_parent_nlink() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let root = INodeNo(1);
+		let (src_ino, _) = state
+			.op_mkdir(root, OsStr::new("src"), 0o755, 0, 1000, 1000)
+			.expect("mkdir src should succeed");
+		let (dst_ino, _) = state
+			.op_mkdir(root, OsStr::new("dst"), 0o755, 0, 1000, 1000)
+			.expect("mkdir dst should succeed");
+
+		let before = state.pager.inode_get(root).expect("root exists").nlink;
+		state
+			.op_rename(root, OsStr::new("src"), root, OsStr::new("dst"), RenameFlags::empty())
+			.expect("rename should succeed");
+
+		assert_eq!(state.pager.dir_entries_get(root, OsStr::new("src")), None);
+		assert_eq!(state.pager.dir_entries_get(root, OsStr::new("dst")), Some(src_ino));
+		assert_eq!(
+			state
+				.op_getattr(dst_ino)
+				.map_err(i32::from)
+				.expect_err("old dst inode should be removed"),
+			i32::from(Errno::ENOENT)
+		);
+		let after = state.pager.inode_get(root).expect("root exists").nlink;
+		assert_eq!(after, before - 1);
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn rename_replace_empty_dir_cross_parent_keeps_newparent_nlink() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let root = INodeNo(1);
+		let (old_parent, _) = state
+			.op_mkdir(root, OsStr::new("old_parent"), 0o755, 0, 1000, 1000)
+			.expect("mkdir old_parent should succeed");
+		let (new_parent, _) = state
+			.op_mkdir(root, OsStr::new("new_parent"), 0o755, 0, 1000, 1000)
+			.expect("mkdir new_parent should succeed");
+		let (src_ino, _) = state
+			.op_mkdir(old_parent, OsStr::new("src"), 0o755, 0, 1000, 1000)
+			.expect("mkdir src should succeed");
+		let (dst_ino, _) = state
+			.op_mkdir(new_parent, OsStr::new("dst"), 0o755, 0, 1000, 1000)
+			.expect("mkdir dst should succeed");
+
+		let old_before = state.pager.inode_get(old_parent).expect("old_parent exists").nlink;
+		let new_before = state.pager.inode_get(new_parent).expect("new_parent exists").nlink;
+		state
+			.op_rename(
+				old_parent,
+				OsStr::new("src"),
+				new_parent,
+				OsStr::new("dst"),
+				RenameFlags::empty(),
+			)
+			.expect("rename should succeed");
+
+		assert_eq!(state.pager.dir_entries_get(old_parent, OsStr::new("src")), None);
+		assert_eq!(
+			state.pager.dir_entries_get(new_parent, OsStr::new("dst")),
+			Some(src_ino)
+		);
+		assert_eq!(state.pager.dir_entries_get(src_ino, OsStr::new("..")), Some(new_parent));
+		assert_eq!(
+			state
+				.op_getattr(dst_ino)
+				.map_err(i32::from)
+				.expect_err("old dst inode should be removed"),
+			i32::from(Errno::ENOENT)
+		);
+		let old_after = state.pager.inode_get(old_parent).expect("old_parent exists").nlink;
+		let new_after = state.pager.inode_get(new_parent).expect("new_parent exists").nlink;
+		assert_eq!(old_after, old_before - 1);
+		assert_eq!(new_after, new_before);
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn rename_replace_non_empty_dir_fails_with_enotempty() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (src_parent, _) = state
+			.op_mkdir(INodeNo(1), OsStr::new("src_parent"), 0o755, 0, 1000, 1000)
+			.expect("mkdir src_parent should succeed");
+		let (dst_parent, _) = state
+			.op_mkdir(INodeNo(1), OsStr::new("dst_parent"), 0o755, 0, 1000, 1000)
+			.expect("mkdir dst_parent should succeed");
+		let (_src_dir, _) = state
+			.op_mkdir(src_parent, OsStr::new("src_dir"), 0o755, 0, 1000, 1000)
+			.expect("mkdir src_dir should succeed");
+		let (dst_dir, _) = state
+			.op_mkdir(dst_parent, OsStr::new("dst_dir"), 0o755, 0, 1000, 1000)
+			.expect("mkdir dst_dir should succeed");
+		let (_file, _inode, fh) = state
+			.op_create(dst_dir, OsStr::new("payload"), 0o644, 0, 1000, 1000)
+			.expect("create payload should succeed");
+		state.op_release(fh);
+
+		let err = state
+			.op_rename(
+				src_parent,
+				OsStr::new("src_dir"),
+				dst_parent,
+				OsStr::new("dst_dir"),
+				RenameFlags::empty(),
+			)
+			.expect_err("rename should fail");
+
+		assert_eq!(i32::from(err), i32::from(Errno::ENOTEMPTY));
+		assert!(state.pager.dir_entries_get(src_parent, OsStr::new("src_dir")).is_some());
+		assert_eq!(
+			state.pager.dir_entries_get(dst_parent, OsStr::new("dst_dir")),
+			Some(dst_dir)
+		);
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn rename_rejects_non_empty_flags() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (_ino, _inode, fh) = state
+			.op_create(INodeNo(1), OsStr::new("a"), 0o644, 0, 1000, 1000)
+			.expect("create should succeed");
+		state.op_release(fh);
+
+		let err = state
+			.op_rename(
+				INodeNo(1),
+				OsStr::new("a"),
+				INodeNo(1),
+				OsStr::new("b"),
+				RenameFlags::RENAME_NOREPLACE,
+			)
+			.expect_err("rename should fail");
+		assert_eq!(i32::from(err), i32::from(Errno::EINVAL));
+		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn access_existing_ok_missing_enoent() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (ino, _inode, fh) = state
+			.op_create(INodeNo(1), OsStr::new("acc"), 0o644, 0, 1000, 1000)
+			.expect("create should succeed");
+		state.op_release(fh);
+
+		assert!(state.op_access(ino, AccessFlags::F_OK).is_ok());
+		let err = state
+			.op_access(INodeNo(999_999), AccessFlags::F_OK)
+			.expect_err("missing inode should fail");
+		assert_eq!(i32::from(err), i32::from(Errno::ENOENT));
 		assert!(state.check_invariants().is_ok());
 	}
 }

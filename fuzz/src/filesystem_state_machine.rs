@@ -64,6 +64,17 @@ enum Op {
 		inode_slot: u16,
 		offset: u16,
 	},
+	Rename {
+		parent_slot: u16,
+		name: Vec<u8>,
+		new_parent_slot: u16,
+		new_name: Vec<u8>,
+		flags: u8,
+	},
+	Access {
+		inode_slot: u16,
+		mask: u8,
+	},
 	Getattr {
 		inode_slot: u16,
 	},
@@ -185,6 +196,36 @@ fuzz_target!(|program: Program| {
 			Op::Readdir { inode_slot, offset } => {
 				if let Some(ino) = pick(&inodes, *inode_slot) {
 					let _ = state.op_readdir(ino, u64::from(*offset));
+				}
+			}
+			Op::Rename {
+				parent_slot,
+				name,
+				new_parent_slot,
+				new_name,
+				flags,
+			} => {
+				if let (Some(parent), Some(newparent)) =
+					(pick(&inodes, *parent_slot), pick(&inodes, *new_parent_slot))
+				{
+					let rename_flags = if (flags & 1) == 0 {
+						fuser::RenameFlags::empty()
+					} else {
+						fuser::RenameFlags::RENAME_NOREPLACE
+					};
+					let _ = state.op_rename(
+						parent,
+						&fuzz_name(name),
+						newparent,
+						&fuzz_name(new_name),
+						rename_flags,
+					);
+				}
+			}
+			Op::Access { inode_slot, mask } => {
+				if let Some(ino) = pick(&inodes, *inode_slot) {
+					let access_mask = fuser::AccessFlags::from_bits_retain(i32::from(*mask));
+					let _ = state.op_access(ino, access_mask);
 				}
 			}
 			Op::Getattr { inode_slot } => {

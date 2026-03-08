@@ -38,6 +38,7 @@ macro_rules! invariant_or_eio {
 	}};
 }
 
+#[derive(Clone)]
 pub struct FileSystem {
 	pub state: Arc<RwLock<FileSystemState>>,
 }
@@ -70,6 +71,11 @@ impl FileSystem {
 	}
 
 	pub fn new() -> Self {
+		Self::new_with_limits(Self::pager_max_pages(TOTAL_BYTES_LIMIT, MAX_INODES), TOTAL_BYTES_LIMIT)
+			.expect("default file system limits must allow root inode and root directory entries")
+	}
+
+	pub fn new_with_limits(max_pages: usize, total_bytes_limit: usize) -> Result<Self, String> {
 		let now = SystemTime::now();
 		let root_ino = INodeNo(1);
 		let root_uid = unsafe { libc::geteuid() };
@@ -88,16 +94,16 @@ impl FileSystem {
 			crtime: now,
 		};
 
-		let mut pager = Pager::new(Self::pager_max_pages(TOTAL_BYTES_LIMIT, MAX_INODES));
+		let mut pager = Pager::new(max_pages.max(1));
 		pager
 			.inodes_insert(root_ino, root_inode)
-			.expect("root inode must fit into a fresh pager");
+			.map_err(|()| "insufficient page capacity for root inode".to_string())?;
 		pager
 			.dir_entries_insert(root_ino, OsString::from("."), root_ino)
-			.expect("root '.' entry must fit into a fresh pager");
+			.map_err(|()| "insufficient page capacity for root '.' entry".to_string())?;
 		pager
 			.dir_entries_insert(root_ino, OsString::from(".."), root_ino)
-			.expect("root '..' entry must fit into a fresh pager");
+			.map_err(|()| "insufficient page capacity for root '..' entry".to_string())?;
 
 		let state = FileSystemState {
 			pager,
@@ -108,12 +114,52 @@ impl FileSystem {
 			max_inodes: MAX_INODES,
 			max_name_len: MAX_NAME_LEN,
 			max_file_size: MAX_FILE_SIZE,
-			total_bytes_limit: TOTAL_BYTES_LIMIT,
+			total_bytes_limit,
 			used_bytes: 0,
 		};
-		Self {
+		Ok(Self {
 			state: Arc::new(RwLock::new(state)),
+		})
+	}
+
+	pub fn from_pager(pager: Pager, total_bytes_limit: usize) -> Result<Self, String> {
+		let inode_numbers: HashSet<INodeNo> = pager.inodes_snapshot().into_iter().map(|(ino, _)| ino).collect();
+		let max_ino = inode_numbers.iter().map(|ino| ino.0).max().unwrap_or(1);
+		let free_inos = (2..max_ino)
+			.filter_map(|raw| {
+				let ino = INodeNo(raw);
+				(!inode_numbers.contains(&ino)).then_some(ino)
+			})
+			.rev()
+			.collect();
+
+		let state = FileSystemState {
+			pager,
+			handles: HashMap::new(),
+			next_fh: 1,
+			next_ino: INodeNo(max_ino.saturating_add(1)),
+			free_inos,
+			max_inodes: MAX_INODES,
+			max_name_len: MAX_NAME_LEN,
+			max_file_size: MAX_FILE_SIZE,
+			total_bytes_limit,
+			used_bytes: 0,
+		};
+
+		let used_bytes = state.recompute_used_bytes();
+		if used_bytes > total_bytes_limit as u64 {
+			return Err(format!(
+				"persisted file data ({used_bytes} bytes) exceeds configured limit ({total_bytes_limit} bytes)"
+			));
 		}
+
+		let mut state = state;
+		state.used_bytes = used_bytes;
+
+		state.check_invariants()?;
+		Ok(Self {
+			state: Arc::new(RwLock::new(state)),
+		})
 	}
 
 	fn alloc_ino_with_count(state: &mut FileSystemState, current_inode_count: usize) -> Option<INodeNo> {
@@ -1917,5 +1963,14 @@ mod tests {
 			.expect_err("missing inode should fail");
 		assert_eq!(i32::from(err), i32::from(Errno::ENOENT));
 		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn new_with_limits_rejects_page_budget_too_small_for_root() {
+		let err = match FileSystem::new_with_limits(1, BLOCK_SIZE) {
+			Ok(_) => panic!("init should fail"),
+			Err(err) => err,
+		};
+		assert!(err.contains("insufficient page capacity"));
 	}
 }

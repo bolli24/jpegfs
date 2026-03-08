@@ -1,6 +1,6 @@
 use crate::filesystem::{BLOCK_SIZE, FileSystem};
 use crate::jpeg_file::JpegFileHandle;
-use crate::pager::{PageId, PagerCodecError, ValidatedPages};
+use crate::pager::{PageId, Pager, PagerCodecError, ValidatedPages};
 use crc::Crc;
 use log::error;
 use std::collections::HashMap;
@@ -26,6 +26,8 @@ pub enum Error {
 	DuplicatePageId(PageId),
 	#[error("pager decode failed: {0}")]
 	Pager(#[from] PagerCodecError),
+	#[error("failed to write JPEG store data")]
+	JpegWrite(#[source] anyhow::Error),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -56,7 +58,12 @@ pub struct JpegBlockStore {
 }
 
 impl JpegBlockStore {
-	pub fn from_bytes_or_init(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
+	fn from_bytes_or_init_with_policy(
+		file: JpegFileHandle,
+		data: &[u8],
+		strict_header_validation: bool,
+		validate_pages_within_store: bool,
+	) -> Result<(Self, ValidatedPages), Error> {
 		if data.len() < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(data.len()));
 		}
@@ -65,6 +72,7 @@ impl JpegBlockStore {
 			Ok(Some(header)) => header,
 			Ok(None) => return Self::init_new(file, data),
 			Err(err @ Error::UnsupportedVersion(_)) => return Err(err),
+			Err(err) if strict_header_validation => return Err(err),
 			Err(err) => {
 				error!("dropping malformed persistence header and reinitializing store: {err}");
 				return Self::init_new(file, data);
@@ -90,7 +98,12 @@ impl JpegBlockStore {
 		let (blocks, remainder) = payload.as_chunks::<BLOCK_SIZE>();
 		debug_assert!(remainder.is_empty(), "stored pages are block-aligned by construction");
 
-		let decoded_pages = ValidatedPages::decode_blocks(blocks, usize::from(header.page_capacity))?;
+		let decoded_pages = if validate_pages_within_store {
+			ValidatedPages::decode_blocks(blocks, usize::from(header.page_capacity))?
+		} else {
+			let pages = Pager::decode_page_blocks(blocks)?;
+			ValidatedPages::from_decoded_pages_unchecked(pages)
+		};
 		let mut pages_map = HashMap::with_capacity(blocks.len());
 		for (slot, page_id) in decoded_pages.page_ids().enumerate() {
 			if pages_map.insert(page_id, slot).is_some() {
@@ -107,6 +120,14 @@ impl JpegBlockStore {
 			},
 			decoded_pages,
 		))
+	}
+
+	pub fn from_bytes_or_init(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
+		Self::from_bytes_or_init_with_policy(file, data, false, true)
+	}
+
+	pub fn from_bytes_or_init_strict(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
+		Self::from_bytes_or_init_with_policy(file, data, true, false)
 	}
 
 	pub fn init_new(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
@@ -188,6 +209,46 @@ impl JpegBlockStore {
 	pub fn free_pages(&self) -> usize {
 		usize::from(self.header.page_capacity.saturating_sub(self.header.pages_used))
 	}
+
+	pub fn page_capacity(&self) -> usize {
+		usize::from(self.header.page_capacity)
+	}
+
+	pub fn persist_blocks(&mut self, blocks: &[[u8; BLOCK_SIZE]]) -> Result<(), Error> {
+		let pages_used = u16::try_from(blocks.len()).unwrap_or(u16::MAX);
+		if pages_used > self.header.page_capacity {
+			return Err(Error::InvalidPageCount {
+				used: pages_used,
+				capacity: self.header.page_capacity,
+			});
+		}
+
+		let payload_len = usize::from(self.header.page_capacity) * BLOCK_SIZE;
+		let mut payload = vec![0u8; payload_len];
+		for (slot, block) in blocks.iter().enumerate() {
+			let start = slot * BLOCK_SIZE;
+			payload[start..start + BLOCK_SIZE].copy_from_slice(block);
+		}
+
+		self.header.pages_used = pages_used;
+		self.header.crc32 = Self::compute_crc(self.header, &payload);
+
+		let mut encoded = Vec::with_capacity(FILE_HEADER_SIZE + payload_len);
+		encoded.extend_from_slice(self.header.as_bytes());
+		encoded.extend_from_slice(&payload);
+		self.file.write_data(&encoded).map_err(Error::JpegWrite)?;
+
+		let decoded_pages = Pager::decode_page_blocks(blocks)?;
+		self.pages_map.clear();
+		for (slot, page) in decoded_pages.into_iter().enumerate() {
+			let page_id = page.page_id();
+			if self.pages_map.insert(page_id, slot).is_some() {
+				return Err(Error::DuplicatePageId(page_id));
+			}
+		}
+
+		Ok(())
+	}
 }
 
 pub struct JpegStorage {
@@ -242,6 +303,7 @@ impl JpegStorage {
 mod tests {
 	use super::*;
 	use crate::inode::Inode;
+	use crate::jpeg_file::init_file;
 	use crate::pager::Pager;
 	use crc::Crc;
 	use fuser::{FileType, INodeNo};
@@ -447,6 +509,44 @@ mod tests {
 		assert!(decoded_pages.is_empty());
 
 		drop(store);
+		std::fs::remove_file(path).expect("temp file should be removed");
+	}
+
+	#[test]
+	fn from_bytes_or_init_strict_rejects_malformed_recognized_header() {
+		let mut data = encode_store_bytes(&[], 2);
+		let mut header = FileHeaderV1::read_from_bytes(&data[..FILE_HEADER_SIZE]).expect("header should parse");
+		header.crc32 ^= 0xFFFF_FFFF;
+		data[..FILE_HEADER_SIZE].copy_from_slice(header.as_bytes());
+		let (file, path) = temp_file_handle();
+
+		let err = match JpegBlockStore::from_bytes_or_init_strict(file, &data) {
+			Ok(_) => panic!("strict load should fail"),
+			Err(err) => err,
+		};
+
+		assert!(matches!(err, Error::HeaderCrcMismatch { .. }));
+
+		std::fs::remove_file(path).expect("temp file should be removed");
+	}
+
+	#[test]
+	fn from_bytes_or_init_strict_allows_fragmented_inode_pages_per_store() {
+		let mut pager = Pager::new(8);
+		pager
+			.bytes_write(INodeNo(42), 0, &[0xAB; BLOCK_SIZE * 2])
+			.expect("write should succeed");
+		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
+		assert!(encoded.len() >= 2, "expected at least two data pages");
+
+		rewrite_test_page_header(&mut encoded[1], |header| header.file_page_no = 9);
+		let data = encode_store_bytes(&encoded, 4);
+		let (file, path) = temp_file_handle();
+
+		let (_store, pages) =
+			JpegBlockStore::from_bytes_or_init_strict(file, &data).expect("strict load should accept fragments");
+		assert_eq!(pages.len(), encoded.len());
+
 		std::fs::remove_file(path).expect("temp file should be removed");
 	}
 
@@ -719,5 +819,40 @@ mod tests {
 
 		std::fs::remove_file(path_a).expect("temp file should be removed");
 		std::fs::remove_file(path_b).expect("temp file should be removed");
+	}
+
+	#[test]
+	fn persist_blocks_roundtrips_store_payload() {
+		let unique = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.expect("clock should be after unix epoch")
+			.as_nanos();
+		let path = std::env::temp_dir().join(format!("jpegfs-persistence-roundtrip-{unique}.jpg"));
+		std::fs::copy("test/CRW_2609(FIN-Gebaeude).jpg", &path).expect("jpeg fixture should copy");
+
+		let mut first_handle = init_file(&path).expect("copied jpeg should initialize");
+		let first_data = first_handle
+			.read_data(first_handle.capacity())
+			.expect("copied jpeg should be readable");
+		let (mut store, _) =
+			JpegBlockStore::from_bytes_or_init_strict(first_handle, &first_data).expect("store should initialize");
+
+		let mut pager = Pager::new(8);
+		pager
+			.bytes_write(INodeNo(99), 0, b"payload")
+			.expect("write should succeed");
+		let encoded = pager.encode_blocks().expect("encoding should succeed");
+		store.persist_blocks(&encoded).expect("persist should succeed");
+		drop(store);
+
+		let mut second_handle = init_file(&path).expect("persisted jpeg should initialize");
+		let second_data = second_handle
+			.read_data(second_handle.capacity())
+			.expect("persisted jpeg should be readable");
+		let (_reloaded, pages) =
+			JpegBlockStore::from_bytes_or_init_strict(second_handle, &second_data).expect("store should reload");
+		assert_eq!(pages.len(), encoded.len());
+
+		std::fs::remove_file(path).expect("temp jpeg should be removed");
 	}
 }

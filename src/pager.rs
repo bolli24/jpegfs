@@ -114,6 +114,19 @@ pub struct Pager {
 	max_pages: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PagerBlockCounts {
+	pub inodes: usize,
+	pub dir_entries: usize,
+	pub data_bytes: usize,
+}
+
+impl PagerBlockCounts {
+	pub fn total(self) -> usize {
+		self.inodes + self.dir_entries + self.data_bytes
+	}
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PagerCodecError {
 	#[error("block is too small for pager header")]
@@ -207,6 +220,10 @@ impl ValidatedPages {
 		Self { pages: Vec::new() }
 	}
 
+	pub fn from_decoded_pages_unchecked(pages: Vec<DecodedPage>) -> Self {
+		Self { pages }
+	}
+
 	pub fn decode_blocks(blocks: &[[u8; BLOCK_SIZE]], max_pages: usize) -> Result<Self, PagerCodecError> {
 		let pages = Pager::decode_page_blocks(blocks)?;
 		Self::from_pages(pages, max_pages)
@@ -285,7 +302,10 @@ impl Pager {
 
 	pub fn decode_blocks(blocks: &[[u8; BLOCK_SIZE]], max_pages: usize) -> Result<Self, PagerCodecError> {
 		let decoded = ValidatedPages::decode_blocks(blocks, max_pages)?;
+		Self::from_validated_pages(decoded, max_pages)
+	}
 
+	pub fn from_validated_pages(decoded: ValidatedPages, max_pages: usize) -> Result<Self, PagerCodecError> {
 		let mut max_page_id: Option<PageId> = None;
 		for page in &decoded.pages {
 			max_page_id = Some(max_page_id.map_or(page.page_id(), |current| PageId(current.0.max(page.page_id().0))));
@@ -423,6 +443,17 @@ impl Pager {
 
 	pub fn page_count(&self) -> usize {
 		self.inodes_pages.len() + self.dir_entries_pages.len() + self.bytes_pages.len()
+	}
+
+	pub fn block_counts(&self) -> PagerBlockCounts {
+		PagerBlockCounts {
+			inodes: self.inodes_pages.len(),
+			dir_entries: self
+				.dir_entries_pages
+				.len()
+				.saturating_sub(self.free_dir_entry_pages.len()),
+			data_bytes: self.bytes_pages.len().saturating_sub(self.free_bytes_pages.len()),
+		}
 	}
 
 	fn alloc_page_id(&mut self) -> PageId {

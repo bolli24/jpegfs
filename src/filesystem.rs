@@ -60,6 +60,7 @@ pub struct FileSystemState {
 	pub total_bytes_limit: usize,
 
 	used_bytes: u64,
+	dirty: bool,
 }
 
 impl FileSystem {
@@ -116,6 +117,7 @@ impl FileSystem {
 			max_file_size: MAX_FILE_SIZE,
 			total_bytes_limit,
 			used_bytes: 0,
+			dirty: false,
 		};
 		Ok(Self {
 			state: Arc::new(RwLock::new(state)),
@@ -144,6 +146,7 @@ impl FileSystem {
 			max_file_size: MAX_FILE_SIZE,
 			total_bytes_limit,
 			used_bytes: 0,
+			dirty: false,
 		};
 
 		let used_bytes = state.recompute_used_bytes();
@@ -322,6 +325,14 @@ impl FileSystemState {
 
 	pub fn used_bytes(&self) -> u64 {
 		self.used_bytes
+	}
+
+	pub fn is_dirty(&self) -> bool {
+		self.dirty
+	}
+
+	fn mark_dirty(&mut self) {
+		self.dirty = true;
 	}
 
 	pub fn recompute_used_bytes(&self) -> u64 {
@@ -538,6 +549,7 @@ impl FileSystemState {
 		parent_inode.nlink += 1;
 		parent_inode.mtime = now;
 		parent_inode.ctime = now;
+		self.mark_dirty();
 
 		Ok((new_ino, new_inode))
 	}
@@ -572,6 +584,7 @@ impl FileSystemState {
 		let parent_inode = self.pager.inode_get_mut(parent).ok_or(Errno::EIO)?;
 		parent_inode.mtime = now;
 		parent_inode.ctime = now;
+		self.mark_dirty();
 		Ok(())
 	}
 
@@ -608,6 +621,7 @@ impl FileSystemState {
 		parent_inode.mtime = now;
 		parent_inode.ctime = now;
 		self.free_inos.push(child_ino);
+		self.mark_dirty();
 		Ok(())
 	}
 
@@ -650,6 +664,7 @@ impl FileSystemState {
 		let inode = self.pager.inode_get_mut(ino).ok_or(Errno::EIO)?;
 		inode.mtime = now;
 		inode.ctime = now;
+		self.mark_dirty();
 
 		Ok(data.len() as u32)
 	}
@@ -741,6 +756,7 @@ impl FileSystemState {
 		let parent_inode = self.pager.inode_get_mut(parent).ok_or(Errno::EIO)?;
 		parent_inode.mtime = now;
 		parent_inode.ctime = now;
+		self.mark_dirty();
 
 		Ok((new_ino, new_inode, file_handle))
 	}
@@ -754,10 +770,14 @@ impl FileSystemState {
 		}
 
 		self.resize_file_len(ino, size as usize)?;
-		let inode = self.pager.inode_get_mut(ino).ok_or(Errno::EIO)?;
-		inode.mtime = now;
-		inode.ctime = now;
-		Ok(*inode)
+		let updated = {
+			let inode = self.pager.inode_get_mut(ino).ok_or(Errno::EIO)?;
+			inode.mtime = now;
+			inode.ctime = now;
+			*inode
+		};
+		self.mark_dirty();
+		Ok(updated)
 	}
 
 	pub fn op_rename(
@@ -898,6 +918,7 @@ impl FileSystemState {
 
 		let source_inode = self.pager.inode_get_mut(source_ino).ok_or(Errno::EIO)?;
 		source_inode.ctime = now;
+		self.mark_dirty();
 		Ok(())
 	}
 
@@ -1102,58 +1123,64 @@ impl Filesystem for FileSystem {
 			changed = true;
 		}
 
-		let inode = state.pager.inode_get_mut(ino).expect("validated inode must exist");
+		{
+			let inode = state.pager.inode_get_mut(ino).expect("validated inode must exist");
 
-		if let Some(mode) = mode {
-			inode.perm = (mode & 0o7777) as u16;
-			changed = true;
+			if let Some(mode) = mode {
+				inode.perm = (mode & 0o7777) as u16;
+				changed = true;
+			}
+
+			if let Some(uid) = uid {
+				inode.uid = uid;
+				changed = true;
+			}
+
+			if let Some(gid) = gid {
+				inode.gid = gid;
+				changed = true;
+			}
+
+			if let Some(atime) = atime {
+				inode.atime = match atime {
+					TimeOrNow::SpecificTime(t) => t,
+					TimeOrNow::Now => now,
+				};
+				changed = true;
+			}
+
+			if let Some(mtime) = mtime {
+				inode.mtime = match mtime {
+					TimeOrNow::SpecificTime(t) => t,
+					TimeOrNow::Now => now,
+				};
+				changed = true;
+			}
+
+			if let Some(ctime) = ctime {
+				inode.ctime = ctime;
+				changed = true;
+			}
+
+			if let Some(crtime) = crtime {
+				inode.crtime = crtime;
+				changed = true;
+			}
+
+			if let Some(chgtime) = chgtime {
+				inode.ctime = chgtime;
+				changed = true;
+			}
+
+			if changed {
+				inode.ctime = now;
+			}
 		}
-
-		if let Some(uid) = uid {
-			inode.uid = uid;
-			changed = true;
-		}
-
-		if let Some(gid) = gid {
-			inode.gid = gid;
-			changed = true;
-		}
-
-		if let Some(atime) = atime {
-			inode.atime = match atime {
-				TimeOrNow::SpecificTime(t) => t,
-				TimeOrNow::Now => now,
-			};
-			changed = true;
-		}
-
-		if let Some(mtime) = mtime {
-			inode.mtime = match mtime {
-				TimeOrNow::SpecificTime(t) => t,
-				TimeOrNow::Now => now,
-			};
-			changed = true;
-		}
-
-		if let Some(ctime) = ctime {
-			inode.ctime = ctime;
-			changed = true;
-		}
-
-		if let Some(crtime) = crtime {
-			inode.crtime = crtime;
-			changed = true;
-		}
-
-		if let Some(chgtime) = chgtime {
-			inode.ctime = chgtime;
-			changed = true;
-		}
-
 		if changed {
-			inode.ctime = now;
+			state.mark_dirty();
 		}
 
+		let inode = state.pager.inode_get(ino).expect("validated inode must exist");
 		reply.attr(&ONE_SEC, &Inode::to_file_attr(ino, inode));
 	}
 

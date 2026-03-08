@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -12,7 +13,7 @@ use rayon::prelude::*;
 
 use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
 use jpegfs::jpeg_file::init_file;
-use jpegfs::pager::{Pager, ValidatedPages};
+use jpegfs::pager::{PageId, Pager, ValidatedPages};
 use jpegfs::persistence::JpegBlockStore;
 
 mod tui;
@@ -263,7 +264,7 @@ fn persist_filesystem(
 	total_page_capacity: usize,
 ) -> anyhow::Result<()> {
 	let encode_started_at = Instant::now();
-	let encoded_pages = {
+	let encoded_by_id = {
 		let state = fs.state.read();
 		state
 			.check_invariants()
@@ -271,59 +272,173 @@ fn persist_filesystem(
 			.context("filesystem invariants failed before persistence")?;
 		state
 			.pager
-			.encode_blocks()
+			.encode_blocks_by_id()
 			.context("failed to encode pager blocks for persistence")?
 	};
 
 	anyhow::ensure!(
-		encoded_pages.len() <= total_page_capacity,
+		encoded_by_id.len() <= total_page_capacity,
 		"encoded pager needs {} pages but only {} pages are available across JPEG stores",
-		encoded_pages.len(),
+		encoded_by_id.len(),
 		total_page_capacity
 	);
 
-	let capacities: Vec<usize> = stores.iter().map(JpegBlockStore::page_capacity).collect();
-	let (ranges, cursor) = assign_page_ranges(&capacities, encoded_pages.len());
+	let mut store_page_ids: Vec<Vec<PageId>> = Vec::with_capacity(stores.len());
+	let mut page_owner_store: HashMap<PageId, usize> = HashMap::new();
+	for (store_index, store) in stores.iter().enumerate() {
+		let page_ids = store.ordered_page_ids();
+		for &page_id in &page_ids {
+			anyhow::ensure!(
+				page_owner_store.insert(page_id, store_index).is_none(),
+				"internal error: page id {page_id:?} is assigned to multiple JPEG stores"
+			);
+		}
+		store_page_ids.push(page_ids);
+	}
+
+	let encoded_ids: HashSet<PageId> = encoded_by_id.keys().copied().collect();
+	let owned_ids: HashSet<PageId> = page_owner_store.keys().copied().collect();
+	let removed_ids: HashSet<PageId> = owned_ids.difference(&encoded_ids).copied().collect();
+
+	let mut dirty_store_indices: HashSet<usize> = HashSet::new();
+	for (store_index, page_ids) in store_page_ids.iter().enumerate() {
+		let mut store_dirty = false;
+		for &page_id in page_ids {
+			if removed_ids.contains(&page_id) {
+				store_dirty = true;
+				break;
+			}
+			if let Some(new_block) = encoded_by_id.get(&page_id) {
+				let old_block = stores[store_index]
+					.persisted_block(page_id)
+					.context("internal error: missing stored block for known page id")?;
+				if old_block != new_block {
+					store_dirty = true;
+					break;
+				}
+			}
+		}
+		if store_dirty {
+			dirty_store_indices.insert(store_index);
+		}
+	}
+
+	let retained_page_ids_per_store: Vec<Vec<PageId>> = store_page_ids
+		.iter()
+		.map(|page_ids| {
+			page_ids
+				.iter()
+				.copied()
+				.filter(|id| encoded_by_id.contains_key(id))
+				.collect()
+		})
+		.collect();
+
+	let mut new_page_ids: Vec<PageId> = encoded_ids.difference(&owned_ids).copied().collect();
+	let retained_page_counts: Vec<usize> = retained_page_ids_per_store.iter().map(Vec::len).collect();
+	let store_capacities: Vec<usize> = stores.iter().map(JpegBlockStore::page_capacity).collect();
+	let assigned_new_pages = assign_new_pages_first_fit(&retained_page_counts, &store_capacities, &mut new_page_ids)?;
+	for (store_index, assigned_pages) in assigned_new_pages.iter().enumerate() {
+		if assigned_pages.is_empty() {
+			continue;
+		}
+		dirty_store_indices.insert(store_index);
+	}
+
+	if dirty_store_indices.is_empty() {
+		info!(
+			"Encoded {} pages across {} JPEG stores in {:?} (written: 0, skipped: {})",
+			encoded_ids.len(),
+			stores.len(),
+			encode_started_at.elapsed(),
+			stores.len()
+		);
+		return Ok(());
+	}
+
+	let mut target_page_ids_per_store: Vec<Option<Vec<PageId>>> = vec![None; stores.len()];
+	for store_index in 0..stores.len() {
+		if !dirty_store_indices.contains(&store_index) {
+			continue;
+		}
+
+		let mut desired_page_ids = retained_page_ids_per_store[store_index].clone();
+		desired_page_ids.extend(assigned_new_pages[store_index].iter().copied());
+		anyhow::ensure!(
+			desired_page_ids.len() <= stores[store_index].page_capacity(),
+			"internal error: page assignment exceeds capacity for store index {store_index}"
+		);
+		target_page_ids_per_store[store_index] = Some(desired_page_ids);
+	}
+
 	let pool = jpeg_thread_pool(stores.len())?;
-	let persist_results: Vec<anyhow::Result<()>> = pool.install(|| {
+	let persist_results: Vec<anyhow::Result<bool>> = pool.install(|| {
 		stores
 			.par_iter_mut()
-			.zip(ranges.par_iter())
-			.map(|(store, (start, end))| {
+			.enumerate()
+			.map(|(store_index, store)| {
+				let Some(target_page_ids) = target_page_ids_per_store[store_index].as_ref() else {
+					return Ok(false);
+				};
+				let mut blocks = Vec::with_capacity(target_page_ids.len());
+				for page_id in target_page_ids {
+					let block = encoded_by_id
+						.get(page_id)
+						.with_context(|| format!("missing encoded block for page {page_id:?}"))?;
+					blocks.push(*block);
+				}
 				store
-					.persist_blocks(&encoded_pages[*start..*end])
-					.context("failed to persist encoded pages to JPEG store")
+					.persist_blocks(&blocks)
+					.with_context(|| format!("failed to persist encoded pages to JPEG store index {}", store_index))
 			})
 			.collect()
 	});
-	persist_results
+	let written_stores = persist_results
 		.into_iter()
-		.collect::<anyhow::Result<Vec<_>>>()
-		.map(|_| ())?;
-
-	anyhow::ensure!(
-		cursor == encoded_pages.len(),
-		"internal error: {} encoded pages were not persisted",
-		encoded_pages.len().saturating_sub(cursor)
-	);
+		.collect::<anyhow::Result<Vec<_>>>()?
+		.into_iter()
+		.filter(|wrote| *wrote)
+		.count();
+	let skipped_stores = stores.len().saturating_sub(written_stores);
 	info!(
-		"Encoded and persisted {} pages across {} JPEG stores in {:?}",
-		encoded_pages.len(),
+		"Encoded and persisted {} pages across {} JPEG stores in {:?} (written: {}, skipped: {})",
+		encoded_ids.len(),
 		stores.len(),
-		encode_started_at.elapsed()
+		encode_started_at.elapsed(),
+		written_stores,
+		skipped_stores
 	);
 	Ok(())
 }
 
-fn assign_page_ranges(capacities: &[usize], total_pages: usize) -> (Vec<(usize, usize)>, usize) {
-	let mut ranges = Vec::with_capacity(capacities.len());
-	let mut cursor = 0usize;
-	for &capacity in capacities {
-		let end = (cursor + capacity).min(total_pages);
-		ranges.push((cursor, end));
-		cursor = end;
+fn assign_new_pages_first_fit(
+	retained_page_counts: &[usize],
+	store_capacities: &[usize],
+	new_page_ids: &mut Vec<PageId>,
+) -> anyhow::Result<Vec<Vec<PageId>>> {
+	anyhow::ensure!(
+		retained_page_counts.len() == store_capacities.len(),
+		"internal error: retained-page and store-capacity lengths differ"
+	);
+
+	new_page_ids.sort_by_key(|id| id.0);
+	let mut assigned_new_pages: Vec<Vec<PageId>> = vec![Vec::new(); store_capacities.len()];
+	let mut next_store_index = 0usize;
+	for page_id in new_page_ids.iter().copied() {
+		while next_store_index < store_capacities.len()
+			&& (retained_page_counts[next_store_index] + assigned_new_pages[next_store_index].len())
+				>= store_capacities[next_store_index]
+		{
+			next_store_index += 1;
+		}
+		anyhow::ensure!(
+			next_store_index < store_capacities.len(),
+			"not enough JPEG store capacity to assign new page {page_id:?}"
+		);
+		assigned_new_pages[next_store_index].push(page_id);
 	}
-	(ranges, cursor)
+
+	Ok(assigned_new_pages)
 }
 
 fn jpeg_thread_pool(job_count: usize) -> anyhow::Result<ThreadPool> {
@@ -380,4 +495,37 @@ pub fn rng_from_passphrase(passphrase: &str, salt: &[u8]) -> anyhow::Result<ChaC
 		.context("argon2 failed")?;
 
 	Ok(ChaCha20Rng::from_seed(seed))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn assign_new_pages_first_fit_uses_slots_freed_by_removals() {
+		let retained_page_counts = vec![1usize, 0usize];
+		let store_capacities = vec![2usize, 1usize];
+		let mut new_page_ids = vec![PageId(11), PageId(10)];
+
+		let assigned = assign_new_pages_first_fit(&retained_page_counts, &store_capacities, &mut new_page_ids)
+			.expect("assignment should succeed by using freed slot in first store");
+
+		assert_eq!(new_page_ids, vec![PageId(10), PageId(11)]);
+		assert_eq!(assigned, vec![vec![PageId(10)], vec![PageId(11)]]);
+	}
+
+	#[test]
+	fn assign_new_pages_first_fit_returns_capacity_error_when_full() {
+		let retained_page_counts = vec![1usize];
+		let store_capacities = vec![1usize];
+		let mut new_page_ids = vec![PageId(42)];
+
+		let err = assign_new_pages_first_fit(&retained_page_counts, &store_capacities, &mut new_page_ids)
+			.expect_err("assignment should fail when all stores are full");
+
+		assert!(
+			err.to_string().contains("not enough JPEG store capacity"),
+			"unexpected error: {err:#}"
+		);
+	}
 }

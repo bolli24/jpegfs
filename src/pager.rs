@@ -40,7 +40,7 @@ impl PageType {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct PageId(pub u32);
 
@@ -277,16 +277,21 @@ impl Pager {
 	}
 
 	pub fn encode_blocks(&self) -> Result<Vec<[u8; BLOCK_SIZE]>, PagerCodecError> {
+		self.encode_blocks_with_ids()
+			.map(|blocks| blocks.into_iter().map(|(_, block)| block).collect())
+	}
+
+	pub fn encode_blocks_with_ids(&self) -> Result<Vec<(PageId, [u8; BLOCK_SIZE])>, PagerCodecError> {
 		let mut encoded = Vec::with_capacity(self.page_count());
 		let free_dir_pages: HashSet<DirEntriesIndex> = self.free_dir_entry_pages.iter().copied().collect();
 		for page in &self.inodes_pages {
-			encoded.push(self.encode_inodes_page(page)?);
+			encoded.push((page.page_id, self.encode_inodes_page(page)?));
 		}
 		for (index, page) in self.dir_entries_pages.iter().enumerate() {
 			if free_dir_pages.contains(&DirEntriesIndex(index)) {
 				continue;
 			}
-			encoded.push(self.encode_dir_entries_page(page)?);
+			encoded.push((page.page_id, self.encode_dir_entries_page(page)?));
 		}
 		for (ino, page_indices) in &self.bytes {
 			for (file_page_no, page_index) in page_indices.iter().enumerate() {
@@ -294,10 +299,23 @@ impl Pager {
 					.bytes_pages
 					.get(page_index.0)
 					.ok_or(PagerCodecError::MissingDataPageIndex(page_index.0))?;
-				encoded.push(self.encode_data_bytes_page(page, *ino, file_page_no as u32)?);
+				encoded.push((
+					page.page_id,
+					self.encode_data_bytes_page(page, *ino, file_page_no as u32)?,
+				));
 			}
 		}
 		Ok(encoded)
+	}
+
+	pub fn encode_blocks_by_id(&self) -> Result<BTreeMap<PageId, [u8; BLOCK_SIZE]>, PagerCodecError> {
+		let mut encoded_by_id = BTreeMap::new();
+		for (page_id, block) in self.encode_blocks_with_ids()? {
+			if encoded_by_id.insert(page_id, block).is_some() {
+				return Err(PagerCodecError::DuplicatePageId(page_id));
+			}
+		}
+		Ok(encoded_by_id)
 	}
 
 	pub fn decode_blocks(blocks: &[[u8; BLOCK_SIZE]], max_pages: usize) -> Result<Self, PagerCodecError> {
@@ -439,6 +457,17 @@ impl Pager {
 			decoded.push(Self::decode_block(block)?);
 		}
 		Ok(decoded)
+	}
+
+	pub fn page_id_from_block(block: &[u8; BLOCK_SIZE]) -> Result<PageId, PagerCodecError> {
+		let header = PageHeaderV1::read_from_bytes(&block[..HEADER_SIZE]).map_err(|_| PagerCodecError::ShortBlock)?;
+		if header.magic != MAGIC {
+			return Err(PagerCodecError::InvalidMagic(header.magic));
+		}
+		if header.version != PAGE_VERSION {
+			return Err(PagerCodecError::UnsupportedVersion(header.version));
+		}
+		Ok(header.page_id)
 	}
 
 	pub fn page_count(&self) -> usize {
@@ -1668,6 +1697,26 @@ mod tests {
 		assert_eq!(decoded.bytes_read(file_ino, 0, payload.len() + 16), payload);
 		pager.check_invariants();
 		decoded.check_invariants();
+	}
+
+	#[test]
+	fn encode_blocks_by_id_matches_encode_blocks_with_ids() {
+		let mut pager = Pager::new(16);
+		let ino = INodeNo(170);
+		let payload = vec![0x5A; DATA_PAGE_CAPACITY + 3];
+		pager.bytes_write(ino, 0, &payload).expect("bytes write should succeed");
+
+		let with_ids = pager
+			.encode_blocks_with_ids()
+			.expect("encoding with page ids should succeed");
+		let by_id = pager
+			.encode_blocks_by_id()
+			.expect("encoding map by page id should succeed");
+
+		assert_eq!(by_id.len(), with_ids.len());
+		for (page_id, block) in with_ids {
+			assert_eq!(by_id.get(&page_id), Some(&block));
+		}
 	}
 
 	#[test]

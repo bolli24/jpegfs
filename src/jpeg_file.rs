@@ -9,21 +9,21 @@ use crate::jpeg::{OwnedJpeg, get_capacity, read_owned_jpeg, write_owned_jpeg};
 use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
 use crate::zigzag::ZIGZAG_INDICES;
 
-pub fn init_file(path: &Path) -> anyhow::Result<FileHandle> {
+pub fn init_file(path: &Path) -> anyhow::Result<JpegFileHandle> {
 	let mut file = File::open(path).context("failed to open input file")?;
 
-	let content = FileHandle::read_all_from_file(&mut file)?;
+	let content = JpegFileHandle::read_all_from_file(&mut file)?;
 	let capacity = get_capacity(&content).context("failed to compute capacity")?;
 	println!("Opened file '{}' capacity: {}", path.display(), capacity);
 
-	Ok(FileHandle {
+	Ok(JpegFileHandle {
 		file,
 		path: path.to_owned(),
 		capacity,
 	})
 }
 
-pub struct FileHandle {
+pub struct JpegFileHandle {
 	file: File,
 	path: PathBuf,
 	capacity: usize,
@@ -195,7 +195,7 @@ impl JpegSession {
 	}
 }
 
-impl FileHandle {
+impl JpegFileHandle {
 	pub fn from_parts(file: File, path: PathBuf, capacity: usize) -> Self {
 		Self { file, path, capacity }
 	}
@@ -215,7 +215,7 @@ impl FileHandle {
 		Self::read_all_from_file(&mut self.file)
 	}
 
-	pub fn copy_to(&self, target_path: &Path) -> anyhow::Result<FileHandle> {
+	pub fn copy_to(&self, target_path: &Path) -> anyhow::Result<JpegFileHandle> {
 		fs::copy(&self.path, target_path).with_context(|| {
 			format!(
 				"failed to copy '{}' to '{}'",

@@ -1,9 +1,9 @@
 #![allow(unsafe_op_in_unsafe_fn, dead_code)]
 
-pub mod file;
 pub mod filesystem;
 pub mod inode;
 pub mod jpeg;
+pub mod jpeg_file;
 pub mod lsb;
 pub mod pager;
 pub mod persistence;

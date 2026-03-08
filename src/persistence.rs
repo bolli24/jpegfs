@@ -1,5 +1,5 @@
-use crate::file::FileHandle;
 use crate::filesystem::{BLOCK_SIZE, FileSystem};
+use crate::jpeg_file::JpegFileHandle;
 use crate::pager::{PageId, PagerCodecError, ValidatedPages};
 use crc::Crc;
 use log::error;
@@ -51,12 +51,12 @@ const FILE_MAGIC: [u8; 8] = *b"JPGFhdr1";
 pub struct JpegBlockStore {
 	header: FileHeaderV1,
 	file_id: FileId,
-	file: FileHandle,
+	file: JpegFileHandle,
 	pages_map: HashMap<PageId, usize>,
 }
 
 impl JpegBlockStore {
-	pub fn from_bytes_or_init(file: FileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
+	pub fn from_bytes_or_init(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
 		if data.len() < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(data.len()));
 		}
@@ -109,7 +109,7 @@ impl JpegBlockStore {
 		))
 	}
 
-	pub fn init_new(file: FileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
+	pub fn init_new(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
 		if data.len() < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(data.len()));
 		}
@@ -252,7 +252,7 @@ mod tests {
 	use std::time::{SystemTime, UNIX_EPOCH};
 	use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-	fn temp_file_handle() -> (FileHandle, PathBuf) {
+	fn temp_file_handle() -> (JpegFileHandle, PathBuf) {
 		let unique = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.expect("clock should be after unix epoch")
@@ -266,7 +266,7 @@ mod tests {
 			.open(&path)
 			.expect("temp file should open");
 
-		(FileHandle::from_parts(file, path.clone(), 0), path)
+		(JpegFileHandle::from_parts(file, path.clone(), 0), path)
 	}
 
 	fn sample_inode() -> Inode {

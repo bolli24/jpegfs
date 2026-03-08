@@ -271,6 +271,19 @@ pub struct StatfsData {
 	pub frsize: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsDashboardStats {
+	pub total_blocks: usize,
+	pub used_blocks: usize,
+	pub free_blocks: usize,
+	pub inode_blocks: usize,
+	pub dir_entry_blocks: usize,
+	pub data_blocks: usize,
+	pub file_count: usize,
+	pub directory_count: usize,
+	pub open_handles: usize,
+}
+
 pub type FsOpResult<T> = Result<T, Errno>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,6 +294,32 @@ pub struct ReaddirEntry {
 }
 
 impl FileSystemState {
+	pub fn dashboard_stats(&self) -> FsDashboardStats {
+		let counts = self.pager.block_counts();
+		let total_blocks = self.pager.max_pages();
+		let mut file_count = 0usize;
+		let mut directory_count = 0usize;
+		for (_, inode) in self.pager.inodes_snapshot() {
+			match inode.kind {
+				FileType::RegularFile => file_count += 1,
+				FileType::Directory => directory_count += 1,
+				_ => {}
+			}
+		}
+
+		FsDashboardStats {
+			total_blocks,
+			used_blocks: counts.total(),
+			free_blocks: total_blocks.saturating_sub(counts.total()),
+			inode_blocks: counts.inodes,
+			dir_entry_blocks: counts.dir_entries,
+			data_blocks: counts.data_bytes,
+			file_count,
+			directory_count,
+			open_handles: self.handles.len(),
+		}
+	}
+
 	pub fn used_bytes(&self) -> u64 {
 		self.used_bytes
 	}

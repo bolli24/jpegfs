@@ -27,6 +27,8 @@ fuser = { version = "0.17", features = ["serializable"] }
 parking_lot = "0.12"
 simplelog = "0.12"
 ctrlc = "3.4"
+ratatui = "0.29"
+crossterm = "0.29"
 
 [profile.release]
 debug = true

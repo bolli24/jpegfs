@@ -445,6 +445,10 @@ impl Pager {
 		self.inodes_pages.len() + self.dir_entries_pages.len() + self.bytes_pages.len()
 	}
 
+	pub fn max_pages(&self) -> usize {
+		self.max_pages
+	}
+
 	pub fn block_counts(&self) -> PagerBlockCounts {
 		PagerBlockCounts {
 			inodes: self.inodes_pages.len(),

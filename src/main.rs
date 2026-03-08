@@ -6,12 +6,13 @@ use fuser::{Config as FuseConfig, MountOption, spawn_mount2};
 use log::{error, info};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use simplelog::{ColorChoice, Config as LogConfig, LevelFilter, TermLogger, TerminalMode};
 
 use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
 use jpegfs::jpeg_file::init_file;
 use jpegfs::pager::{Pager, ValidatedPages};
 use jpegfs::persistence::JpegBlockStore;
+
+mod tui;
 
 const DEFAULT_MOUNT_PATH: &str = "/tmp/jpegfs";
 const MIN_BOOTSTRAP_PAGES: usize = 2;
@@ -55,13 +56,8 @@ impl Drop for PersistOnDrop {
 }
 
 fn main() -> anyhow::Result<()> {
-	TermLogger::init(
-		LevelFilter::Info,
-		LogConfig::default(),
-		TerminalMode::Mixed,
-		ColorChoice::Auto,
-	)
-	.context("failed to initialize terminal logger")?;
+	let (log_tx, log_rx) = mpsc::sync_channel(8_192);
+	tui::init_tui_logger(log_tx).context("failed to initialize tui logger")?;
 
 	let jpeg_dir = parse_jpeg_dir_arg()?;
 	let jpeg_paths = discover_jpeg_paths(&jpeg_dir)?;
@@ -99,7 +95,7 @@ fn main() -> anyhow::Result<()> {
 	})
 	.context("failed to set shutdown signal handler")?;
 
-	shutdown_rx.recv().context("failed to wait for shutdown signal")?;
+	tui::run_tui(&persistence.fs, &mount_path, &log_rx, &shutdown_rx)?;
 	drop(session);
 	log_filesystem_capacity("before exit", &persistence.fs, total_page_capacity);
 	persistence.persist_once()?;

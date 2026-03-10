@@ -25,13 +25,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "header_encode_decode"
-path = "src/header_encode_decode.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "filesystem_state_machine"
 path = "src/filesystem_state_machine.rs"
 test = false

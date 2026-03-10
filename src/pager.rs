@@ -318,11 +318,6 @@ impl Pager {
 		Ok(encoded_by_id)
 	}
 
-	pub fn decode_blocks(blocks: &[[u8; BLOCK_SIZE]], max_pages: usize) -> Result<Self, PagerCodecError> {
-		let decoded = ValidatedPages::decode_blocks(blocks, max_pages)?;
-		Self::from_validated_pages(decoded, max_pages)
-	}
-
 	pub fn from_validated_pages(decoded: ValidatedPages, max_pages: usize) -> Result<Self, PagerCodecError> {
 		let mut max_page_id: Option<PageId> = None;
 		for page in &decoded.pages {
@@ -1687,7 +1682,8 @@ mod tests {
 			.expect("bytes write should succeed");
 
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
-		let decoded = Pager::decode_blocks(&encoded, 16).expect("decoding should succeed");
+		let decoded_pages = ValidatedPages::decode_blocks(&encoded, 16).expect("page decoding should succeed");
+		let decoded = Pager::from_validated_pages(decoded_pages, 16).expect("decoding should succeed");
 
 		assert_eq!(decoded.inodes_len(), 2);
 		assert_eq!(decoded.inode_get(dir_ino), Some(&dir_inode));
@@ -1735,7 +1731,8 @@ mod tests {
 		assert_eq!(pager.dir_entries_get_dir(first_inode), None);
 
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
-		let mut decoded = Pager::decode_blocks(&encoded, 1).expect("decoding should succeed");
+		let decoded_pages = ValidatedPages::decode_blocks(&encoded, 1).expect("page decoding should succeed");
+		let mut decoded = Pager::from_validated_pages(decoded_pages, 1).expect("decoding should succeed");
 		assert_eq!(decoded.dir_entries_get_dir(first_inode), None);
 
 		decoded
@@ -1759,7 +1756,8 @@ mod tests {
 		pager.check_invariants();
 
 		encoded[0][HEADER_SIZE] ^= 0x01;
-		match Pager::decode_blocks(&encoded, 8) {
+		let decoded_pages = ValidatedPages::decode_blocks(&encoded, 8);
+		match decoded_pages.and_then(|pages| Pager::from_validated_pages(pages, 8)) {
 			Err(PagerCodecError::CrcMismatch { .. }) => {}
 			Err(other) => panic!("expected CRC mismatch, got {other:?}"),
 			Ok(_) => panic!("decode must fail"),
@@ -1785,7 +1783,8 @@ mod tests {
 		);
 		second_block[..HEADER_SIZE].copy_from_slice(header.as_bytes());
 
-		match Pager::decode_blocks(&encoded, 8) {
+		let decoded_pages = ValidatedPages::decode_blocks(&encoded, 8);
+		match decoded_pages.and_then(|pages| Pager::from_validated_pages(pages, 8)) {
 			Err(PagerCodecError::NonContiguousDataPages { .. }) => {}
 			Err(other) => panic!("expected non-contiguous error, got {other:?}"),
 			Ok(_) => panic!("decode must fail"),
@@ -1810,7 +1809,8 @@ mod tests {
 		);
 		first_block[..HEADER_SIZE].copy_from_slice(header.as_bytes());
 
-		match Pager::decode_blocks(&encoded, 8) {
+		let decoded_pages = ValidatedPages::decode_blocks(&encoded, 8);
+		match decoded_pages.and_then(|pages| Pager::from_validated_pages(pages, 8)) {
 			Err(PagerCodecError::PageIdSpaceExhausted) => {}
 			Err(other) => panic!("expected page-id exhaustion error, got {other:?}"),
 			Ok(_) => panic!("decode must fail"),
@@ -1834,7 +1834,8 @@ mod tests {
 			.expect("single-byte write should reuse one freed page");
 
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
-		let mut pager = Pager::decode_blocks(&encoded, 16).expect("decoding should succeed");
+		let decoded_pages = ValidatedPages::decode_blocks(&encoded, 16).expect("page decoding should succeed");
+		let mut pager = Pager::from_validated_pages(decoded_pages, 16).expect("decoding should succeed");
 		pager.check_invariants();
 
 		// This allocation used to collide with an existing page_id after roundtrip.
@@ -1843,7 +1844,8 @@ mod tests {
 			.expect("directory insert should allocate a fresh page id");
 
 		let encoded = pager.encode_blocks().expect("encoding after allocation should succeed");
-		let decoded = Pager::decode_blocks(&encoded, 16).expect("decoding after allocation should succeed");
+		let decoded_pages = ValidatedPages::decode_blocks(&encoded, 16).expect("page decoding should succeed");
+		let decoded = Pager::from_validated_pages(decoded_pages, 16).expect("decoding after allocation should succeed");
 		assert_eq!(decoded.dir_entries_get(dir_ino, OsStr::new("entry")), Some(data_ino_b));
 		pager.check_invariants();
 		decoded.check_invariants();

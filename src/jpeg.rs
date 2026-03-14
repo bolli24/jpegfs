@@ -219,9 +219,6 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 	handle_jpeg_panic(result)
 }
 
-// JMSG_LENGTH_MAX is typically 200 in libjpeg
-const JMSG_LENGTH_MAX: usize = 200;
-
 extern "C-unwind" fn custom_error_exit(cinfo: &mut jpeg_common_struct) {
 	unsafe {
 		let err = cinfo.err;

@@ -13,7 +13,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 const PAGE_VERSION: u16 = 1;
 const PAGE_CRC: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(u16)]
 pub enum PageType {
 	Inodes,
@@ -21,30 +21,11 @@ pub enum PageType {
 	DataBytes,
 }
 
-impl PageType {
-	fn from_wire(value: u16) -> Option<Self> {
-		match value {
-			0 => Some(Self::Inodes),
-			1 => Some(Self::DirEntries),
-			2 => Some(Self::DataBytes),
-			_ => None,
-		}
-	}
-
-	fn to_wire(self) -> u16 {
-		match self {
-			Self::Inodes => 0,
-			Self::DirEntries => 1,
-			Self::DataBytes => 2,
-		}
-	}
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct PageId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 struct PageHeaderV1 {
 	magic: [u8; 4],
@@ -53,7 +34,7 @@ struct PageHeaderV1 {
 	file_page_no: u32,
 	crc32: u32,
 	version: u16,
-	page_type: u16,
+	page_type: PageType,
 	payload_len: u16,
 	reserved: u16,
 }
@@ -129,14 +110,12 @@ impl PagerBlockCounts {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PagerCodecError {
-	#[error("block is too small for pager header")]
-	ShortBlock,
+	#[error("unable to read header from bytes: {0:?}")]
+	HeaderDecodeError(Vec<u8>),
 	#[error("invalid magic: {0:?}")]
 	InvalidMagic([u8; 4]),
 	#[error("unsupported version: {0}")]
 	UnsupportedVersion(u16),
-	#[error("invalid page type: {0}")]
-	InvalidPageType(u16),
 	#[error("reserved header field is non-zero: {0}")]
 	ReservedFieldNonZero(u16),
 	#[error("payload length {payload_len} exceeds capacity {capacity}")]
@@ -455,7 +434,8 @@ impl Pager {
 	}
 
 	pub fn page_id_from_block(block: &[u8; BLOCK_SIZE]) -> Result<PageId, PagerCodecError> {
-		let header = PageHeaderV1::read_from_bytes(&block[..HEADER_SIZE]).map_err(|_| PagerCodecError::ShortBlock)?;
+		let header = PageHeaderV1::try_read_from_bytes(&block[..HEADER_SIZE])
+			.map_err(|_| PagerCodecError::HeaderDecodeError(block[..HEADER_SIZE].iter().copied().collect()))?;
 		if header.magic != MAGIC {
 			return Err(PagerCodecError::InvalidMagic(header.magic));
 		}
@@ -1044,7 +1024,7 @@ impl Pager {
 		let mut header = PageHeaderV1 {
 			magic: MAGIC,
 			version: PAGE_VERSION,
-			page_type: page_type.to_wire(),
+			page_type,
 			page_id,
 			owner_ino,
 			file_page_no,
@@ -1061,7 +1041,8 @@ impl Pager {
 	}
 
 	fn decode_block(block: &[u8; BLOCK_SIZE]) -> Result<DecodedPage, PagerCodecError> {
-		let header = PageHeaderV1::read_from_bytes(&block[..HEADER_SIZE]).map_err(|_| PagerCodecError::ShortBlock)?;
+		let header = PageHeaderV1::try_read_from_bytes(&block[..HEADER_SIZE])
+			.map_err(|_| PagerCodecError::HeaderDecodeError(block[..HEADER_SIZE].iter().copied().collect()))?;
 		if header.magic != MAGIC {
 			return Err(PagerCodecError::InvalidMagic(header.magic));
 		}
@@ -1072,8 +1053,6 @@ impl Pager {
 			return Err(PagerCodecError::ReservedFieldNonZero(header.reserved));
 		}
 
-		let page_type =
-			PageType::from_wire(header.page_type).ok_or(PagerCodecError::InvalidPageType(header.page_type))?;
 		let payload_len = header.payload_len as usize;
 		if payload_len > BLOCK_PAYLOAD_CAPACITY {
 			return Err(PagerCodecError::PayloadTooLarge {
@@ -1095,7 +1074,7 @@ impl Pager {
 			});
 		}
 
-		match page_type {
+		match header.page_type {
 			PageType::Inodes => {
 				if header.owner_ino != 0 || header.file_page_no != 0 {
 					return Err(PagerCodecError::InvalidInodesHeaderFields {
@@ -1775,7 +1754,7 @@ mod tests {
 		pager.check_invariants();
 
 		let second_block = &mut encoded[1];
-		let mut header = PageHeaderV1::read_from_bytes(&second_block[..HEADER_SIZE]).expect("header should parse");
+		let mut header = PageHeaderV1::try_read_from_bytes(&second_block[..HEADER_SIZE]).expect("header should parse");
 		header.file_page_no = 2;
 		header.crc32 = Pager::compute_crc(
 			&header,
@@ -1801,7 +1780,7 @@ mod tests {
 		pager.check_invariants();
 
 		let first_block = &mut encoded[0];
-		let mut header = PageHeaderV1::read_from_bytes(&first_block[..HEADER_SIZE]).expect("header should parse");
+		let mut header = PageHeaderV1::try_read_from_bytes(&first_block[..HEADER_SIZE]).expect("header should parse");
 		header.page_id = PageId(u32::MAX);
 		header.crc32 = Pager::compute_crc(
 			&header,

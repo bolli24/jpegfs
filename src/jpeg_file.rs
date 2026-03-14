@@ -1,18 +1,80 @@
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
-use std::{fs, fs::File, io::Read};
+use std::{fs, fs::File, io, io::Read};
 
-use anyhow::{Context, bail};
+use thiserror::Error;
 
-use crate::jpeg::{OwnedJpeg, get_capacity, read_owned_jpeg, write_owned_jpeg};
+use crate::jpeg::{JpegError, OwnedJpeg, get_capacity, read_owned_jpeg, write_owned_jpeg};
 use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
 use crate::zigzag::ZIGZAG_INDICES;
 
-pub fn init_file(path: &Path) -> anyhow::Result<JpegFileHandle> {
-	let mut file = File::open(path).context("failed to open input file")?;
+#[derive(Debug, Error)]
+pub enum JpegFileError {
+	#[error("failed to open input file '{path}'")]
+	OpenInput {
+		path: PathBuf,
+		#[source]
+		source: io::Error,
+	},
+	#[error("failed to rewind input file '{path}'")]
+	RewindInput {
+		path: PathBuf,
+		#[source]
+		source: io::Error,
+	},
+	#[error("failed to read input file '{path}'")]
+	ReadInput {
+		path: PathBuf,
+		#[source]
+		source: io::Error,
+	},
+	#[error("failed to compute JPEG capacity")]
+	CapacityComputation(#[source] JpegError),
+	#[error(transparent)]
+	Jpeg(#[from] JpegError),
+	#[error("bit offset {bit_offset} is not byte-aligned")]
+	NotByteAligned { bit_offset: usize },
+	#[error("bit offset {bit_offset} exceeds available capacity of {capacity_bits} bits")]
+	BitOffsetOutOfRange { bit_offset: usize, capacity_bits: usize },
+	#[error("requested {requested_bytes} bytes exceeds available capacity of {available_bytes} bytes")]
+	ReadOutOfCapacity {
+		requested_bytes: usize,
+		available_bytes: usize,
+	},
+	#[error("not enough capacity to write {requested_bytes} bytes; only {available_bytes} bytes available")]
+	WriteOutOfCapacity {
+		requested_bytes: usize,
+		available_bytes: usize,
+	},
+	#[error("failed to create '{path}'")]
+	CreateOutput {
+		path: PathBuf,
+		#[source]
+		source: io::Error,
+	},
+	#[error("failed to write output file '{path}'")]
+	WriteOutput {
+		path: PathBuf,
+		#[source]
+		source: io::Error,
+	},
+	#[error("failed to copy '{from}' to '{to}'")]
+	CopyFile {
+		from: PathBuf,
+		to: PathBuf,
+		#[source]
+		source: io::Error,
+	},
+}
 
-	let content = JpegFileHandle::read_all_from_file(&mut file)?;
-	let capacity = get_capacity(&content).context("failed to compute capacity")?;
+pub fn init_file(path: &Path) -> Result<JpegFileHandle, JpegFileError> {
+	let mut file = File::open(path).map_err(|source| JpegFileError::OpenInput {
+		path: path.to_owned(),
+		source,
+	})?;
+
+	let content = JpegFileHandle::read_all_from_file(&mut file, path)?;
+	let capacity = get_capacity(&content).map_err(JpegFileError::CapacityComputation)?;
 	println!("Opened file '{}' capacity: {}", path.display(), capacity);
 
 	Ok(JpegFileHandle {
@@ -45,7 +107,7 @@ pub struct BitSlot {
 }
 
 impl JpegSession {
-	pub fn new(path: PathBuf, source_jpeg: Vec<u8>) -> anyhow::Result<Self> {
+	pub fn new(path: PathBuf, source_jpeg: Vec<u8>) -> Result<Self, JpegFileError> {
 		let owned_jpeg = unsafe { read_owned_jpeg(&source_jpeg)? };
 		let bit_slots = Self::collect_bit_slots(&owned_jpeg);
 		Ok(Self {
@@ -62,19 +124,18 @@ impl JpegSession {
 		self.bit_slots.len() / 8
 	}
 
-	pub fn seek_bits(&mut self, bit_offset: usize) -> anyhow::Result<()> {
+	pub fn seek_bits(&mut self, bit_offset: usize) -> Result<(), JpegFileError> {
 		if bit_offset > self.bit_slots.len() {
-			bail!(
-				"bit offset {} exceeds available capacity of {} bits",
+			return Err(JpegFileError::BitOffsetOutOfRange {
 				bit_offset,
-				self.bit_slots.len()
-			);
+				capacity_bits: self.bit_slots.len(),
+			});
 		}
 		self.cursor_bits = bit_offset;
 		Ok(())
 	}
 
-	pub fn seek(&mut self, byte_offset: usize) -> anyhow::Result<()> {
+	pub fn seek(&mut self, byte_offset: usize) -> Result<(), JpegFileError> {
 		self.seek_bits(byte_offset * 8)
 	}
 
@@ -123,14 +184,15 @@ impl JpegSession {
 		n
 	}
 
-	pub fn read_data(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
-		ensure_byte_aligned(self.cursor_bits)?;
+	pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
+		ensure_byte_aligned(self.cursor_bits).ok_or(JpegFileError::NotByteAligned {
+			bit_offset: self.cursor_bits,
+		})?;
 		if len > self.remaining_bytes() {
-			bail!(
-				"requested {} KiB exceeds available capacity of {} KiB",
-				len / 1024,
-				self.remaining_bytes() / 1024
-			);
+			return Err(JpegFileError::ReadOutOfCapacity {
+				requested_bytes: len,
+				available_bytes: self.remaining_bytes(),
+			});
 		}
 
 		let mut out = vec![0u8; len];
@@ -139,14 +201,15 @@ impl JpegSession {
 		Ok(out)
 	}
 
-	pub fn write_data(&mut self, data: &[u8]) -> anyhow::Result<()> {
-		ensure_byte_aligned(self.cursor_bits)?;
+	pub fn write_data(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
+		ensure_byte_aligned(self.cursor_bits).ok_or(JpegFileError::NotByteAligned {
+			bit_offset: self.cursor_bits,
+		})?;
 		if data.len() > self.remaining_bytes() {
-			bail!(
-				"not enough capacity to write {} KiB; only {} KiB available",
-				data.len() / 1024,
-				self.remaining_bytes() / 1024
-			);
+			return Err(JpegFileError::WriteOutOfCapacity {
+				requested_bytes: data.len(),
+				available_bytes: self.remaining_bytes(),
+			});
 		}
 
 		let written = self.write(data);
@@ -154,18 +217,23 @@ impl JpegSession {
 		Ok(())
 	}
 
-	pub fn flush(&mut self) -> anyhow::Result<()> {
+	pub fn flush(&mut self) -> Result<(), JpegFileError> {
 		if !self.dirty {
 			return Ok(());
 		}
 
 		let output_jpeg = unsafe { write_owned_jpeg(&self.source_jpeg, &self.owned_jpeg)? };
 
-		let mut output_file =
-			File::create(&self.path).with_context(|| format!("failed to create '{}'", self.path.display()))?;
+		let mut output_file = File::create(&self.path).map_err(|source| JpegFileError::CreateOutput {
+			path: self.path.clone(),
+			source,
+		})?;
 		output_file
 			.write_all(&output_jpeg)
-			.context("failed to write output file")?;
+			.map_err(|source| JpegFileError::WriteOutput {
+				path: self.path.clone(),
+				source,
+			})?;
 
 		println!("Wrote '{}': {}KiB", self.path.display(), output_jpeg.len() / 1024);
 
@@ -202,29 +270,34 @@ impl JpegFileHandle {
 		self.capacity
 	}
 
-	fn read_all_from_file(file: &mut File) -> anyhow::Result<Vec<u8>> {
-		file.rewind().context("failed to rewind input file")?;
+	fn read_all_from_file(file: &mut File, path: &Path) -> Result<Vec<u8>, JpegFileError> {
+		file.rewind().map_err(|source| JpegFileError::RewindInput {
+			path: path.to_owned(),
+			source,
+		})?;
 		let mut content = Vec::<u8>::new();
-		file.read_to_end(&mut content).context("failed to read input file")?;
+		file.read_to_end(&mut content)
+			.map_err(|source| JpegFileError::ReadInput {
+				path: path.to_owned(),
+				source,
+			})?;
 		Ok(content)
 	}
 
-	fn read_all(&mut self) -> anyhow::Result<Vec<u8>> {
-		Self::read_all_from_file(&mut self.file)
+	fn read_all(&mut self) -> Result<Vec<u8>, JpegFileError> {
+		Self::read_all_from_file(&mut self.file, &self.path)
 	}
 
-	pub fn copy_to(&self, target_path: &Path) -> anyhow::Result<JpegFileHandle> {
-		fs::copy(&self.path, target_path).with_context(|| {
-			format!(
-				"failed to copy '{}' to '{}'",
-				self.path.display(),
-				target_path.display()
-			)
+	pub fn copy_to(&self, target_path: &Path) -> Result<JpegFileHandle, JpegFileError> {
+		fs::copy(&self.path, target_path).map_err(|source| JpegFileError::CopyFile {
+			from: self.path.clone(),
+			to: target_path.to_owned(),
+			source,
 		})?;
 		init_file(target_path)
 	}
 
-	pub fn write_data(&mut self, data: &[u8]) -> anyhow::Result<()> {
+	pub fn write_data(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
 		let input_jpeg = self.read_all()?;
 		let mut session = JpegSession::new(self.path.clone(), input_jpeg)?;
 		session.seek(0)?;
@@ -234,10 +307,86 @@ impl JpegFileHandle {
 		Ok(())
 	}
 
-	pub fn read_data(&mut self, len: usize) -> anyhow::Result<Vec<u8>> {
+	pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
 		let input_jpeg = self.read_all()?;
 		let mut session = JpegSession::new(self.path.clone(), input_jpeg)?;
 		session.seek(0)?;
 		session.read_data(len)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::jpeg::OwnedComponent;
+
+	fn dummy_session() -> JpegSession {
+		let component = OwnedComponent {
+			width_in_blocks: 1,
+			height_in_blocks: 1,
+			blocks: vec![[0; 64]],
+		};
+		JpegSession {
+			path: PathBuf::from("dummy.jpg"),
+			source_jpeg: Vec::new(),
+			owned_jpeg: OwnedJpeg {
+				components: [component.clone(), component.clone(), component],
+			},
+			bit_slots: vec![
+				BitSlot {
+					component_index: 0,
+					block_index: 0,
+					coeff_index: 5,
+				};
+				8
+			],
+			cursor_bits: 0,
+			dirty: false,
+		}
+	}
+
+	#[test]
+	fn seek_bits_rejects_offsets_past_capacity() {
+		let mut session = dummy_session();
+		let err = session
+			.seek_bits(9)
+			.expect_err("seeking past the bit capacity should fail");
+		assert!(matches!(
+			err,
+			JpegFileError::BitOffsetOutOfRange {
+				bit_offset: 9,
+				capacity_bits: 8
+			}
+		));
+	}
+
+	#[test]
+	fn read_data_rejects_requests_past_capacity() {
+		let mut session = dummy_session();
+		let err = session
+			.read_data(2)
+			.expect_err("reading more than one byte should exceed capacity");
+		assert!(matches!(
+			err,
+			JpegFileError::ReadOutOfCapacity {
+				requested_bytes: 2,
+				available_bytes: 1
+			}
+		));
+	}
+
+	#[test]
+	fn write_data_rejects_requests_past_capacity() {
+		let mut session = dummy_session();
+		let err = session
+			.write_data(&[1, 2])
+			.expect_err("writing more than one byte should exceed capacity");
+		assert!(matches!(
+			err,
+			JpegFileError::WriteOutOfCapacity {
+				requested_bytes: 2,
+				available_bytes: 1
+			}
+		));
 	}
 }

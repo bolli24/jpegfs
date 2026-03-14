@@ -1,5 +1,5 @@
 use crate::filesystem::BLOCK_SIZE;
-use crate::jpeg_file::JpegFileHandle;
+use crate::jpeg_file::{JpegFileError, JpegFileHandle};
 use crate::pager::{PageId, Pager, PagerCodecError, ValidatedPages};
 use crc::Crc;
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ pub enum Error {
 	#[error("pager decode failed: {0}")]
 	Pager(#[from] PagerCodecError),
 	#[error("failed to write JPEG store data")]
-	JpegWrite(#[source] anyhow::Error),
+	JpegWrite(#[source] JpegFileError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable)]

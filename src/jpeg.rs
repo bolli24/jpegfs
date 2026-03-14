@@ -1,9 +1,9 @@
 use std::{panic, ptr};
 
-use anyhow::bail;
 use arbitrary::{Arbitrary, Unstructured};
 use libc::{c_uchar, c_ulong, c_void, free};
 use mozjpeg_sys::*;
+use thiserror::Error;
 
 use crate::lsb::block_capacity_bits;
 
@@ -25,6 +25,26 @@ impl OwnedComponent {
 #[derive(Clone, Debug)]
 pub struct OwnedJpeg {
 	pub components: [OwnedComponent; 3],
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum JpegError {
+	#[error("only 3-component JPEGs are supported, found {found}")]
+	UnsupportedComponentCount { found: i32 },
+	#[error(
+		"component {component_index} dimensions mismatch: template={template_width}x{template_height}, owned={owned_width}x{owned_height}"
+	)]
+	ComponentDimensionsMismatch {
+		component_index: usize,
+		template_width: usize,
+		template_height: usize,
+		owned_width: usize,
+		owned_height: usize,
+	},
+	#[error("{0}")]
+	Libjpeg(String),
+	#[error("unknown libjpeg panic")]
+	UnknownLibjpegPanic,
 }
 
 impl<'a> Arbitrary<'a> for OwnedComponent {
@@ -76,17 +96,17 @@ impl OwnedJpeg {
 	}
 }
 
-pub fn get_capacity(jpeg_data: &[u8]) -> anyhow::Result<usize> {
+pub fn get_capacity(jpeg_data: &[u8]) -> Result<usize, JpegError> {
 	let owned = unsafe { read_owned_jpeg(jpeg_data)? };
 	Ok(owned.capacity())
 }
 
-pub fn get_component_capacity(jpeg_data: &[u8]) -> anyhow::Result<[usize; 3]> {
+pub fn get_component_capacity(jpeg_data: &[u8]) -> Result<[usize; 3], JpegError> {
 	let owned = unsafe { read_owned_jpeg(jpeg_data)? };
 	Ok(owned.component_capacity())
 }
 
-pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> anyhow::Result<OwnedJpeg> {
+pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> Result<OwnedJpeg, JpegError> {
 	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
 		let mut err: jpeg_error_mgr = std::mem::zeroed();
 		jpeg_std_error(&mut err);
@@ -98,7 +118,9 @@ pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> anyhow::Result<OwnedJpeg> {
 			|_| {},
 			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
 				if srcinfo.num_components != 3 {
-					panic!("only 3-component JPEGs are supported, found {}", srcinfo.num_components);
+					panic::panic_any(JpegError::UnsupportedComponentCount {
+						found: srcinfo.num_components,
+					});
 				}
 
 				let mut components = std::array::from_fn(|comp_idx| {
@@ -131,7 +153,7 @@ pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> anyhow::Result<OwnedJpeg> {
 	handle_jpeg_panic(result)
 }
 
-pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> anyhow::Result<Vec<u8>> {
+pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> Result<Vec<u8>, JpegError> {
 	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
 		let mut err: jpeg_error_mgr = std::mem::zeroed();
 		jpeg_std_error(&mut err);
@@ -148,7 +170,9 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 			},
 			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
 				if srcinfo.num_components != 3 {
-					panic!("only 3-component JPEGs are supported, found {}", srcinfo.num_components);
+					panic::panic_any(JpegError::UnsupportedComponentCount {
+						found: srcinfo.num_components,
+					});
 				}
 
 				for comp_idx in 0..3usize {
@@ -157,10 +181,13 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 					let height_in_blocks = (*comp_info).height_in_blocks as usize;
 					let expected = &owned_jpeg.components[comp_idx];
 					if width_in_blocks != expected.width_in_blocks || height_in_blocks != expected.height_in_blocks {
-						panic!(
-							"component {comp_idx} dimensions mismatch: template={}x{}, owned={}x{}",
-							width_in_blocks, height_in_blocks, expected.width_in_blocks, expected.height_in_blocks
-						);
+						panic::panic_any(JpegError::ComponentDimensionsMismatch {
+							component_index: comp_idx,
+							template_width: width_in_blocks,
+							template_height: height_in_blocks,
+							owned_width: expected.width_in_blocks,
+							owned_height: expected.height_in_blocks,
+						});
 					}
 				}
 
@@ -234,20 +261,22 @@ extern "C-unwind" fn custom_error_exit(cinfo: &mut jpeg_common_struct) {
 		let null_pos = buffer.iter().position(|&b| b == 0).unwrap_or(80);
 		let error_msg = String::from_utf8_lossy(&buffer[..null_pos]).into_owned();
 
-		panic!("libjpeg error {}: {}", msg_code, error_msg);
+		panic::panic_any(JpegError::Libjpeg(format!("libjpeg error {}: {}", msg_code, error_msg)));
 	}
 }
 
-fn handle_jpeg_panic<T>(result: std::thread::Result<T>) -> anyhow::Result<T> {
+fn handle_jpeg_panic<T>(result: std::thread::Result<T>) -> Result<T, JpegError> {
 	match result {
 		Ok(value) => Ok(value),
 		Err(err) => {
-			if let Some(msg) = err.downcast_ref::<String>() {
-				bail!(msg.clone());
+			if let Some(err) = err.downcast_ref::<JpegError>() {
+				Err(err.clone())
+			} else if let Some(msg) = err.downcast_ref::<String>() {
+				Err(JpegError::Libjpeg(msg.clone()))
 			} else if let Some(msg) = err.downcast_ref::<&str>() {
-				bail!(msg.to_string());
+				Err(JpegError::Libjpeg((*msg).to_string()))
 			} else {
-				bail!("unknown libjpeg panic");
+				Err(JpegError::UnknownLibjpegPanic)
 			}
 		}
 	}

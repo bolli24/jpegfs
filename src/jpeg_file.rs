@@ -38,10 +38,10 @@ pub struct JpegSession {
 }
 
 #[derive(Clone, Copy)]
-struct BitSlot {
-	component_index: usize,
-	block_index: usize,
-	coeff_index: usize,
+pub struct BitSlot {
+	pub component_index: usize,
+	pub block_index: usize,
+	pub coeff_index: usize,
 }
 
 impl JpegSession {
@@ -174,7 +174,7 @@ impl JpegSession {
 		Ok(())
 	}
 
-	fn collect_bit_slots(owned_jpeg: &OwnedJpeg) -> Vec<BitSlot> {
+	pub fn collect_bit_slots(owned_jpeg: &OwnedJpeg) -> Vec<BitSlot> {
 		let mut bit_slots = Vec::new();
 		for (component_index, component) in owned_jpeg.components.iter().enumerate() {
 			for (block_index, block) in component.blocks.iter().enumerate() {

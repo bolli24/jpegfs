@@ -21,6 +21,7 @@ const POSIX_BLOCK: u64 = 512;
 pub const MAX_INODES: usize = 4096;
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_FILE_SIZE: usize = 4 * 1024 * 1024;
+// Only used for memory-only filesystems, when jpeg-persisted uses jpegs capacity
 pub const TOTAL_BYTES_LIMIT: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]

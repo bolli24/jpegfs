@@ -2,7 +2,7 @@ use crate::{
 	MAGIC,
 	filesystem::BLOCK_SIZE,
 	inode::{Inode, InodeRaw},
-	store::{Error as StoreError, StoreBlock},
+	store::{Error as StoreError, StoreBlock, StoreSlot},
 };
 use crc::Crc;
 use fuser::INodeNo;
@@ -65,7 +65,7 @@ const DIRENTRIES_CAPACITY: usize = BLOCK_PAYLOAD_CAPACITY;
 pub struct DirEntriesPage {
 	page_id: PageId,
 	inode: INodeNo,
-	indices: BTreeMap<OsString, (u32, INodeNo)>,
+	indices: BTreeMap<OsString, (StoreSlot, INodeNo)>,
 	entries: StoreBlock<(OsString, INodeNo), DIRENTRIES_CAPACITY>,
 }
 
@@ -175,7 +175,7 @@ pub enum DecodedPage {
 		page_id: PageId,
 		inode: INodeNo,
 		entries: StoreBlock<(OsString, INodeNo), DIRENTRIES_CAPACITY>,
-		indices: BTreeMap<OsString, (u32, INodeNo)>,
+		indices: BTreeMap<OsString, (StoreSlot, INodeNo)>,
 	},
 	DataBytes {
 		page_id: PageId,
@@ -716,7 +716,7 @@ impl Pager {
 		Ok(None)
 	}
 
-	fn remap_single_dir_entry_slot(page: &mut DirEntriesPage, from_slot: u32, to_slot: u32) {
+	fn remap_single_dir_entry_slot(page: &mut DirEntriesPage, from_slot: StoreSlot, to_slot: StoreSlot) {
 		if from_slot == to_slot {
 			return;
 		}
@@ -1196,7 +1196,7 @@ impl Pager {
 			})?;
 		let entries = StoreBlock::<(OsString, INodeNo), DIRENTRIES_CAPACITY>::from_bytes(raw_payload)?;
 		let mut indices = BTreeMap::new();
-		for slot in 0..entries.active_slots() {
+		for slot in entries.slots() {
 			let (name, child_ino) = entries.get(slot)?;
 			if indices.insert(name.clone(), (slot, child_ino)).is_some() {
 				return Err(PagerCodecError::DuplicateDirEntryName(name));

@@ -12,14 +12,12 @@ arbitrary = "1.4"
 mozjpeg-sys = "2.2"
 libc = "0.2"
 
-sha256 = "1.6"
-
 argon2 = { version = "0.5", features = ["std"] }
 rand = "0.10"
 rand_chacha = "0.10"
 
 serde = "1.0"
-postcard = { version = "1.1", features = ["use-std", "use-crc"] }
+postcard = { version = "1.1", features = ["use-std", "use-crc"] }  # When updating it must be made sure that the binary format does not change
 crc = "3.4"
 zerocopy = "0.8"
 
@@ -27,7 +25,7 @@ fuser = { version = "0.17", features = ["serializable"] }
 parking_lot = "0.12"
 simplelog = "0.12"
 ctrlc = "3.4"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.29"
 rayon = "1.11"
 

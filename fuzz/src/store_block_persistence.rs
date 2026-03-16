@@ -4,7 +4,7 @@ use std::mem::size_of;
 
 use arbitrary::Arbitrary;
 use jpegfs::pager::PageId;
-use jpegfs::store::{Error, Header, StoreBlock};
+use jpegfs::store::{Error, Header, StoreBlock, StoreSlot};
 use libfuzzer_sys::fuzz_target;
 use zerocopy::FromBytes;
 
@@ -32,7 +32,7 @@ fuzz_target!(|program: Program| {
 
 		match block.try_store(value.clone()) {
 			Ok(index) => {
-				assert_eq!(index as usize, expected.len());
+				assert_eq!(index, StoreSlot::from_raw(expected.len() as u32));
 				expected.push(value);
 
 				assert_eq!(persisted_active_slots(&block) as usize, expected.len());
@@ -42,8 +42,8 @@ fuzz_target!(|program: Program| {
 		}
 	}
 
-	for (index, expected_value) in expected.iter().enumerate() {
-		let got = block.get(index as u32).expect("stored value must round-trip");
+	for (slot, expected_value) in block.slots().zip(expected.iter()) {
+		let got = block.get(slot).expect("stored value must round-trip");
 		assert_eq!(got, *expected_value);
 	}
 });

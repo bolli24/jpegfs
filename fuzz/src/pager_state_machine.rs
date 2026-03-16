@@ -11,7 +11,7 @@ use arbitrary::Arbitrary;
 use fuser::{FileType, INodeNo};
 use jpegfs::{
 	inode::Inode,
-	pager::{Pager, ValidatedPages},
+	pager::{DecodedPages, Pager},
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -264,8 +264,8 @@ fuzz_target!(|program: Program| {
 	}
 
 	let encoded = pager.encode_blocks().expect("encoding pager blocks should succeed");
-	let decoded_pages = ValidatedPages::decode_blocks(&encoded, MAX_PAGES).expect("page decoding should succeed");
-	pager = Pager::from_validated_pages(decoded_pages, MAX_PAGES).expect("decoding pager blocks should succeed");
+	let decoded_pages = DecodedPages::decode_blocks(&encoded).expect("page decoding should succeed");
+	pager = Pager::from_decoded_pages(decoded_pages, MAX_PAGES).expect("decoding pager blocks should succeed");
 	pager.check_invariants();
 	check_consistency(&pager, &inode_model, &dir_model, &bytes_model);
 });

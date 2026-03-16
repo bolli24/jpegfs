@@ -1,6 +1,6 @@
 use crate::filesystem::BLOCK_SIZE;
 use crate::jpeg_file::{JpegFileError, JpegFileHandle};
-use crate::pager::{PageId, Pager, PagerCodecError, ValidatedPages};
+use crate::pager::{DecodedPages, PageId, Pager, PagerCodecError};
 use crc::Crc;
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -53,7 +53,7 @@ pub struct JpegBlockStore {
 }
 
 impl JpegBlockStore {
-	pub fn from_bytes_or_init_strict(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
+	pub fn from_bytes_or_init_strict(file: JpegFileHandle, data: &[u8]) -> Result<(Self, DecodedPages), Error> {
 		if data.len() < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(data.len()));
 		}
@@ -85,7 +85,7 @@ impl JpegBlockStore {
 		let persisted_blocks = blocks[..usize::from(header.pages_used)].to_vec();
 
 		let pages = Pager::decode_page_blocks(blocks)?;
-		let decoded_pages = ValidatedPages::from_decoded_pages_unchecked(pages);
+		let decoded_pages = DecodedPages::from_decoded_pages(pages);
 		let mut pages_map = HashMap::with_capacity(blocks.len());
 		for (slot, page_id) in decoded_pages.page_ids().enumerate() {
 			if pages_map.insert(page_id, slot).is_some() {
@@ -104,7 +104,7 @@ impl JpegBlockStore {
 		))
 	}
 
-	pub fn init_new(file: JpegFileHandle, data: &[u8]) -> Result<(Self, ValidatedPages), Error> {
+	pub fn init_new(file: JpegFileHandle, data: &[u8]) -> Result<(Self, DecodedPages), Error> {
 		if data.len() < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(data.len()));
 		}
@@ -132,7 +132,7 @@ impl JpegBlockStore {
 				pages_map: HashMap::new(),
 				persisted_blocks: Vec::new(),
 			},
-			ValidatedPages::empty(),
+			DecodedPages::empty(),
 		))
 	}
 

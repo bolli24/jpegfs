@@ -13,7 +13,7 @@ use rayon::prelude::*;
 
 use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
 use jpegfs::jpeg_file::init_file;
-use jpegfs::pager::{PageId, Pager, ValidatedPages};
+use jpegfs::pager::{DecodedPages, PageId, Pager};
 use jpegfs::persistence::JpegBlockStore;
 
 mod tui;
@@ -169,10 +169,10 @@ fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 	Ok(paths)
 }
 
-fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>, ValidatedPages, usize)> {
+fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>, DecodedPages, usize)> {
 	let decode_started_at = Instant::now();
 	let pool = jpeg_thread_pool(paths.len())?;
-	let loaded: Vec<anyhow::Result<(usize, JpegBlockStore, ValidatedPages, usize)>> = pool.install(|| {
+	let loaded: Vec<anyhow::Result<(usize, JpegBlockStore, DecodedPages, usize)>> = pool.install(|| {
 		paths
 			.par_iter()
 			.enumerate()
@@ -184,7 +184,7 @@ fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>
 	loaded.sort_by_key(|(index, _, _, _)| *index);
 
 	let mut stores = Vec::with_capacity(paths.len());
-	let mut decoded_pages = ValidatedPages::empty();
+	let mut decoded_pages = DecodedPages::empty();
 	let mut total_page_capacity = 0usize;
 
 	for (_, store, pages, page_capacity) in loaded {
@@ -195,10 +195,6 @@ fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>
 		stores.push(store);
 	}
 
-	let decoded_pages = decoded_pages
-		.validate(total_page_capacity)
-		.context("combined persisted pages are invalid")?;
-
 	info!(
 		"Decoded {} JPEG stores in {:?}",
 		paths.len(),
@@ -208,7 +204,7 @@ fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>
 	Ok((stores, decoded_pages, total_page_capacity))
 }
 
-fn load_one_store(index: usize, path: &Path) -> anyhow::Result<(usize, JpegBlockStore, ValidatedPages, usize)> {
+fn load_one_store(index: usize, path: &Path) -> anyhow::Result<(usize, JpegBlockStore, DecodedPages, usize)> {
 	let mut file = init_file(path).with_context(|| format!("failed to open JPEG store at {}", path.display()))?;
 	let data = file
 		.read_data(file.capacity())
@@ -219,7 +215,7 @@ fn load_one_store(index: usize, path: &Path) -> anyhow::Result<(usize, JpegBlock
 	Ok((index, store, pages, page_capacity))
 }
 
-fn init_filesystem(decoded_pages: ValidatedPages, total_page_capacity: usize) -> anyhow::Result<FileSystem> {
+fn init_filesystem(decoded_pages: DecodedPages, total_page_capacity: usize) -> anyhow::Result<FileSystem> {
 	anyhow::ensure!(
 		total_page_capacity >= MIN_BOOTSTRAP_PAGES,
 		"insufficient total JPEG capacity: {total_page_capacity} pages available, at least {MIN_BOOTSTRAP_PAGES} are required"
@@ -231,7 +227,7 @@ fn init_filesystem(decoded_pages: ValidatedPages, total_page_capacity: usize) ->
 			.map_err(anyhow::Error::msg)
 			.context("failed to initialize fresh filesystem from JPEG capacity")?
 	} else {
-		let pager = Pager::from_validated_pages(decoded_pages, total_page_capacity)
+		let pager = Pager::from_decoded_pages(decoded_pages, total_page_capacity)
 			.context("failed to decode persisted pager state from JPEG stores")?;
 		FileSystem::from_pager(pager, total_bytes_limit)
 			.map_err(anyhow::Error::msg)

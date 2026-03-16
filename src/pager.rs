@@ -287,6 +287,7 @@ impl Pager {
 		Ok(encoded_by_id)
 	}
 
+	/// Initialize a filesystem pager from a set of decoded pages, validating them in the process
 	pub fn from_decoded_pages(decoded: DecodedPages, max_pages: usize) -> Result<Self, PagerCodecError> {
 		Self::validate_decoded_pages(&decoded.0, max_pages)?;
 
@@ -365,6 +366,13 @@ impl Pager {
 		Ok(pager)
 	}
 
+	/// Validate a set of decoded pages to uphold the nescessary invariants to construct a pager.
+	/// This does not check for any additional invariants that the filesystem requires. see [`crate::filesystem::FileSystemState::check_invariants`].
+	/// - Does not contain too many pages
+	/// - No duplicate page ids
+	/// - No page id equal to u32::MAX
+	/// - No duplicate inodes
+	/// - Decoded data pages for a decoded inode are contiguous
 	fn validate_decoded_pages(decoded: &[DecodedPage], max_pages: usize) -> Result<(), PagerCodecError> {
 		if decoded.len() > max_pages {
 			return Err(PagerCodecError::TooManyPages(decoded.len()));

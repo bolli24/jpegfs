@@ -106,7 +106,7 @@ fn refresh_pools(state: &FileSystemState, inodes: &mut Vec<INodeNo>, handles: &m
 fuzz_target!(|program: Program| {
 	let fs = FileSystem::new();
 	let mut state = fs.state.write();
-	let mut inodes = vec![INodeNo(1)];
+	let mut inodes = vec![INodeNo::ROOT];
 	let mut handles = Vec::new();
 
 	for op in program.ops.iter().take(MAX_OPS) {

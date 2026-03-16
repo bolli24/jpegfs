@@ -13,6 +13,7 @@ use crate::pager::Pager;
 use fuser::*;
 use log::{info, warn};
 use parking_lot::RwLock;
+use thiserror::Error;
 
 pub const BLOCK_SIZE: usize = 4096;
 const POSIX_BLOCK: u64 = 512;
@@ -63,6 +64,72 @@ pub struct FileSystemState {
 	dirty: bool,
 }
 
+#[derive(Debug, Error)]
+pub enum FileSystemInvariantError {
+	#[error("missing root inode")]
+	MissingRootInode,
+	#[error("root inode is not a directory")]
+	RootNotDirectory,
+	#[error("missing root directory entries")]
+	MissingRootDirectoryEntries,
+	#[error("root directory missing '.'")]
+	RootMissingDot,
+	#[error("root directory '.' entry mismatch")]
+	RootDotMismatch,
+	#[error("root directory missing '..'")]
+	RootMissingDotDot,
+	#[error("root directory '..' entry mismatch")]
+	RootDotDotMismatch,
+	#[error("inode size mismatch for {ino:?}")]
+	InodeSizeMismatch { ino: INodeNo },
+	#[error("non-regular inode carries byte pages: {ino:?}")]
+	NonRegularInodeCarriesBytes { ino: INodeNo },
+	#[error("used_bytes overflow while checking invariants")]
+	UsedBytesOverflow,
+	#[error("used_bytes mismatch: actual={actual} computed={computed}")]
+	UsedBytesMismatch { actual: u64, computed: u64 },
+	#[error("used_bytes exceeds total_bytes_limit")]
+	UsedBytesExceedsLimit,
+	#[error("inode count exceeds max_inodes")]
+	InodeCountExceedsMax,
+	#[error("free inode set overlaps live inodes: {ino:?}")]
+	FreeInodeOverlapsLiveInodes { ino: INodeNo },
+	#[error("handle points to missing inode: fh={fh:?}, ino={ino:?}")]
+	HandlePointsToMissingInode { fh: FileHandle, ino: INodeNo },
+	#[error("handle points to non-regular inode: fh={fh:?}, ino={ino:?}")]
+	HandlePointsToNonRegularInode { fh: FileHandle, ino: INodeNo },
+	#[error("missing directory entries for {dir_ino:?}")]
+	MissingDirectoryEntries { dir_ino: INodeNo },
+	#[error("directory missing '.': {dir_ino:?}")]
+	DirectoryMissingDot { dir_ino: INodeNo },
+	#[error("'.' entry mismatch in directory: {dir_ino:?}")]
+	DirectoryDotMismatch { dir_ino: INodeNo },
+	#[error("directory missing '..': {dir_ino:?}")]
+	DirectoryMissingDotDot { dir_ino: INodeNo },
+	#[error("entry name too long in {dir_ino:?}: {name:?}")]
+	EntryNameTooLong { dir_ino: INodeNo, name: OsString },
+	#[error("directory entry points to missing inode: parent={parent:?}, name={name:?}, child={child:?}")]
+	DirectoryEntryPointsToMissingInode {
+		parent: INodeNo,
+		name: OsString,
+		child: INodeNo,
+	},
+	#[error("directory nlink mismatch for {dir_ino:?}: actual={actual} expected={expected}")]
+	DirectoryNlinkMismatch {
+		dir_ino: INodeNo,
+		actual: u32,
+		expected: u32,
+	},
+}
+
+#[derive(Debug, Error)]
+pub enum FileSystemInitError {
+	#[error("persisted file data ({used_bytes} bytes) exceeds configured limit ({total_bytes_limit} bytes)")]
+	PersistedFileDataExceedsLimit { used_bytes: u64, total_bytes_limit: usize },
+	#[error(transparent)]
+	Invariant(#[from] FileSystemInvariantError),
+}
+
 impl FileSystem {
 	fn pager_max_pages(total_bytes_limit: usize, max_inodes: usize) -> usize {
 		total_bytes_limit
@@ -78,7 +145,6 @@ impl FileSystem {
 
 	pub fn new_with_limits(max_pages: usize, total_bytes_limit: usize) -> Result<Self, String> {
 		let now = SystemTime::now();
-		let root_ino = INodeNo(1);
 		let root_uid = unsafe { libc::geteuid() };
 		let root_gid = unsafe { libc::getegid() };
 
@@ -97,20 +163,20 @@ impl FileSystem {
 
 		let mut pager = Pager::new(max_pages.max(1));
 		pager
-			.inodes_insert(root_ino, root_inode)
+			.inodes_insert(INodeNo::ROOT, root_inode)
 			.map_err(|()| "insufficient page capacity for root inode".to_string())?;
 		pager
-			.dir_entries_insert(root_ino, OsString::from("."), root_ino)
+			.dir_entries_insert(INodeNo::ROOT, OsString::from("."), INodeNo::ROOT)
 			.map_err(|()| "insufficient page capacity for root '.' entry".to_string())?;
 		pager
-			.dir_entries_insert(root_ino, OsString::from(".."), root_ino)
+			.dir_entries_insert(INodeNo::ROOT, OsString::from(".."), INodeNo::ROOT)
 			.map_err(|()| "insufficient page capacity for root '..' entry".to_string())?;
 
 		let state = FileSystemState {
 			pager,
 			handles: HashMap::new(),
 			next_fh: 1,
-			next_ino: INodeNo(root_ino.0 + 1),
+			next_ino: INodeNo(INodeNo::ROOT.0 + 1),
 			free_inos: Vec::new(),
 			max_inodes: MAX_INODES,
 			max_name_len: MAX_NAME_LEN,
@@ -124,7 +190,7 @@ impl FileSystem {
 		})
 	}
 
-	pub fn from_pager(pager: Pager, total_bytes_limit: usize) -> Result<Self, String> {
+	pub fn from_pager(pager: Pager, total_bytes_limit: usize) -> Result<Self, FileSystemInitError> {
 		let inode_numbers: HashSet<INodeNo> = pager.inodes_snapshot().into_iter().map(|(ino, _)| ino).collect();
 		let max_ino = inode_numbers.iter().map(|ino| ino.0).max().unwrap_or(1);
 		let free_inos = (2..max_ino)
@@ -151,9 +217,10 @@ impl FileSystem {
 
 		let used_bytes = state.recompute_used_bytes();
 		if used_bytes > total_bytes_limit as u64 {
-			return Err(format!(
-				"persisted file data ({used_bytes} bytes) exceeds configured limit ({total_bytes_limit} bytes)"
-			));
+			return Err(FileSystemInitError::PersistedFileDataExceedsLimit {
+				used_bytes,
+				total_bytes_limit,
+			});
 		}
 
 		let mut state = state;
@@ -360,7 +427,10 @@ impl FileSystemState {
 	}
 
 	fn reject_dot_entries(name: &OsStr) -> FsOpResult<()> {
-		if name == OsStr::new(".") || name == OsStr::new("..") {
+		if name == OsStr::new(".") {
+			return Err(Errno::EINVAL);
+		}
+		if name == OsStr::new("..") {
 			return Err(Errno::EINVAL);
 		}
 		Ok(())
@@ -404,7 +474,7 @@ impl FileSystemState {
 			if !visited.insert(cursor) {
 				return Err(Errno::EIO);
 			}
-			if cursor == INodeNo(1) {
+			if cursor == INodeNo::ROOT {
 				return Ok(false);
 			}
 
@@ -592,7 +662,7 @@ impl FileSystemState {
 		Self::reject_dot_entries(name)?;
 		let child_ino = self.lookup_child_ino(parent, name)?;
 
-		if child_ino == INodeNo(1) {
+		if child_ino == INodeNo::ROOT {
 			return Err(Errno::EBUSY);
 		}
 
@@ -802,7 +872,7 @@ impl FileSystemState {
 		}
 
 		let source_ino = self.lookup_child_ino(parent, name)?;
-		if source_ino == INodeNo(1) {
+		if source_ino == INodeNo::ROOT {
 			return Err(Errno::EBUSY);
 		}
 		let source_inode = self.pager.inode_get(source_ino).ok_or(Errno::EIO)?;
@@ -819,7 +889,7 @@ impl FileSystemState {
 
 		let mut target_is_dir = false;
 		if let Some(existing_ino) = target_ino {
-			if existing_ino == INodeNo(1) {
+			if existing_ino == INodeNo::ROOT {
 				return Err(Errno::EBUSY);
 			}
 			let existing_inode = self.pager.inode_get(existing_ino).ok_or(Errno::EIO)?;
@@ -927,20 +997,29 @@ impl FileSystemState {
 		Ok(())
 	}
 
-	pub fn check_invariants(&self) -> Result<(), String> {
-		let root = INodeNo(1);
-		let Some(root_inode) = self.pager.inode_get(root) else {
-			return Err("missing root inode".to_string());
+	/// Validate that the filesystem currently upholds all nescessary invariants
+	pub fn check_invariants(&self) -> Result<(), FileSystemInvariantError> {
+		let Some(root_inode) = self.pager.inode_get(INodeNo::ROOT) else {
+			return Err(FileSystemInvariantError::MissingRootInode);
 		};
 		if root_inode.kind != FileType::Directory {
-			return Err("root inode is not a directory".to_string());
+			return Err(FileSystemInvariantError::RootNotDirectory);
 		}
 
-		let Some(root_dir) = self.pager.dir_entries_get_dir(root) else {
-			return Err("missing root directory entries".to_string());
+		let Some(root_dir) = self.pager.dir_entries_get_dir(INodeNo::ROOT) else {
+			return Err(FileSystemInvariantError::MissingRootDirectoryEntries);
 		};
-		if root_dir.get(OsStr::new(".")) != Some(&root) || root_dir.get(OsStr::new("..")) != Some(&root) {
-			return Err("root directory is missing '.' or '..'".to_string());
+		let Some(root_dot) = root_dir.get(OsStr::new(".")) else {
+			return Err(FileSystemInvariantError::RootMissingDot);
+		};
+		if root_dot != &INodeNo::ROOT {
+			return Err(FileSystemInvariantError::RootDotMismatch);
+		}
+		let Some(root_dotdot) = root_dir.get(OsStr::new("..")) else {
+			return Err(FileSystemInvariantError::RootMissingDotDot);
+		};
+		if root_dotdot != &INodeNo::ROOT {
+			return Err(FileSystemInvariantError::RootDotDotMismatch);
 		}
 
 		let mut computed_used_bytes = 0u64;
@@ -949,41 +1028,42 @@ impl FileSystemState {
 			let bytes_len = self.pager.bytes_len(*ino) as u64;
 			if inode.kind == FileType::RegularFile {
 				if inode.size != bytes_len {
-					return Err(format!("inode size mismatch for {ino:?}"));
+					return Err(FileSystemInvariantError::InodeSizeMismatch { ino: *ino });
 				}
 				computed_used_bytes = computed_used_bytes
 					.checked_add(bytes_len)
-					.ok_or_else(|| "used_bytes overflow while checking invariants".to_string())?;
+					.ok_or(FileSystemInvariantError::UsedBytesOverflow)?;
 			} else if bytes_len != 0 {
-				return Err(format!("non-regular inode carries byte pages: {ino:?}"));
+				return Err(FileSystemInvariantError::NonRegularInodeCarriesBytes { ino: *ino });
 			}
 		}
 
 		let used_bytes = self.used_bytes();
 		if used_bytes != computed_used_bytes {
-			return Err(format!(
-				"used_bytes mismatch: actual={used_bytes} computed={computed_used_bytes}",
-			));
+			return Err(FileSystemInvariantError::UsedBytesMismatch {
+				actual: used_bytes,
+				computed: computed_used_bytes,
+			});
 		}
 		if used_bytes > self.total_bytes_limit as u64 {
-			return Err("used_bytes exceeds total_bytes_limit".to_string());
+			return Err(FileSystemInvariantError::UsedBytesExceedsLimit);
 		}
 		if self.pager.inodes_len() > self.max_inodes {
-			return Err("inode count exceeds max_inodes".to_string());
+			return Err(FileSystemInvariantError::InodeCountExceedsMax);
 		}
 
 		for ino in &self.free_inos {
 			if self.pager.inodes_contains(*ino) {
-				return Err(format!("free inode set overlaps live inodes: {ino:?}"));
+				return Err(FileSystemInvariantError::FreeInodeOverlapsLiveInodes { ino: *ino });
 			}
 		}
 
 		for (fh, ino) in &self.handles {
 			let Some(inode) = self.pager.inode_get(*ino) else {
-				return Err(format!("handle points to missing inode: fh={fh:?}, ino={ino:?}"));
+				return Err(FileSystemInvariantError::HandlePointsToMissingInode { fh: *fh, ino: *ino });
 			};
 			if inode.kind != FileType::RegularFile {
-				return Err(format!("handle points to non-regular inode: fh={fh:?}, ino={ino:?}"));
+				return Err(FileSystemInvariantError::HandlePointsToNonRegularInode { fh: *fh, ino: *ino });
 			}
 		}
 
@@ -992,28 +1072,33 @@ impl FileSystemState {
 			.filter(|(_, inode)| inode.kind == FileType::Directory)
 		{
 			let Some(entries) = self.pager.dir_entries_get_dir(*dir_ino) else {
-				return Err(format!("missing directory entries for {dir_ino:?}"));
+				return Err(FileSystemInvariantError::MissingDirectoryEntries { dir_ino: *dir_ino });
 			};
 
 			let Some(parent_dot) = entries.get(OsStr::new(".")) else {
-				return Err(format!("directory missing '.': {dir_ino:?}"));
+				return Err(FileSystemInvariantError::DirectoryMissingDot { dir_ino: *dir_ino });
 			};
 			if parent_dot != dir_ino {
-				return Err(format!("'.' entry mismatch in directory: {dir_ino:?}"));
+				return Err(FileSystemInvariantError::DirectoryDotMismatch { dir_ino: *dir_ino });
 			}
 			if !entries.contains_key(OsStr::new("..")) {
-				return Err(format!("directory missing '..': {dir_ino:?}"));
+				return Err(FileSystemInvariantError::DirectoryMissingDotDot { dir_ino: *dir_ino });
 			}
 
 			let mut subdir_count = 0u32;
 			for (name, child_ino) in entries {
 				if name != OsStr::new(".") && name != OsStr::new("..") && name.as_bytes().len() > self.max_name_len {
-					return Err(format!("entry name too long in {dir_ino:?}: {name:?}"));
+					return Err(FileSystemInvariantError::EntryNameTooLong {
+						dir_ino: *dir_ino,
+						name: name.clone(),
+					});
 				}
 				let Some(child_inode) = self.pager.inode_get(child_ino) else {
-					return Err(format!(
-						"directory entry points to missing inode: parent={dir_ino:?}, name={name:?}, child={child_ino:?}"
-					));
+					return Err(FileSystemInvariantError::DirectoryEntryPointsToMissingInode {
+						parent: *dir_ino,
+						name: name.clone(),
+						child: child_ino,
+					});
 				};
 				if name != OsStr::new(".") && name != OsStr::new("..") && child_inode.kind == FileType::Directory {
 					subdir_count += 1;
@@ -1022,10 +1107,11 @@ impl FileSystemState {
 
 			let expected_nlink = 2u32.saturating_add(subdir_count);
 			if dir_inode.nlink != expected_nlink {
-				return Err(format!(
-					"directory nlink mismatch for {dir_ino:?}: actual={} expected={expected_nlink}",
-					dir_inode.nlink
-				));
+				return Err(FileSystemInvariantError::DirectoryNlinkMismatch {
+					dir_ino: *dir_ino,
+					actual: dir_inode.nlink,
+					expected: expected_nlink,
+				});
 			}
 		}
 
@@ -1640,7 +1726,7 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
-			.op_create(INodeNo(1), OsStr::new("blocks"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("blocks"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		state
 			.op_write(ino, fh, 0, &vec![0u8; BLOCK_SIZE + 1])
@@ -1659,7 +1745,7 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
-			.op_create(INodeNo(1), OsStr::new("saturate"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("saturate"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		state
 			.op_write(ino, fh, 0, &vec![0u8; BLOCK_SIZE * 3])
@@ -1684,11 +1770,11 @@ mod tests {
 		let ino = {
 			let mut state = fs.state.write();
 			let (ino, _inode, fh) = state
-				.op_create(INodeNo(1), OsStr::new("file"), 0o644, 0, 1000, 1000)
+				.op_create(INodeNo::ROOT, OsStr::new("file"), 0o644, 0, 1000, 1000)
 				.expect("create should succeed");
 			state.op_write(ino, fh, 0, b"abc").expect("write should succeed");
 			state
-				.op_unlink(INodeNo(1), OsStr::new("file"))
+				.op_unlink(INodeNo::ROOT, OsStr::new("file"))
 				.expect("unlink should succeed");
 			assert!(state.op_getattr(ino).is_ok());
 			state.op_release(fh);
@@ -1710,7 +1796,7 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
-			.op_create(INodeNo(1), OsStr::new("growshrink"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("growshrink"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		state.op_release(fh);
 
@@ -1727,7 +1813,7 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (dir_ino, _dir) = state
-			.op_mkdir(INodeNo(1), OsStr::new("dir"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("dir"), 0o755, 0, 1000, 1000)
 			.expect("mkdir should succeed");
 		let (_file_ino, _file, fh) = state
 			.op_create(dir_ino, OsStr::new("child"), 0o644, 0, 1000, 1000)
@@ -1736,7 +1822,7 @@ mod tests {
 
 		assert_eq!(
 			state
-				.op_rmdir(INodeNo(1), OsStr::new("dir"))
+				.op_rmdir(INodeNo::ROOT, OsStr::new("dir"))
 				.map_err(i32::from)
 				.expect_err("non-empty directory should fail"),
 			i32::from(Errno::ENOTEMPTY)
@@ -1749,7 +1835,7 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
-			.op_create(INodeNo(1), OsStr::new("offset"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("offset"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		let err = state
 			.op_write(ino, fh, u64::MAX, b"x")
@@ -1763,15 +1849,15 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (first, _first_inode, fh_first) = state
-			.op_create(INodeNo(1), OsStr::new("first"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("first"), 0o644, 0, 1000, 1000)
 			.expect("first create should succeed");
 		state.op_release(fh_first);
 		state
-			.op_unlink(INodeNo(1), OsStr::new("first"))
+			.op_unlink(INodeNo::ROOT, OsStr::new("first"))
 			.expect("unlink should succeed");
 
 		let (second, _second_inode, fh_second) = state
-			.op_create(INodeNo(1), OsStr::new("second"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("second"), 0o644, 0, 1000, 1000)
 			.expect("second create should succeed");
 		state.op_release(fh_second);
 
@@ -1784,22 +1870,22 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
-			.op_create(INodeNo(1), OsStr::new("old"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("old"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		state.op_release(fh);
 
 		state
 			.op_rename(
-				INodeNo(1),
+				INodeNo::ROOT,
 				OsStr::new("old"),
-				INodeNo(1),
+				INodeNo::ROOT,
 				OsStr::new("new"),
 				RenameFlags::empty(),
 			)
 			.expect("rename should succeed");
 
-		assert_eq!(state.pager.dir_entries_get(INodeNo(1), OsStr::new("old")), None);
-		assert_eq!(state.pager.dir_entries_get(INodeNo(1), OsStr::new("new")), Some(ino));
+		assert_eq!(state.pager.dir_entries_get(INodeNo::ROOT, OsStr::new("old")), None);
+		assert_eq!(state.pager.dir_entries_get(INodeNo::ROOT, OsStr::new("new")), Some(ino));
 		assert!(state.check_invariants().is_ok());
 	}
 
@@ -1808,12 +1894,12 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (src_ino, _src_inode, src_fh) = state
-			.op_create(INodeNo(1), OsStr::new("src"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("src"), 0o644, 0, 1000, 1000)
 			.expect("create src should succeed");
 		state.op_release(src_fh);
 
 		let (dst_ino, _dst_inode, dst_fh) = state
-			.op_create(INodeNo(1), OsStr::new("dst"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("dst"), 0o644, 0, 1000, 1000)
 			.expect("create dst should succeed");
 		state
 			.op_write(dst_ino, dst_fh, 0, b"payload")
@@ -1822,17 +1908,17 @@ mod tests {
 
 		state
 			.op_rename(
-				INodeNo(1),
+				INodeNo::ROOT,
 				OsStr::new("src"),
-				INodeNo(1),
+				INodeNo::ROOT,
 				OsStr::new("dst"),
 				RenameFlags::empty(),
 			)
 			.expect("rename should succeed");
 
-		assert_eq!(state.pager.dir_entries_get(INodeNo(1), OsStr::new("src")), None);
+		assert_eq!(state.pager.dir_entries_get(INodeNo::ROOT, OsStr::new("src")), None);
 		assert_eq!(
-			state.pager.dir_entries_get(INodeNo(1), OsStr::new("dst")),
+			state.pager.dir_entries_get(INodeNo::ROOT, OsStr::new("dst")),
 			Some(src_ino)
 		);
 		assert_eq!(
@@ -1850,10 +1936,10 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (a, _) = state
-			.op_mkdir(INodeNo(1), OsStr::new("a"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("a"), 0o755, 0, 1000, 1000)
 			.expect("mkdir a should succeed");
 		let (b, _) = state
-			.op_mkdir(INodeNo(1), OsStr::new("b"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("b"), 0o755, 0, 1000, 1000)
 			.expect("mkdir b should succeed");
 		let (child, _) = state
 			.op_mkdir(a, OsStr::new("child"), 0o755, 0, 1000, 1000)
@@ -1875,21 +1961,29 @@ mod tests {
 	fn rename_replace_empty_dir_same_parent_decrements_parent_nlink() {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
-		let root = INodeNo(1);
 		let (src_ino, _) = state
-			.op_mkdir(root, OsStr::new("src"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("src"), 0o755, 0, 1000, 1000)
 			.expect("mkdir src should succeed");
 		let (dst_ino, _) = state
-			.op_mkdir(root, OsStr::new("dst"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("dst"), 0o755, 0, 1000, 1000)
 			.expect("mkdir dst should succeed");
 
-		let before = state.pager.inode_get(root).expect("root exists").nlink;
+		let before = state.pager.inode_get(INodeNo::ROOT).expect("root exists").nlink;
 		state
-			.op_rename(root, OsStr::new("src"), root, OsStr::new("dst"), RenameFlags::empty())
+			.op_rename(
+				INodeNo::ROOT,
+				OsStr::new("src"),
+				INodeNo::ROOT,
+				OsStr::new("dst"),
+				RenameFlags::empty(),
+			)
 			.expect("rename should succeed");
 
-		assert_eq!(state.pager.dir_entries_get(root, OsStr::new("src")), None);
-		assert_eq!(state.pager.dir_entries_get(root, OsStr::new("dst")), Some(src_ino));
+		assert_eq!(state.pager.dir_entries_get(INodeNo::ROOT, OsStr::new("src")), None);
+		assert_eq!(
+			state.pager.dir_entries_get(INodeNo::ROOT, OsStr::new("dst")),
+			Some(src_ino)
+		);
 		assert_eq!(
 			state
 				.op_getattr(dst_ino)
@@ -1897,7 +1991,7 @@ mod tests {
 				.expect_err("old dst inode should be removed"),
 			i32::from(Errno::ENOENT)
 		);
-		let after = state.pager.inode_get(root).expect("root exists").nlink;
+		let after = state.pager.inode_get(INodeNo::ROOT).expect("root exists").nlink;
 		assert_eq!(after, before - 1);
 		assert!(state.check_invariants().is_ok());
 	}
@@ -1906,12 +2000,11 @@ mod tests {
 	fn rename_replace_empty_dir_cross_parent_keeps_newparent_nlink() {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
-		let root = INodeNo(1);
 		let (old_parent, _) = state
-			.op_mkdir(root, OsStr::new("old_parent"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("old_parent"), 0o755, 0, 1000, 1000)
 			.expect("mkdir old_parent should succeed");
 		let (new_parent, _) = state
-			.op_mkdir(root, OsStr::new("new_parent"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("new_parent"), 0o755, 0, 1000, 1000)
 			.expect("mkdir new_parent should succeed");
 		let (src_ino, _) = state
 			.op_mkdir(old_parent, OsStr::new("src"), 0o755, 0, 1000, 1000)
@@ -1957,10 +2050,10 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (src_parent, _) = state
-			.op_mkdir(INodeNo(1), OsStr::new("src_parent"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("src_parent"), 0o755, 0, 1000, 1000)
 			.expect("mkdir src_parent should succeed");
 		let (dst_parent, _) = state
-			.op_mkdir(INodeNo(1), OsStr::new("dst_parent"), 0o755, 0, 1000, 1000)
+			.op_mkdir(INodeNo::ROOT, OsStr::new("dst_parent"), 0o755, 0, 1000, 1000)
 			.expect("mkdir dst_parent should succeed");
 		let (_src_dir, _) = state
 			.op_mkdir(src_parent, OsStr::new("src_dir"), 0o755, 0, 1000, 1000)
@@ -1997,15 +2090,15 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (_ino, _inode, fh) = state
-			.op_create(INodeNo(1), OsStr::new("a"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("a"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		state.op_release(fh);
 
 		let err = state
 			.op_rename(
-				INodeNo(1),
+				INodeNo::ROOT,
 				OsStr::new("a"),
-				INodeNo(1),
+				INodeNo::ROOT,
 				OsStr::new("b"),
 				RenameFlags::RENAME_NOREPLACE,
 			)
@@ -2019,7 +2112,7 @@ mod tests {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
-			.op_create(INodeNo(1), OsStr::new("acc"), 0o644, 0, 1000, 1000)
+			.op_create(INodeNo::ROOT, OsStr::new("acc"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
 		state.op_release(fh);
 

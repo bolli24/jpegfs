@@ -229,9 +229,7 @@ fn init_filesystem(decoded_pages: DecodedPages, total_page_capacity: usize) -> a
 	} else {
 		let pager = Pager::from_decoded_pages(decoded_pages, total_page_capacity)
 			.context("failed to decode persisted pager state from JPEG stores")?;
-		FileSystem::from_pager(pager, total_bytes_limit)
-			.map_err(anyhow::Error::msg)
-			.context("persisted filesystem state is invalid")?
+		FileSystem::from_pager(pager, total_bytes_limit).context("persisted filesystem state is invalid")?
 	};
 
 	log_filesystem_capacity("initialized", &fs, total_page_capacity);

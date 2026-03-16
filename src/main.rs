@@ -223,15 +223,14 @@ fn init_filesystem(decoded_pages: DecodedPages, total_page_capacity: usize) -> a
 		"insufficient total JPEG capacity: {total_page_capacity} pages available, at least {MIN_BOOTSTRAP_PAGES} are required"
 	);
 
-	let total_bytes_limit = total_page_capacity.saturating_mul(BLOCK_SIZE);
 	let fs = if decoded_pages.is_empty() {
-		FileSystem::new_with_limits(total_page_capacity, total_bytes_limit)
+		FileSystem::new_with_limits(total_page_capacity)
 			.map_err(anyhow::Error::msg)
 			.context("failed to initialize fresh filesystem from JPEG capacity")?
 	} else {
 		let pager = Pager::from_decoded_pages(decoded_pages, total_page_capacity)
 			.context("failed to decode persisted pager state from JPEG stores")?;
-		FileSystem::from_pager(pager, total_bytes_limit).context("persisted filesystem state is invalid")?
+		FileSystem::from_pager(pager).context("persisted filesystem state is invalid")?
 	};
 
 	log_filesystem_capacity("initialized", &fs, total_page_capacity);

@@ -231,6 +231,11 @@ impl DecodedPages {
 }
 
 impl Pager {
+	fn owner_inode(ino: INodeNo) -> NonZeroU64 {
+		debug_assert_ne!(ino.0, 0, "pager owner inode must be nonzero");
+		NonZeroU64::new(ino.0).unwrap_or_else(|| unreachable!("pager owner inode contract violated"))
+	}
+
 	pub fn new(max_pages: usize) -> Self {
 		const {
 			assert!(INODES_PAGE_CAPACITY > 0);
@@ -481,16 +486,11 @@ impl Pager {
 		self.inodes.len()
 	}
 
-	/// Returns a snapshot of the inodes in the pager, sorted by inode number.
-	pub fn inodes_snapshot(&self) -> Vec<(INodeNo, Inode)> {
-		let mut out = Vec::with_capacity(self.inodes.len());
-		for ino in self.inodes.keys().copied() {
-			if let Some(inode) = self.inode_get(ino).copied() {
-				out.push((ino, inode));
-			}
-		}
-		out.sort_by_key(|(ino, _)| ino.0);
-		out
+	/// Returns a borrowed view of the live inodes in the pager
+	pub fn inodes(&self) -> impl Iterator<Item = (INodeNo, &Inode)> + '_ {
+		self.inodes_pages
+			.iter()
+			.flat_map(|page| page.entries.iter().map(|(ino, inode)| (*ino, inode)))
 	}
 
 	pub fn inode_get(&self, inode: INodeNo) -> Option<&Inode> {
@@ -593,7 +593,10 @@ impl Pager {
 		Some(out)
 	}
 
+	/// Caller contract: `inode` must be nonzero.
 	pub fn dir_entries_insert(&mut self, inode: INodeNo, name: OsString, child: INodeNo) -> Result<(), ()> {
+		debug_assert_ne!(inode.0, 0, "directory entry owner inode must be nonzero");
+
 		// Remove existing entry if name already exists
 		let previous_child = match self.remove_dir_entry(inode, name.as_os_str()) {
 			Ok(previous) => previous,
@@ -808,7 +811,10 @@ impl Pager {
 		out
 	}
 
+	/// Caller contract: `inode` must be nonzero.
 	pub fn bytes_write(&mut self, inode: INodeNo, offset: usize, data: &[u8]) -> Result<usize, ()> {
+		debug_assert_ne!(inode.0, 0, "byte page owner inode must be nonzero");
+
 		if data.is_empty() {
 			return Ok(0);
 		}
@@ -834,7 +840,10 @@ impl Pager {
 		Ok(data.len())
 	}
 
+	/// Caller contract: `inode` must be nonzero.
 	pub fn bytes_truncate(&mut self, inode: INodeNo, new_len: usize) -> Result<(), ()> {
+		debug_assert_ne!(inode.0, 0, "byte page owner inode must be nonzero");
+
 		self.bytes_resize(inode, new_len)
 	}
 
@@ -1001,7 +1010,7 @@ impl Pager {
 		Self::encode_wire_block(
 			PageType::DirEntries,
 			page.page_id,
-			Some(NonZeroU64::new(page.inode.0).expect("INodeNo::ROOT and allocated inodes must be nonzero")),
+			Some(Self::owner_inode(page.inode)),
 			None,
 			page.entries.as_bytes(),
 			DIRENTRIES_CAPACITY,
@@ -1020,7 +1029,7 @@ impl Pager {
 		Self::encode_wire_block(
 			PageType::DataBytes,
 			page.page_id,
-			Some(NonZeroU64::new(owner_ino.0).expect("InodeNo must never be 0")),
+			Some(Self::owner_inode(owner_ino)),
 			NonZeroU32::new(file_page_no),
 			&page.data[..page.length],
 			DATA_PAGE_CAPACITY,
@@ -1292,6 +1301,7 @@ impl Pager {
 mod tests {
 	use super::*;
 	use fuser::FileType;
+	use std::collections::HashSet;
 	use std::os::unix::ffi::OsStringExt;
 	use std::time::SystemTime;
 
@@ -1352,6 +1362,44 @@ mod tests {
 		assert_eq!(pager.inodes_len(), 1);
 		assert_eq!(pager.inode_get(INodeNo(3)).expect("inode should exist").size, 99);
 		pager.check_invariants();
+	}
+
+	#[test]
+	fn borrowed_inode_iterator_yields_full_inode_set() {
+		let mut pager = Pager::new(8);
+		let mut a = inode();
+		a.size = 10;
+		let mut b = inode();
+		b.size = 20;
+		let mut c = inode();
+		c.size = 30;
+
+		pager.inodes_insert(INodeNo(7), a).expect("insert should succeed");
+		pager.inodes_insert(INodeNo(2), b).expect("insert should succeed");
+		pager.inodes_insert(INodeNo(5), c).expect("insert should succeed");
+
+		let iter_set: HashSet<_> = pager.inodes().map(|(ino, inode)| (ino, *inode)).collect();
+		let expected: HashSet<_> = [(INodeNo(2), b), (INodeNo(5), c), (INodeNo(7), a)]
+			.into_iter()
+			.collect();
+
+		assert_eq!(iter_set, expected);
+	}
+
+	#[cfg(debug_assertions)]
+	#[test]
+	#[should_panic(expected = "directory entry owner inode must be nonzero")]
+	fn zero_dir_entry_owner_panics_in_debug() {
+		let mut pager = Pager::new(8);
+		let _ = pager.dir_entries_insert(INodeNo(0), OsString::from("child"), INodeNo(1));
+	}
+
+	#[cfg(debug_assertions)]
+	#[test]
+	#[should_panic(expected = "byte page owner inode must be nonzero")]
+	fn zero_byte_owner_panics_in_debug() {
+		let mut pager = Pager::new(8);
+		let _ = pager.bytes_write(INodeNo(0), 0, b"payload");
 	}
 
 	#[test]

@@ -88,6 +88,10 @@ fn as_name(bytes: &[u8]) -> OsString {
 	OsString::from_vec(out)
 }
 
+fn is_valid_inode(ino: INodeNo) -> bool {
+	ino.0 != 0
+}
+
 fn model_bytes_write(file: &mut Vec<u8>, offset: usize, data: &[u8]) {
 	if data.is_empty() {
 		return;
@@ -139,6 +143,9 @@ fuzz_target!(|program: Program| {
 			Op::InodeInsert(raw) => {
 				let inode = to_inode(raw);
 				let ino = INodeNo(raw.ino);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let existed = inode_model.contains_key(&ino);
 				let before_len = inode_model.len();
 
@@ -157,18 +164,27 @@ fuzz_target!(|program: Program| {
 			}
 			Op::InodeRemove { ino } => {
 				let ino = INodeNo(ino);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let expected = inode_model.remove(&ino);
 				let got = pager.inode_remove(ino);
 				assert_eq!(got, expected);
 			}
 			Op::InodeRead { ino } => {
 				let ino = INodeNo(ino);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let expected = inode_model.get(&ino);
 				let got = pager.inode_get(ino);
 				assert_eq!(got, expected);
 			}
 			Op::InodeMutateSize { ino, delta } => {
 				let ino = INodeNo(ino);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let expected = inode_model.get_mut(&ino);
 				let got = pager.inode_get_mut(ino);
 
@@ -184,14 +200,23 @@ fuzz_target!(|program: Program| {
 			}
 			Op::DirInsert { inode, name, child } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let name = as_name(&name);
 				let child = INodeNo(child);
+				if !is_valid_inode(child) {
+					continue;
+				}
 				if pager.dir_entries_insert(ino, name.clone(), child).is_ok() {
 					dir_model.entry(ino).or_default().insert(name, child);
 				}
 			}
 			Op::DirRemove { inode, name } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let name = as_name(&name);
 				let got = pager.dir_entries_remove(ino, name.as_os_str());
 				let expected = dir_model
@@ -204,6 +229,9 @@ fuzz_target!(|program: Program| {
 			}
 			Op::DirRead { inode, name } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let name = as_name(&name);
 				let got = pager.dir_entries_get(ino, name.as_os_str());
 				let expected = dir_model
@@ -214,11 +242,17 @@ fuzz_target!(|program: Program| {
 			}
 			Op::DirClear { inode } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				pager.dir_entries_clear(ino);
 				dir_model.remove(&ino);
 			}
 			Op::BytesWrite { inode, offset, data } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let offset = usize::from(offset);
 				let payload_len = data.len().min(MAX_WRITE_BYTES);
 				let payload = &data[..payload_len];
@@ -229,6 +263,9 @@ fuzz_target!(|program: Program| {
 			}
 			Op::BytesRead { inode, offset, size } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let offset = usize::from(offset);
 				let size = usize::from(size);
 				let got = pager.bytes_read(ino, offset, size);
@@ -247,6 +284,9 @@ fuzz_target!(|program: Program| {
 			}
 			Op::BytesTruncate { inode, len } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				let len = usize::from(len);
 				if pager.bytes_truncate(ino, len).is_ok() {
 					let file = bytes_model.entry(ino).or_default();
@@ -255,6 +295,9 @@ fuzz_target!(|program: Program| {
 			}
 			Op::BytesRemove { inode } => {
 				let ino = INodeNo(inode);
+				if !is_valid_inode(ino) {
+					continue;
+				}
 				pager.bytes_remove(ino);
 				bytes_model.remove(&ino);
 			}

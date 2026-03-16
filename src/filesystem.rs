@@ -21,7 +21,7 @@ const POSIX_BLOCK: u64 = 512;
 pub const MAX_INODES: usize = 4096;
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_FILE_SIZE: usize = 4 * 1024 * 1024;
-// Only used for memory-only filesystems, when jpeg-persisted uses jpegs capacity
+// Only used to size the default memory-only filesystem page budget.
 pub const TOTAL_BYTES_LIMIT: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -43,7 +43,6 @@ pub struct FileSystemState {
 	pub max_inodes: usize,
 	pub max_name_len: usize,
 	pub max_file_size: usize,
-	pub total_bytes_limit: usize,
 
 	used_bytes: u64,
 	dirty: bool,
@@ -73,8 +72,6 @@ pub enum FileSystemInvariantError {
 	UsedBytesOverflow,
 	#[error("used_bytes mismatch: actual={actual} computed={computed}")]
 	UsedBytesMismatch { actual: u64, computed: u64 },
-	#[error("used_bytes exceeds total_bytes_limit")]
-	UsedBytesExceedsLimit,
 	#[error("inode count exceeds max_inodes")]
 	InodeCountExceedsMax,
 	#[error("free inode set overlaps live inodes: {ino:?}")]
@@ -109,26 +106,24 @@ pub enum FileSystemInvariantError {
 
 #[derive(Debug, Error)]
 pub enum FileSystemInitError {
-	#[error("persisted file data ({used_bytes} bytes) exceeds configured limit ({total_bytes_limit} bytes)")]
-	PersistedFileDataExceedsLimit { used_bytes: u64, total_bytes_limit: usize },
 	#[error(transparent)]
 	Invariant(#[from] FileSystemInvariantError),
 }
 
 impl FileSystem {
-	fn pager_max_pages(total_bytes_limit: usize, max_inodes: usize) -> usize {
-		total_bytes_limit
+	fn pager_max_pages(file_bytes_budget: usize, max_inodes: usize) -> usize {
+		file_bytes_budget
 			.div_ceil(BLOCK_SIZE)
 			.saturating_add(max_inodes.saturating_mul(8))
 			.max(1)
 	}
 
 	pub fn new() -> Self {
-		Self::new_with_limits(Self::pager_max_pages(TOTAL_BYTES_LIMIT, MAX_INODES), TOTAL_BYTES_LIMIT)
+		Self::new_with_limits(Self::pager_max_pages(TOTAL_BYTES_LIMIT, MAX_INODES))
 			.expect("default file system limits must allow root inode and root directory entries")
 	}
 
-	pub fn new_with_limits(max_pages: usize, total_bytes_limit: usize) -> Result<Self, String> {
+	pub fn new_with_limits(max_pages: usize) -> Result<Self, String> {
 		let now = SystemTime::now();
 		let root_uid = unsafe { libc::geteuid() };
 		let root_gid = unsafe { libc::getegid() };
@@ -166,7 +161,6 @@ impl FileSystem {
 			max_inodes: MAX_INODES,
 			max_name_len: MAX_NAME_LEN,
 			max_file_size: MAX_FILE_SIZE,
-			total_bytes_limit,
 			used_bytes: 0,
 			dirty: false,
 		};
@@ -175,10 +169,12 @@ impl FileSystem {
 		})
 	}
 
-	pub fn from_pager(pager: Pager, total_bytes_limit: usize) -> Result<Self, FileSystemInitError> {
-		let inode_numbers: HashSet<INodeNo> = pager.inodes_snapshot().into_iter().map(|(ino, _)| ino).collect();
-		let max_ino = inode_numbers.iter().map(|ino| ino.0).max().unwrap_or(1);
-		let free_inos = (2..max_ino)
+	/// Construct a new filesystem from a pager and validate its invariants
+	/// Assumes that the pager is valid
+	pub fn from_pager(pager: Pager) -> Result<Self, FileSystemInitError> {
+		let inode_numbers: HashSet<INodeNo> = pager.inodes().map(|(ino, _)| ino).collect();
+		let max_ino = inode_numbers.iter().copied().max().unwrap_or(INodeNo::ROOT);
+		let free_inos = (2..max_ino.0)
 			.filter_map(|raw| {
 				let ino = INodeNo(raw);
 				(!inode_numbers.contains(&ino)).then_some(ino)
@@ -190,26 +186,17 @@ impl FileSystem {
 			pager,
 			handles: HashMap::new(),
 			next_fh: 1,
-			next_ino: INodeNo(max_ino.saturating_add(1)),
+			next_ino: INodeNo(max_ino.0.saturating_add(1)),
 			free_inos,
 			max_inodes: MAX_INODES,
 			max_name_len: MAX_NAME_LEN,
 			max_file_size: MAX_FILE_SIZE,
-			total_bytes_limit,
 			used_bytes: 0,
 			dirty: false,
 		};
 
-		let used_bytes = state.recompute_used_bytes();
-		if used_bytes > total_bytes_limit as u64 {
-			return Err(FileSystemInitError::PersistedFileDataExceedsLimit {
-				used_bytes,
-				total_bytes_limit,
-			});
-		}
-
 		let mut state = state;
-		state.used_bytes = used_bytes;
+		state.used_bytes = state.recompute_used_bytes();
 
 		state.check_invariants()?;
 		Ok(Self {
@@ -219,6 +206,7 @@ impl FileSystem {
 
 	fn alloc_ino_with_count(state: &mut FileSystemState, current_inode_count: usize) -> Option<INodeNo> {
 		if let Some(reused) = state.free_inos.pop() {
+			debug_assert_ne!(reused.0, 0, "free inode pool must never contain inode 0");
 			return Some(reused);
 		}
 
@@ -227,6 +215,7 @@ impl FileSystem {
 		}
 
 		let new = state.next_ino;
+		debug_assert_ne!(new.0, 0, "filesystem allocator must never hand out inode 0");
 		let incremented = state.next_ino.0.checked_add(1)?;
 		state.next_ino = INodeNo(incremented);
 		Some(new)
@@ -258,13 +247,9 @@ impl FileSystem {
 		state.free_inos.push(ino);
 	}
 
-	fn blocks_for_bytes(bytes: u64) -> u64 {
-		bytes.div_ceil(BLOCK_SIZE as u64)
-	}
-
 	fn statfs_data(state: &FileSystemState) -> StatfsData {
-		let blocks = Self::blocks_for_bytes(state.total_bytes_limit as u64);
-		let used_blocks = Self::blocks_for_bytes(state.used_bytes());
+		let blocks = state.pager.max_pages() as u64;
+		let used_blocks = state.pager.block_counts().total() as u64;
 		let bfree = blocks.saturating_sub(used_blocks);
 		let files = state.max_inodes as u64;
 		let ffree = state.max_inodes.saturating_sub(state.pager.inodes_len()) as u64;
@@ -312,6 +297,7 @@ impl Inode {
 	}
 }
 
+/// Time that users may cache file attributes for
 const FUSE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,7 +340,7 @@ impl FileSystemState {
 		let total_blocks = self.pager.max_pages();
 		let mut file_count = 0usize;
 		let mut directory_count = 0usize;
-		for (_, inode) in self.pager.inodes_snapshot() {
+		for (_, inode) in self.pager.inodes() {
 			match inode.kind {
 				FileType::RegularFile => file_count += 1,
 				FileType::Directory => directory_count += 1,
@@ -389,15 +375,16 @@ impl FileSystemState {
 
 	pub fn recompute_used_bytes(&self) -> u64 {
 		self.pager
-			.inodes_snapshot()
-			.into_iter()
+			.inodes()
 			.filter(|(_, inode)| inode.kind == FileType::RegularFile)
 			.map(|(ino, _)| self.pager.bytes_len(ino) as u64)
 			.sum()
 	}
 
 	pub fn inode_numbers(&self) -> Vec<INodeNo> {
-		self.pager.inodes_snapshot().into_iter().map(|(ino, _)| ino).collect()
+		let mut inodes: Vec<_> = self.pager.inodes().map(|(ino, _)| ino).collect();
+		inodes.sort_by_key(|ino| ino.0);
+		inodes
 	}
 
 	pub fn handle_ids(&self) -> Vec<FileHandle> {
@@ -496,9 +483,6 @@ impl FileSystemState {
 			let Some(new_used_bytes) = self.used_bytes.checked_add(growth as u64) else {
 				return Err(Errno::ENOSPC);
 			};
-			if new_used_bytes > self.total_bytes_limit as u64 {
-				return Err(Errno::ENOSPC);
-			}
 			self.pager.bytes_truncate(ino, new_len).map_err(|()| Errno::ENOSPC)?;
 			self.used_bytes = new_used_bytes;
 		} else {
@@ -1008,18 +992,17 @@ impl FileSystemState {
 		}
 
 		let mut computed_used_bytes = 0u64;
-		let inode_snapshot = self.pager.inodes_snapshot();
-		for (ino, inode) in &inode_snapshot {
-			let bytes_len = self.pager.bytes_len(*ino) as u64;
+		for (ino, inode) in self.pager.inodes() {
+			let bytes_len = self.pager.bytes_len(ino) as u64;
 			if inode.kind == FileType::RegularFile {
 				if inode.size != bytes_len {
-					return Err(FileSystemInvariantError::InodeSizeMismatch { ino: *ino });
+					return Err(FileSystemInvariantError::InodeSizeMismatch { ino });
 				}
 				computed_used_bytes = computed_used_bytes
 					.checked_add(bytes_len)
 					.ok_or(FileSystemInvariantError::UsedBytesOverflow)?;
 			} else if bytes_len != 0 {
-				return Err(FileSystemInvariantError::NonRegularInodeCarriesBytes { ino: *ino });
+				return Err(FileSystemInvariantError::NonRegularInodeCarriesBytes { ino });
 			}
 		}
 
@@ -1029,9 +1012,6 @@ impl FileSystemState {
 				actual: used_bytes,
 				computed: computed_used_bytes,
 			});
-		}
-		if used_bytes > self.total_bytes_limit as u64 {
-			return Err(FileSystemInvariantError::UsedBytesExceedsLimit);
 		}
 		if self.pager.inodes_len() > self.max_inodes {
 			return Err(FileSystemInvariantError::InodeCountExceedsMax);
@@ -1052,35 +1032,36 @@ impl FileSystemState {
 			}
 		}
 
-		for (dir_ino, dir_inode) in inode_snapshot
-			.iter()
+		for (dir_ino, dir_inode) in self
+			.pager
+			.inodes()
 			.filter(|(_, inode)| inode.kind == FileType::Directory)
 		{
-			let Some(entries) = self.pager.dir_entries_get_dir(*dir_ino) else {
-				return Err(FileSystemInvariantError::MissingDirectoryEntries { dir_ino: *dir_ino });
+			let Some(entries) = self.pager.dir_entries_get_dir(dir_ino) else {
+				return Err(FileSystemInvariantError::MissingDirectoryEntries { dir_ino });
 			};
 
 			let Some(parent_dot) = entries.get(OsStr::new(".")) else {
-				return Err(FileSystemInvariantError::DirectoryMissingDot { dir_ino: *dir_ino });
+				return Err(FileSystemInvariantError::DirectoryMissingDot { dir_ino });
 			};
-			if parent_dot != dir_ino {
-				return Err(FileSystemInvariantError::DirectoryDotMismatch { dir_ino: *dir_ino });
+			if parent_dot != &dir_ino {
+				return Err(FileSystemInvariantError::DirectoryDotMismatch { dir_ino });
 			}
 			if !entries.contains_key(OsStr::new("..")) {
-				return Err(FileSystemInvariantError::DirectoryMissingDotDot { dir_ino: *dir_ino });
+				return Err(FileSystemInvariantError::DirectoryMissingDotDot { dir_ino });
 			}
 
 			let mut subdir_count = 0u32;
 			for (name, child_ino) in entries {
 				if name != OsStr::new(".") && name != OsStr::new("..") && name.as_bytes().len() > self.max_name_len {
 					return Err(FileSystemInvariantError::EntryNameTooLong {
-						dir_ino: *dir_ino,
+						dir_ino,
 						name: name.clone(),
 					});
 				}
 				let Some(child_inode) = self.pager.inode_get(child_ino) else {
 					return Err(FileSystemInvariantError::DirectoryEntryPointsToMissingInode {
-						parent: *dir_ino,
+						parent: dir_ino,
 						name: name.clone(),
 						child: child_ino,
 					});
@@ -1093,7 +1074,7 @@ impl FileSystemState {
 			let expected_nlink = 2u32.saturating_add(subdir_count);
 			if dir_inode.nlink != expected_nlink {
 				return Err(FileSystemInvariantError::DirectoryNlinkMismatch {
-					dir_ino: *dir_ino,
+					dir_ino,
 					actual: dir_inode.nlink,
 					expected: expected_nlink,
 				});
@@ -1700,13 +1681,14 @@ mod tests {
 
 	#[test]
 	fn statfs_data_for_fresh_filesystem() {
-		let fs = FileSystem::new();
+		let fs = FileSystem::new_with_limits(8).expect("filesystem should initialize");
 		let state = fs.state.read();
 		let statfs = FileSystem::statfs_data(&state);
+		let counts = state.pager.block_counts();
 
-		assert_eq!(statfs.blocks, (TOTAL_BYTES_LIMIT / BLOCK_SIZE) as u64);
-		assert_eq!(statfs.bfree, statfs.blocks);
-		assert_eq!(statfs.bavail, statfs.blocks);
+		assert_eq!(statfs.blocks, 8);
+		assert_eq!(statfs.bfree, 8 - counts.total() as u64);
+		assert_eq!(statfs.bavail, statfs.bfree);
 		assert_eq!(statfs.files, MAX_INODES as u64);
 		assert_eq!(statfs.ffree, (MAX_INODES - 1) as u64);
 		assert_eq!(statfs.bsize, BLOCK_SIZE as u32);
@@ -1715,8 +1697,24 @@ mod tests {
 	}
 
 	#[test]
-	fn statfs_data_rounds_blocks_up() {
+	fn filesystem_allocates_nonzero_inodes() {
 		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+
+		let (file_ino, _inode, _fh) = state
+			.op_create(INodeNo::ROOT, OsStr::new("file"), 0o644, 0, 1000, 1000)
+			.expect("create should succeed");
+		assert_ne!(file_ino.0, 0);
+
+		let (dir_ino, _inode) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("dir"), 0o755, 0, 1000, 1000)
+			.expect("mkdir should succeed");
+		assert_ne!(dir_ino.0, 0);
+	}
+
+	#[test]
+	fn statfs_data_tracks_used_pages() {
+		let fs = FileSystem::new_with_limits(6).expect("filesystem should initialize");
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
 			.op_create(INodeNo::ROOT, OsStr::new("blocks"), 0o644, 0, 1000, 1000)
@@ -1725,31 +1723,34 @@ mod tests {
 			.op_write(ino, fh, 0, &vec![0u8; BLOCK_SIZE + 1])
 			.expect("write should succeed");
 		state.op_release(fh);
-		state.total_bytes_limit = BLOCK_SIZE * 2 + 1;
 
 		let statfs = FileSystem::statfs_data(&state);
-		assert_eq!(statfs.blocks, 3);
-		assert_eq!(statfs.bfree, 1);
-		assert_eq!(statfs.bavail, 1);
+		assert_eq!(statfs.blocks, 6);
+		assert_eq!(statfs.bfree, 2);
+		assert_eq!(statfs.bavail, 2);
 	}
 
 	#[test]
 	fn statfs_data_saturates_free_counts() {
-		let fs = FileSystem::new();
+		let fs = FileSystem::new_with_limits(6).expect("filesystem should initialize");
 		let mut state = fs.state.write();
 		let (ino, _inode, fh) = state
 			.op_create(INodeNo::ROOT, OsStr::new("saturate"), 0o644, 0, 1000, 1000)
 			.expect("create should succeed");
-		state
-			.op_write(ino, fh, 0, &vec![0u8; BLOCK_SIZE * 3])
-			.expect("write should succeed");
+		let mut offset = 0u64;
+		loop {
+			match state.op_write(ino, fh, offset, &vec![0u8; BLOCK_SIZE]) {
+				Ok(written) => offset += u64::from(written),
+				Err(err) if i32::from(err) == i32::from(Errno::ENOSPC) => break,
+				Err(err) => panic!("unexpected write error: {err:?}"),
+			}
+		}
 		state.op_release(fh);
-		state.total_bytes_limit = BLOCK_SIZE;
 		state.max_inodes = 0;
 		state.max_name_len = usize::MAX;
 
 		let statfs = FileSystem::statfs_data(&state);
-		assert_eq!(statfs.blocks, 1);
+		assert_eq!(statfs.blocks, 6);
 		assert_eq!(statfs.bfree, 0);
 		assert_eq!(statfs.bavail, 0);
 		assert_eq!(statfs.files, 0);
@@ -2119,7 +2120,7 @@ mod tests {
 
 	#[test]
 	fn new_with_limits_rejects_page_budget_too_small_for_root() {
-		let err = match FileSystem::new_with_limits(1, BLOCK_SIZE) {
+		let err = match FileSystem::new_with_limits(1) {
 			Ok(_) => panic!("init should fail"),
 			Err(err) => err,
 		};

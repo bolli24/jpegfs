@@ -19,6 +19,8 @@ use jpegfs::persistence::JpegBlockStore;
 mod tui;
 
 const DEFAULT_MOUNT_PATH: &str = "/tmp/jpegfs";
+
+/// A filesystem requires at least 2 pages: 1 dir inodes pages, 1 dir entries page
 const MIN_BOOTSTRAP_PAGES: usize = 2;
 
 struct PersistOnDrop {

@@ -23,22 +23,6 @@ pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_FILE_SIZE: usize = 4 * 1024 * 1024;
 pub const TOTAL_BYTES_LIMIT: usize = 100 * 1024 * 1024;
 
-macro_rules! invariant_or_eio {
-	($opt:expr, $reply:expr, $($arg:tt)*) => {{
-		match $opt {
-			Some(value) => value,
-			None => {
-				if cfg!(test) {
-					panic!($($arg)*);
-				}
-				warn!($($arg)*);
-				$reply.error(Errno::EIO);
-				return;
-			}
-		}
-	}};
-}
-
 #[derive(Clone)]
 pub struct FileSystem {
 	pub state: Arc<RwLock<FileSystemState>>,
@@ -327,7 +311,7 @@ impl Inode {
 	}
 }
 
-const ONE_SEC: Duration = Duration::from_secs(1);
+const FUSE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatfsData {
@@ -1138,13 +1122,21 @@ impl Filesystem for FileSystem {
 			Err(err) => return reply.error(err),
 		};
 
-		let inode = invariant_or_eio!(
-			state.pager.inode_get(file),
-			reply,
-			"directory entry points to missing inode: parent={parent:?}, name={name:?}, child={file:?}"
-		);
+		let inode = match state.pager.inode_get(file) {
+			Some(inode) => inode,
+			None => {
+				let message = format!(
+					"directory entry points to missing inode: parent={parent:?}, name={name:?}, child={file:?}"
+				);
+				if cfg!(test) {
+					panic!("{message}");
+				}
+				warn!("{message}");
+				return reply.error(Errno::EIO);
+			}
+		};
 
-		reply.entry(&ONE_SEC, &Inode::to_file_attr(file, inode), Generation(0));
+		reply.entry(&FUSE_TTL, &Inode::to_file_attr(file, inode), Generation(0));
 	}
 
 	fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
@@ -1155,7 +1147,7 @@ impl Filesystem for FileSystem {
 		info!("getattr(ino={ino:?})");
 		let state = self.state.read();
 		match state.op_getattr(ino) {
-			Ok(inode) => reply.attr(&ONE_SEC, &Inode::to_file_attr(ino, &inode)),
+			Ok(inode) => reply.attr(&FUSE_TTL, &Inode::to_file_attr(ino, &inode)),
 			Err(err) => reply.error(err),
 		}
 	}
@@ -1267,7 +1259,7 @@ impl Filesystem for FileSystem {
 		}
 
 		let inode = state.pager.inode_get(ino).expect("validated inode must exist");
-		reply.attr(&ONE_SEC, &Inode::to_file_attr(ino, inode));
+		reply.attr(&FUSE_TTL, &Inode::to_file_attr(ino, inode));
 	}
 
 	fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
@@ -1298,7 +1290,7 @@ impl Filesystem for FileSystem {
 		info!("mkdir(parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})");
 		let mut state = self.state.write();
 		match state.op_mkdir(parent, name, mode, umask, req.uid(), req.gid()) {
-			Ok((ino, inode)) => reply.entry(&ONE_SEC, &Inode::to_file_attr(ino, &inode), Generation(0)),
+			Ok((ino, inode)) => reply.entry(&FUSE_TTL, &Inode::to_file_attr(ino, &inode), Generation(0)),
 			Err(err) => reply.error(err),
 		}
 	}
@@ -1548,7 +1540,7 @@ impl Filesystem for FileSystem {
 		let mut state = self.state.write();
 		match state.op_create(parent, name, mode, umask, req.uid(), req.gid()) {
 			Ok((ino, new_inode, file_handle)) => reply.created(
-				&ONE_SEC,
+				&FUSE_TTL,
 				&Inode::to_file_attr(ino, &new_inode),
 				Generation(0),
 				file_handle,

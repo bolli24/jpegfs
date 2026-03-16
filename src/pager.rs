@@ -9,6 +9,7 @@ use fuser::INodeNo;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::mem::size_of;
+use std::num::{NonZeroU32, NonZeroU64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 const PAGE_VERSION: u16 = 1;
 const PAGE_CRC: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
@@ -30,13 +31,19 @@ pub struct PageId(pub u32);
 struct PageHeaderV1 {
 	magic: [u8; 4],
 	page_id: PageId,
-	owner_ino: u64,
-	file_page_no: u32,
+	owner_ino: Option<NonZeroU64>,
+	file_page_no: Option<NonZeroU32>,
 	crc32: u32,
 	version: u16,
 	page_type: PageType,
 	payload_len: u16,
 	reserved: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+struct InodesPageWireHeader {
+	count: u16,
 }
 
 const HEADER_SIZE: usize = size_of::<PageHeaderV1>();
@@ -50,7 +57,8 @@ pub struct InodesPage {
 	free_entries: usize,
 }
 
-const INODES_PAGE_CAPACITY: usize = (BLOCK_PAYLOAD_CAPACITY - size_of::<u16>()) / size_of::<InodeRaw>();
+const INODES_PAGE_CAPACITY: usize =
+	(BLOCK_PAYLOAD_CAPACITY - size_of::<InodesPageWireHeader>()) / size_of::<InodeRaw>();
 const DIRENTRIES_CAPACITY: usize = BLOCK_PAYLOAD_CAPACITY;
 
 // Persists to header + entries.data
@@ -128,10 +136,8 @@ pub enum PagerCodecError {
 	},
 	#[error("page CRC mismatch: expected {expected:#010x}, actual {actual:#010x}")]
 	CrcMismatch { expected: u32, actual: u32 },
-	#[error("inode page has invalid owner inode ({owner_ino}) or file_page_no ({file_page_no})")]
-	InvalidInodesHeaderFields { owner_ino: u64, file_page_no: u32 },
-	#[error("dir entries page has invalid file_page_no ({0})")]
-	InvalidDirEntriesHeaderFields(u32),
+	#[error("{0:?} page header is missing owner inode")]
+	MissingOwnerInHeader(PageType),
 	#[error("inode page entry count ({0}) exceeds capacity")]
 	InodesEntryCountTooLarge(usize),
 	#[error("duplicate inode {0:?} while decoding inode pages")]
@@ -245,7 +251,7 @@ impl Pager {
 		}
 	}
 
-	// Convenience for tests/fuzzing: encode blocks and drop PageId mapping
+	/// Convenience for tests/fuzzing: encode blocks and drop PageId mapping
 	pub fn encode_blocks(&self) -> Result<Vec<[u8; BLOCK_SIZE]>, PagerCodecError> {
 		self.encode_blocks_with_ids()
 			.map(|blocks| blocks.into_iter().map(|(_, block)| block).collect())
@@ -287,7 +293,8 @@ impl Pager {
 		Ok(encoded_by_id)
 	}
 
-	/// Initialize a filesystem pager from a set of decoded pages, validating them in the process
+	/// Initialize a pager from a set of decoded pages, validating them in the process
+	/// Does not guarantee that a filesystem using this will be valid
 	pub fn from_decoded_pages(decoded: DecodedPages, max_pages: usize) -> Result<Self, PagerCodecError> {
 		Self::validate_decoded_pages(&decoded.0, max_pages)?;
 
@@ -959,6 +966,9 @@ impl Pager {
 		}
 	}
 
+	/// Encode an inodes page, format:
+	/// header: {count: 2 bytes}
+	/// payload: len * size_of::<InodeRaw>() bytes
 	fn encode_inodes_page(&self, page: &InodesPage) -> Result<[u8; BLOCK_SIZE], PagerCodecError> {
 		let mut entries: Vec<_> = page.entries.iter().collect();
 		entries.sort_by_key(|(ino, _)| ino.0);
@@ -966,24 +976,33 @@ impl Pager {
 			return Err(PagerCodecError::InodesEntryCountTooLarge(entries.len()));
 		}
 
-		let count =
-			u16::try_from(entries.len()).map_err(|_| PagerCodecError::InodesEntryCountTooLarge(entries.len()))?;
-		let mut payload = Vec::with_capacity(size_of::<u16>() + entries.len() * size_of::<InodeRaw>());
-		payload.extend_from_slice(&count.to_le_bytes());
+		let header = InodesPageWireHeader {
+			count: u16::try_from(entries.len())
+				.map_err(|_| PagerCodecError::InodesEntryCountTooLarge(entries.len()))?,
+		};
+		let mut payload = Vec::with_capacity(size_of::<InodesPageWireHeader>() + entries.len() * size_of::<InodeRaw>());
+		payload.extend_from_slice(header.as_bytes());
 		for (ino, inode) in entries {
 			let raw = InodeRaw::from_parts(*ino, inode)?;
 			payload.extend_from_slice(raw.as_bytes());
 		}
 
-		Self::encode_wire_block(PageType::Inodes, page.page_id, 0, 0, &payload, BLOCK_PAYLOAD_CAPACITY)
+		Self::encode_wire_block(
+			PageType::Inodes,
+			page.page_id,
+			None,
+			None,
+			&payload,
+			BLOCK_PAYLOAD_CAPACITY,
+		)
 	}
 
 	fn encode_dir_entries_page(&self, page: &DirEntriesPage) -> Result<[u8; BLOCK_SIZE], PagerCodecError> {
 		Self::encode_wire_block(
 			PageType::DirEntries,
 			page.page_id,
-			page.inode.0,
-			0,
+			Some(NonZeroU64::new(page.inode.0).expect("INodeNo::ROOT and allocated inodes must be nonzero")),
+			None,
 			page.entries.as_bytes(),
 			DIRENTRIES_CAPACITY,
 		)
@@ -1001,18 +1020,19 @@ impl Pager {
 		Self::encode_wire_block(
 			PageType::DataBytes,
 			page.page_id,
-			owner_ino.0,
-			file_page_no,
+			Some(NonZeroU64::new(owner_ino.0).expect("InodeNo must never be 0")),
+			NonZeroU32::new(file_page_no),
 			&page.data[..page.length],
 			DATA_PAGE_CAPACITY,
 		)
 	}
 
+	/// Encode a wire block. Fails if paylod is too large
 	fn encode_wire_block(
 		page_type: PageType,
 		page_id: PageId,
-		owner_ino: u64,
-		file_page_no: u32,
+		owner_ino: Option<NonZeroU64>,
+		file_page_no: Option<NonZeroU32>,
 		payload: &[u8],
 		max_payload: usize,
 	) -> Result<[u8; BLOCK_SIZE], PagerCodecError> {
@@ -1023,10 +1043,7 @@ impl Pager {
 			});
 		}
 
-		let payload_len = u16::try_from(payload.len()).map_err(|_| PagerCodecError::PayloadTooLarge {
-			payload_len: payload.len(),
-			capacity: max_payload,
-		})?;
+		let payload_len = u16::try_from(payload.len()).expect("block payload capacity must fit into u16");
 		let mut header = PageHeaderV1 {
 			magic: MAGIC,
 			version: PAGE_VERSION,
@@ -1046,9 +1063,18 @@ impl Pager {
 		Ok(out)
 	}
 
+	/// Decode block into a page, validating page internal invariants:
+	/// - valid magic
+	/// - current version
+	/// - reserved data is not zero
+	/// - payload length does not exceed block payload capacity
+	/// - padding bytes after data are zeroed
+	/// - crc matches
+	/// - header holds values needed for its page type
+	/// - header does hold values not needed for its page type
+	/// - page type specific invariants
 	fn decode_block(block: &[u8; BLOCK_SIZE]) -> Result<DecodedPage, PagerCodecError> {
-		let header = PageHeaderV1::try_read_from_bytes(&block[..HEADER_SIZE])
-			.map_err(|_| PagerCodecError::HeaderDecodeError(block[..HEADER_SIZE].iter().copied().collect()))?;
+		let header = Self::try_read_header(&block)?;
 		if header.magic != MAGIC {
 			return Err(PagerCodecError::InvalidMagic(header.magic));
 		}
@@ -1081,40 +1107,54 @@ impl Pager {
 		}
 
 		match header.page_type {
-			PageType::Inodes => {
-				if header.owner_ino != 0 || header.file_page_no != 0 {
-					return Err(PagerCodecError::InvalidInodesHeaderFields {
-						owner_ino: header.owner_ino,
-						file_page_no: header.file_page_no,
-					});
-				}
-				Self::decode_inodes_page(header.page_id, payload_len, payload)
-			}
+			PageType::Inodes => Self::decode_inodes_page(header.page_id, payload_len, payload),
 			PageType::DirEntries => {
-				if header.file_page_no != 0 {
-					return Err(PagerCodecError::InvalidDirEntriesHeaderFields(header.file_page_no));
-				}
-				Self::decode_dir_entries_page(header.page_id, INodeNo(header.owner_ino), payload_len, payload)
+				let owner_ino = INodeNo(
+					header
+						.owner_ino
+						.map(NonZeroU64::get)
+						.ok_or(PagerCodecError::MissingOwnerInHeader(PageType::DirEntries))?,
+				);
+				Self::decode_dir_entries_page(header.page_id, owner_ino, payload_len, payload)
 			}
 			PageType::DataBytes => Self::decode_data_bytes_page(
 				header.page_id,
-				INodeNo(header.owner_ino),
-				header.file_page_no,
+				INodeNo(
+					header
+						.owner_ino
+						.map(NonZeroU64::get)
+						.ok_or(PagerCodecError::MissingOwnerInHeader(PageType::DataBytes))?,
+				),
+				header.file_page_no.map(NonZeroU32::get).unwrap_or(0),
 				payload_len,
 				payload,
 			),
 		}
 	}
 
+	fn try_read_header(block: &[u8; 4096]) -> Result<PageHeaderV1, PagerCodecError> {
+		PageHeaderV1::try_read_from_bytes(&block[..HEADER_SIZE])
+			.map_err(|_| PagerCodecError::HeaderDecodeError(block[..HEADER_SIZE].iter().copied().collect()))
+	}
+
+	/// Decode a inodes page, validating its invariants:
+	/// - payload is long enough
+	/// - payload length matches encoded amount of items
+	/// - inodes counts does not exceed capacity
+	/// - no duplicate inodes
 	fn decode_inodes_page(page_id: PageId, payload_len: usize, payload: &[u8]) -> Result<DecodedPage, PagerCodecError> {
-		if payload_len < size_of::<u16>() {
-			return Err(PagerCodecError::MalformedInodesPayload);
-		}
-		let count = u16::from_le_bytes(payload[..size_of::<u16>()].try_into().expect("u16 has exact width")) as usize;
-		let raw_bytes = &payload[size_of::<u16>()..];
+		const HEADER_LEN: usize = size_of::<InodesPageWireHeader>();
+		let header = InodesPageWireHeader::read_from_bytes(
+			payload
+				.get(..HEADER_LEN)
+				.ok_or(PagerCodecError::MalformedInodesPayload)?,
+		)
+		.expect("..header_len is big enough for header");
+		let count = usize::from(header.count);
+		let raw_bytes = &payload[HEADER_LEN..];
 		let expected = count
 			.checked_mul(size_of::<InodeRaw>())
-			.and_then(|bytes| bytes.checked_add(size_of::<u16>()))
+			.and_then(|bytes| bytes.checked_add(HEADER_LEN))
 			.ok_or(PagerCodecError::MalformedInodesPayload)?;
 		if payload_len != expected {
 			return Err(PagerCodecError::InvalidPayloadLength {
@@ -1138,19 +1178,16 @@ impl Pager {
 		Ok(DecodedPage::Inodes { page_id, entries })
 	}
 
+	/// Decode a dir entries page, validating its invariants:
+	/// - payload length is correct
+	/// - no duplicate entry names
+	/// - StoreBlock is correctly encoded
 	fn decode_dir_entries_page(
 		page_id: PageId,
 		inode: INodeNo,
 		payload_len: usize,
 		payload: &[u8],
 	) -> Result<DecodedPage, PagerCodecError> {
-		if payload_len != DIRENTRIES_CAPACITY {
-			return Err(PagerCodecError::InvalidPayloadLength {
-				page_type: PageType::DirEntries,
-				payload_len,
-				expected: DIRENTRIES_CAPACITY,
-			});
-		}
 		let raw_payload: [u8; DIRENTRIES_CAPACITY] =
 			payload.try_into().map_err(|_| PagerCodecError::InvalidPayloadLength {
 				page_type: PageType::DirEntries,
@@ -1173,6 +1210,7 @@ impl Pager {
 		})
 	}
 
+	/// Decode a data bytes page, validating that its payload length does not exceed capacity
 	fn decode_data_bytes_page(
 		page_id: PageId,
 		inode: INodeNo,
@@ -1199,7 +1237,7 @@ impl Pager {
 
 	fn compute_crc(header: &PageHeaderV1, payload: &[u8]) -> u32 {
 		let mut header_no_crc = *header;
-		header_no_crc.crc32 = 0;
+		header_no_crc.crc32 = 0; // Remove existing checksum so it does not influence new checksum
 		let mut digest = PAGE_CRC.digest();
 		digest.update(header_no_crc.as_bytes());
 		digest.update(payload);
@@ -1766,6 +1804,81 @@ mod tests {
 	}
 
 	#[test]
+	fn codec_decode_rejects_inodes_payload_shorter_than_wire_header() {
+		let page_id = PageId(1);
+		let payload = [];
+
+		match Pager::decode_inodes_page(page_id, payload.len(), &payload) {
+			Err(PagerCodecError::MalformedInodesPayload) => {}
+			Err(other) => panic!("expected malformed inodes payload, got {other:?}"),
+			Ok(_) => panic!("decode must fail"),
+		}
+	}
+
+	#[test]
+	fn codec_decode_rejects_inodes_payload_with_mismatched_count() {
+		let page_id = PageId(2);
+		let payload = InodesPageWireHeader { count: 1 }.as_bytes().to_vec();
+
+		match Pager::decode_inodes_page(page_id, payload.len(), &payload) {
+			Err(PagerCodecError::InvalidPayloadLength {
+				page_type: PageType::Inodes,
+				payload_len,
+				expected,
+			}) => {
+				assert_eq!(payload_len, payload.len());
+				assert_eq!(expected, size_of::<InodesPageWireHeader>() + size_of::<InodeRaw>());
+			}
+			Err(other) => panic!("expected invalid payload length, got {other:?}"),
+			Ok(_) => panic!("decode must fail"),
+		}
+	}
+
+	#[test]
+	fn codec_decode_rejects_dir_entries_block_without_owner_ino() {
+		let mut pager = Pager::new(8);
+		pager
+			.dir_entries_insert(INodeNo(86), OsString::from("child"), INodeNo(87))
+			.expect("insert should succeed");
+		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
+		assert_eq!(encoded.len(), 1, "single dir page should encode into one block");
+
+		let block = &mut encoded[0];
+		let mut header = PageHeaderV1::try_read_from_bytes(&block[..HEADER_SIZE]).expect("header should parse");
+		header.owner_ino = None;
+		header.crc32 = Pager::compute_crc(&header, &block[HEADER_SIZE..HEADER_SIZE + header.payload_len as usize]);
+		block[..HEADER_SIZE].copy_from_slice(header.as_bytes());
+
+		match DecodedPages::decode_blocks(&encoded) {
+			Err(PagerCodecError::MissingOwnerInHeader(PageType::DirEntries)) => {}
+			Err(other) => panic!("expected missing-owner error, got {other:?}"),
+			Ok(_) => panic!("decode must fail"),
+		}
+	}
+
+	#[test]
+	fn codec_decode_rejects_data_block_without_owner_ino() {
+		let mut pager = Pager::new(8);
+		pager
+			.bytes_write(INodeNo(88), 0, b"owner-check")
+			.expect("write should succeed");
+		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
+		assert!(!encoded.is_empty(), "encoding should emit at least one block");
+
+		let block = &mut encoded[0];
+		let mut header = PageHeaderV1::try_read_from_bytes(&block[..HEADER_SIZE]).expect("header should parse");
+		header.owner_ino = None;
+		header.crc32 = Pager::compute_crc(&header, &block[HEADER_SIZE..HEADER_SIZE + header.payload_len as usize]);
+		block[..HEADER_SIZE].copy_from_slice(header.as_bytes());
+
+		match DecodedPages::decode_blocks(&encoded) {
+			Err(PagerCodecError::MissingOwnerInHeader(PageType::DataBytes)) => {}
+			Err(other) => panic!("expected missing-owner error, got {other:?}"),
+			Ok(_) => panic!("decode must fail"),
+		}
+	}
+
+	#[test]
 	fn codec_decode_rejects_non_contiguous_data_page_numbers() {
 		let mut pager = Pager::new(8);
 		let ino = INodeNo(81);
@@ -1777,7 +1890,7 @@ mod tests {
 
 		let second_block = &mut encoded[1];
 		let mut header = PageHeaderV1::try_read_from_bytes(&second_block[..HEADER_SIZE]).expect("header should parse");
-		header.file_page_no = 2;
+		header.file_page_no = NonZeroU32::new(2);
 		header.crc32 = Pager::compute_crc(
 			&header,
 			&second_block[HEADER_SIZE..HEADER_SIZE + header.payload_len as usize],

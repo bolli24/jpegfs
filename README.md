@@ -27,7 +27,14 @@ cargo fuzz run --target x86_64-unknown-linux-gnu filesystem_state_machine -- -ma
 Available modules:
 
 - filesystem_state_maschine
-- inode_roundtrip
+- inode_raw_roundtrip
+- inode_structured_roundtrip
 - owned_jpeg_read_write
 - pager_state_maschine
 - store_block_persistence
+
+Minimize all copora:
+
+```bash
+./fuzz/cmin-all.sh --target x86_64-unknown-linux-gnu
+```

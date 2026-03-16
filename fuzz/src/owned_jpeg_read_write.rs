@@ -3,8 +3,7 @@
 use jpegfs::jpeg_file::JpegSession;
 use jpegfs::{
 	jpeg::OwnedJpeg,
-	lsb::{get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb, write_bit_to_bytes},
-	zigzag::ZIGZAG_INDICES,
+	lsb::{get_lsb, read_bit_from_bytes, set_lsb, write_bit_to_bytes},
 };
 use libfuzzer_sys::fuzz_target;
 

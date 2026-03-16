@@ -1,6 +1,6 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+use arbitrary::Arbitrary;
 use fuser::{FileType, INodeNo};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -47,7 +47,7 @@ pub struct InodeRaw {
 	pub _reserved0: u8,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromBytes, IntoBytes, KnownLayout, Immutable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromBytes, IntoBytes, KnownLayout, Immutable, Arbitrary)]
 #[repr(u8)]
 pub enum InodeKindRaw {
 	Directory = 1,
@@ -71,7 +71,7 @@ fn encode_file_type(kind: FileType) -> InodeKindRaw {
 	}
 }
 
-fn decode_file_type(kind: InodeKindRaw) -> FileType {
+pub fn decode_file_type(kind: InodeKindRaw) -> FileType {
 	match kind {
 		InodeKindRaw::Directory => FileType::Directory,
 		InodeKindRaw::Regular => FileType::RegularFile,
@@ -92,19 +92,26 @@ fn encode_system_time(ts: SystemTime) -> Result<(i64, u32), InodeConversionError
 		}
 		Err(error) => {
 			let duration = error.duration();
-			let secs = i64::try_from(duration.as_secs())
-				.map_err(|_| InodeConversionError::SecondsOutOfRange(duration.as_secs()))?;
 			let nanos = duration.subsec_nanos();
 			if nanos == 0 {
-				Ok((-secs, 0))
+				if duration.as_secs() == (i64::MAX as u64) + 1 {
+					Ok((i64::MIN, 0))
+				} else {
+					let secs = i64::try_from(duration.as_secs())
+						.map_err(|_| InodeConversionError::SecondsOutOfRange(duration.as_secs()))?;
+					Ok((-secs, 0))
+				}
 			} else {
-				Ok((-(secs + 1), 1_000_000_000 - nanos))
+				let secs = i64::try_from(duration.as_secs())
+					.map_err(|_| InodeConversionError::SecondsOutOfRange(duration.as_secs()))?;
+				let encoded_secs = if secs == i64::MAX { i64::MIN } else { -(secs + 1) };
+				Ok((encoded_secs, 1_000_000_000 - nanos))
 			}
 		}
 	}
 }
 
-fn decode_system_time(seconds: i64, nanos: u32) -> Result<SystemTime, InodeConversionError> {
+pub fn decode_system_time(seconds: i64, nanos: u32) -> Result<SystemTime, InodeConversionError> {
 	if nanos >= 1_000_000_000 {
 		return Err(InodeConversionError::InvalidTimestamp { seconds, nanos });
 	}
@@ -216,6 +223,33 @@ mod tests {
 		let raw = InodeRaw::from_parts(ino, &inode).expect("inode -> raw conversion should succeed");
 		let (restored_ino, restored) = raw.into_parts().expect("raw -> inode conversion should succeed");
 
+		assert_eq!(restored_ino, ino);
+		assert_eq!(restored, inode);
+	}
+
+	#[test]
+	fn inode_raw_roundtrip_preserves_minimum_negative_second_timestamp() {
+		let inode = Inode {
+			kind: FileType::Directory,
+			perm: 0o755,
+			uid: 0,
+			gid: 0,
+			size: 0,
+			nlink: 1,
+			atime: UNIX_EPOCH
+				.checked_sub(Duration::from_secs((i64::MAX as u64) + 1))
+				.expect("minimum raw second should be representable"),
+			mtime: UNIX_EPOCH - Duration::from_nanos(1),
+			ctime: UNIX_EPOCH - Duration::from_secs(i64::MAX as u64),
+			crtime: UNIX_EPOCH + Duration::from_secs(5),
+		};
+		let ino = INodeNo(44);
+
+		let raw = InodeRaw::from_parts(ino, &inode).expect("inode -> raw conversion should succeed");
+		assert_eq!(raw.atime_sec, i64::MIN);
+		assert_eq!(raw.atime_nsec, 0);
+
+		let (restored_ino, restored) = raw.into_parts().expect("raw -> inode conversion should succeed");
 		assert_eq!(restored_ino, ino);
 		assert_eq!(restored, inode);
 	}

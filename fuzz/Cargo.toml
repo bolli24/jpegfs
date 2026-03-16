@@ -38,8 +38,15 @@ doc = false
 bench = false
 
 [[bin]]
-name = "inode_roundtrip"
-path = "src/inode_roundtrip.rs"
+name = "inode_structured_roundtrip"
+path = "src/inode_structured_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inode_raw_roundtrip"
+path = "src/inode_raw_roundtrip.rs"
 test = false
 doc = false
 bench = false

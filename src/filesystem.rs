@@ -48,7 +48,7 @@ pub struct FileSystemState {
 	dirty: bool,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum FileSystemInvariantError {
 	#[error("missing root inode")]
 	MissingRootInode,
@@ -88,6 +88,16 @@ pub enum FileSystemInvariantError {
 	DirectoryDotMismatch { dir_ino: INodeNo },
 	#[error("directory missing '..': {dir_ino:?}")]
 	DirectoryMissingDotDot { dir_ino: INodeNo },
+	#[error("directory parent is not a directory: dir={dir_ino:?}, parent={parent_ino:?}")]
+	DirectoryParentNotDirectory { dir_ino: INodeNo, parent_ino: INodeNo },
+	#[error("directory parent mismatch: dir={dir_ino:?}, expected={expected_parent:?}, actual={actual_parent:?}")]
+	DirectoryParentMismatch {
+		dir_ino: INodeNo,
+		expected_parent: INodeNo,
+		actual_parent: INodeNo,
+	},
+	#[error("directory parent cycle detected from {dir_ino:?} via {repeated_ino:?}")]
+	DirectoryParentCycle { dir_ino: INodeNo, repeated_ino: INodeNo },
 	#[error("entry name too long in {dir_ino:?}: {name:?}")]
 	EntryNameTooLong { dir_ino: INodeNo, name: OsString },
 	#[error("directory entry points to missing inode: parent={parent:?}, name={name:?}, child={child:?}")]
@@ -361,6 +371,7 @@ impl FileSystemState {
 		}
 	}
 
+	/// Count of bytes used for all file data
 	pub fn used_bytes(&self) -> u64 {
 		self.used_bytes
 	}
@@ -398,6 +409,7 @@ impl FileSystemState {
 		Ok(())
 	}
 
+	/// Check that a directory is not . or .. before rm_dir, rename etc.
 	fn reject_dot_entries(name: &OsStr) -> FsOpResult<()> {
 		if name == OsStr::new(".") {
 			return Err(Errno::EINVAL);
@@ -408,6 +420,7 @@ impl FileSystemState {
 		Ok(())
 	}
 
+	/// Check that an inode is usable as a parent (it exists, is a directory and has an entries page)
 	fn ensure_parent_dir(&self, parent: INodeNo) -> FsOpResult<()> {
 		let inode = self.inode_or_enoent(parent)?;
 		if inode.kind != FileType::Directory {
@@ -419,15 +432,18 @@ impl FileSystemState {
 		Ok(())
 	}
 
+	/// Check that an inode exists
 	fn inode_or_enoent(&self, ino: INodeNo) -> FsOpResult<&Inode> {
 		self.pager.inode_get(ino).ok_or(Errno::ENOENT)
 	}
 
+	/// Check that an inode exists and is a file
 	fn ensure_regular_file_inode(&self, ino: INodeNo) -> FsOpResult<&Inode> {
 		let inode = self.inode_or_enoent(ino)?;
 		if inode.kind == FileType::Directory {
 			return Err(Errno::EISDIR);
 		}
+		debug_assert_eq!(inode.kind, FileType::RegularFile);
 		Ok(inode)
 	}
 
@@ -438,13 +454,9 @@ impl FileSystemState {
 
 	fn is_descendant_dir(&self, candidate: INodeNo, ancestor: INodeNo) -> FsOpResult<bool> {
 		let mut cursor = candidate;
-		let mut visited = HashSet::new();
 		loop {
 			if cursor == ancestor {
 				return Ok(true);
-			}
-			if !visited.insert(cursor) {
-				return Err(Errno::EIO);
 			}
 			if cursor == INodeNo::ROOT {
 				return Ok(false);
@@ -452,6 +464,44 @@ impl FileSystemState {
 
 			let parent = self.pager.dir_entries_get(cursor, OsStr::new("..")).ok_or(Errno::EIO)?;
 			cursor = parent;
+		}
+	}
+
+	/// Resolve a directory's `..` entry and validate that it points to a directory.
+	fn directory_parent_ino(&self, dir_ino: INodeNo) -> Result<INodeNo, FileSystemInvariantError> {
+		let parent_ino = self
+			.pager
+			.dir_entries_get(dir_ino, OsStr::new(".."))
+			.ok_or(FileSystemInvariantError::DirectoryMissingDotDot { dir_ino })?;
+		let Some(parent_inode) = self.pager.inode_get(parent_ino) else {
+			return Err(FileSystemInvariantError::DirectoryEntryPointsToMissingInode {
+				parent: dir_ino,
+				name: OsString::from(".."),
+				child: parent_ino,
+			});
+		};
+		if parent_inode.kind != FileType::Directory {
+			return Err(FileSystemInvariantError::DirectoryParentNotDirectory { dir_ino, parent_ino });
+		}
+		Ok(parent_ino)
+	}
+
+	/// Validate that a directory's parent chain reaches `ROOT` without cycles.
+	fn validate_directory_parent_chain(&self, dir_ino: INodeNo) -> Result<(), FileSystemInvariantError> {
+		let mut cursor = dir_ino;
+		let mut visited = HashSet::new();
+		loop {
+			if cursor == INodeNo::ROOT {
+				return Ok(());
+			}
+			if !visited.insert(cursor) {
+				return Err(FileSystemInvariantError::DirectoryParentCycle {
+					dir_ino,
+					repeated_ino: cursor,
+				});
+			}
+
+			cursor = self.directory_parent_ino(cursor)?;
 		}
 	}
 
@@ -966,7 +1016,11 @@ impl FileSystemState {
 		Ok(())
 	}
 
-	/// Validate that the filesystem currently upholds all nescessary invariants
+	/// Validate that the filesystem currently upholds all nescessary invariants:
+	/// - has root inode that is a directory and has its . and .. entries
+	/// - each file inode has the correct ammount of bytes stored
+	/// - used byte accounting, inode limits, free inode tracking and file handles are consistent
+	/// - every directory has valid entries, link counts, and a parent chain that matches the visible namespace
 	pub fn check_invariants(&self) -> Result<(), FileSystemInvariantError> {
 		let Some(root_inode) = self.pager.inode_get(INodeNo::ROOT) else {
 			return Err(FileSystemInvariantError::MissingRootInode);
@@ -1068,6 +1122,15 @@ impl FileSystemState {
 				};
 				if name != OsStr::new(".") && name != OsStr::new("..") && child_inode.kind == FileType::Directory {
 					subdir_count += 1;
+
+					let actual_parent = self.directory_parent_ino(child_ino)?;
+					if actual_parent != dir_ino {
+						return Err(FileSystemInvariantError::DirectoryParentMismatch {
+							dir_ino: child_ino,
+							expected_parent: dir_ino,
+							actual_parent,
+						});
+					}
 				}
 			}
 
@@ -1079,6 +1142,7 @@ impl FileSystemState {
 					expected: expected_nlink,
 				});
 			}
+			self.validate_directory_parent_chain(dir_ino)?;
 		}
 
 		Ok(())
@@ -2099,6 +2163,109 @@ mod tests {
 			.expect_err("rename should fail");
 		assert_eq!(i32::from(err), i32::from(Errno::EINVAL));
 		assert!(state.check_invariants().is_ok());
+	}
+
+	#[test]
+	fn check_invariants_rejects_directory_parent_cycles() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (a, _) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("a"), 0o755, 0, 1000, 1000)
+			.expect("mkdir a should succeed");
+		let (b, _) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("b"), 0o755, 0, 1000, 1000)
+			.expect("mkdir b should succeed");
+
+		assert_eq!(
+			state.pager.dir_entries_remove(INodeNo::ROOT, OsStr::new("a")),
+			Some(a),
+			"removing root/a should succeed"
+		);
+		assert_eq!(
+			state.pager.dir_entries_remove(INodeNo::ROOT, OsStr::new("b")),
+			Some(b),
+			"removing root/b should succeed"
+		);
+		state
+			.pager
+			.inode_get_mut(INodeNo::ROOT)
+			.expect("root should exist")
+			.nlink = 2;
+		state
+			.pager
+			.dir_entries_insert(a, OsString::from(".."), b)
+			.expect("replacing a/.. should succeed");
+		state
+			.pager
+			.dir_entries_insert(b, OsString::from(".."), a)
+			.expect("replacing b/.. should succeed");
+
+		let err = state
+			.check_invariants()
+			.expect_err("cyclic directory parents should fail invariants");
+		assert!(matches!(
+			err,
+			FileSystemInvariantError::DirectoryParentCycle { dir_ino, repeated_ino }
+				if [a, b].contains(&dir_ino) && [a, b].contains(&repeated_ino)
+		));
+	}
+
+	#[test]
+	fn check_invariants_rejects_directory_parent_pointing_to_file() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (dir_ino, _) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("dir"), 0o755, 0, 1000, 1000)
+			.expect("mkdir should succeed");
+		let (file_ino, _inode, fh) = state
+			.op_create(INodeNo::ROOT, OsStr::new("file"), 0o755, 0, 1000, 1000)
+			.expect("create should succeed");
+		state.op_release(fh);
+
+		state
+			.pager
+			.dir_entries_insert(dir_ino, OsString::from(".."), file_ino)
+			.expect("replacing dir/.. should succeed");
+
+		let err = state
+			.check_invariants()
+			.expect_err("directory parent must remain a directory");
+		assert_eq!(
+			err,
+			FileSystemInvariantError::DirectoryParentNotDirectory {
+				dir_ino,
+				parent_ino: file_ino,
+			}
+		);
+	}
+
+	#[test]
+	fn check_invariants_rejects_directory_parent_mismatch() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (a, _) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("a"), 0o755, 0, 1000, 1000)
+			.expect("mkdir a should succeed");
+		let (b, _) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("b"), 0o755, 0, 1000, 1000)
+			.expect("mkdir b should succeed");
+
+		state
+			.pager
+			.dir_entries_insert(b, OsString::from(".."), a)
+			.expect("replacing b/.. should succeed");
+
+		let err = state
+			.check_invariants()
+			.expect_err("directory parent must match visible containing directory");
+		assert_eq!(
+			err,
+			FileSystemInvariantError::DirectoryParentMismatch {
+				dir_ino: b,
+				expected_parent: INodeNo::ROOT,
+				actual_parent: a,
+			}
+		);
 	}
 
 	#[test]

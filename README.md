@@ -1,6 +1,9 @@
 # jpegfs
 
-Run with `cargo run <jpeg_directory>`
+Run with `cargo run <jpeg_directory> <mount_directory>`
+
+If the mount directory does not exist, jpegfs creates it and removes it again on shutdown.
+Pre-existing mount directories are left in place.
 
 ## Fuzzing
 

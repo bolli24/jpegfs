@@ -18,10 +18,28 @@ use jpegfs::persistence::JpegBlockStore;
 
 mod tui;
 
-const DEFAULT_MOUNT_PATH: &str = "/tmp/jpegfs";
-
 /// A filesystem requires at least 2 pages: 1 dir inodes pages, 1 dir entries page
 const MIN_BOOTSTRAP_PAGES: usize = 2;
+
+#[derive(Debug)]
+struct CliArgs {
+	jpeg_dir: PathBuf,
+	mount_dir: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MountDirState {
+	mount_dir: PathBuf,
+	created_by_process: bool,
+}
+
+impl Drop for MountDirState {
+	fn drop(&mut self) {
+		if let Err(err) = cleanup_mount_dir(&self.mount_dir, self.created_by_process) {
+			warn!("failed to remove mount directory {}: {err:#}", self.mount_dir.display());
+		}
+	}
+}
 
 struct PersistOnDrop {
 	fs: FileSystem,
@@ -65,7 +83,8 @@ fn main() -> anyhow::Result<()> {
 	let (log_tx, log_rx) = mpsc::sync_channel(8_192);
 	tui::init_tui_logger(log_tx).context("failed to initialize tui logger")?;
 
-	let jpeg_dir = parse_jpeg_dir_arg()?;
+	let cli_args = parse_cli_args()?;
+	let CliArgs { jpeg_dir, mount_dir } = cli_args;
 	let jpeg_paths = discover_jpeg_paths(&jpeg_dir)?;
 	let jpeg_threads = configured_jpeg_threads(jpeg_paths.len())?;
 	info!(
@@ -86,28 +105,16 @@ fn main() -> anyhow::Result<()> {
 		MountOption::DefaultPermissions,
 	];
 
-	let mount_path = PathBuf::from(DEFAULT_MOUNT_PATH);
-	match std::fs::create_dir_all(&mount_path) {
-		Ok(()) => {}
-		Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-		Err(e) => {
-			return Err(e).with_context(|| format!("failed to create mount directory at {}", mount_path.display()));
-		}
-	}
-	anyhow::ensure!(
-		mount_path.is_dir(),
-		"mount path exists but is not a directory: {}",
-		mount_path.display()
-	);
+	let _mount_dir_state = prepare_mount_dir(&mount_dir)?;
 
-	let session = spawn_mount2(persistence.fs.clone(), &mount_path, &config).context("failed to mount file system")?;
+	let session = spawn_mount2(persistence.fs.clone(), &mount_dir, &config).context("failed to mount file system")?;
 	let (shutdown_tx, shutdown_rx) = mpsc::channel();
 	ctrlc::set_handler(move || {
 		let _ = shutdown_tx.send(());
 	})
 	.context("failed to set shutdown signal handler")?;
 
-	tui::run_tui(&persistence.fs, &mount_path, &log_rx, &shutdown_rx)?;
+	tui::run_tui(&persistence.fs, &mount_dir, &log_rx, &shutdown_rx)?;
 	drop(session);
 	log_filesystem_capacity("before exit", &persistence.fs, total_page_capacity);
 	let shutdown_persist_started_at = Instant::now();
@@ -120,14 +127,17 @@ fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn parse_jpeg_dir_arg() -> anyhow::Result<PathBuf> {
-	let mut args = std::env::args_os();
+fn parse_cli_args() -> anyhow::Result<CliArgs> {
+	let mut args = std::env::args_os().into_iter();
 	let program = args.next().unwrap_or_default();
 	let Some(jpeg_dir) = args.next() else {
-		bail!("usage: {} <jpeg_dir>", Path::new(&program).display());
+		bail!("usage: {} <jpeg_dir> <mount_dir>", Path::new(&program).display());
+	};
+	let Some(mount_dir) = args.next() else {
+		bail!("usage: {} <jpeg_dir> <mount_dir>", Path::new(&program).display());
 	};
 	if args.next().is_some() {
-		bail!("usage: {} <jpeg_dir>", Path::new(&program).display());
+		bail!("usage: {} <jpeg_dir> <mount_dir>", Path::new(&program).display());
 	}
 	let jpeg_dir = PathBuf::from(jpeg_dir);
 	anyhow::ensure!(
@@ -135,7 +145,46 @@ fn parse_jpeg_dir_arg() -> anyhow::Result<PathBuf> {
 		"jpeg directory does not exist or is not a directory: {}",
 		jpeg_dir.display()
 	);
-	Ok(jpeg_dir)
+	Ok(CliArgs {
+		jpeg_dir,
+		mount_dir: PathBuf::from(mount_dir),
+	})
+}
+
+fn prepare_mount_dir(mount_dir: &Path) -> anyhow::Result<MountDirState> {
+	if mount_dir.exists() {
+		anyhow::ensure!(
+			mount_dir.is_dir(),
+			"mount path exists but is not a directory: {}",
+			mount_dir.display()
+		);
+		return Ok(MountDirState {
+			mount_dir: mount_dir.to_path_buf(),
+			created_by_process: false,
+		});
+	}
+
+	std::fs::create_dir_all(mount_dir)
+		.with_context(|| format!("failed to create mount directory at {}", mount_dir.display()))?;
+	Ok(MountDirState {
+		mount_dir: mount_dir.to_path_buf(),
+		created_by_process: true,
+	})
+}
+
+fn cleanup_mount_dir(mount_dir: &Path, created_by_process: bool) -> anyhow::Result<bool> {
+	if !created_by_process || !mount_dir.exists() {
+		return Ok(false);
+	}
+
+	anyhow::ensure!(
+		mount_dir.is_dir(),
+		"mount path is no longer a directory: {}",
+		mount_dir.display()
+	);
+	std::fs::remove_dir(mount_dir)
+		.with_context(|| format!("failed to remove mount directory at {}", mount_dir.display()))?;
+	Ok(true)
 }
 
 fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {

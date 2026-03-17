@@ -27,14 +27,16 @@ Quick smoke run (60 seconds):
 cargo fuzz run --target x86_64-unknown-linux-gnu filesystem_state_machine -- -max_total_time=60
 ```
 
-Available modules:
+Available fuzz targets:
 
-- filesystem_state_maschine
-- inode_raw_roundtrip
-- inode_structured_roundtrip
-- owned_jpeg_read_write
-- pager_state_maschine
-- store_block_persistence
+- `filesystem_state_machine`: fuzzes filesystem operations and checks the resulting state for consistency.
+- `inode_raw_roundtrip`: decodes arbitrary raw inode bytes and checks that valid inodes re-encode and decode stably.
+- `inode_structured_roundtrip`: fuzzes structured inode values and checks round-trips through `InodeRaw`.
+- `owned_jpeg_lsb_roundtrip`: fuzzes in-memory `OwnedJpeg` LSB embedding and extraction without running the JPEG codec.
+- `owned_jpeg_read_write`: fuzzes end-to-end JPEG read/write round-trips on a tiny resized test JPEG fixture.
+- `pager_state_machine`: fuzzes pager inode, directory, and byte-page operations against a model and persistence checks.
+- `store_block_persistence`: fuzzes `StoreBlock<String, 512>` inserts and validates persisted slot metadata and
+  round-trips.
 
 Minimize all copora:
 

@@ -24,6 +24,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "owned_jpeg_lsb_roundtrip"
+path = "src/owned_jpeg_lsb_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "filesystem_state_machine"
 path = "src/filesystem_state_machine.rs"
 test = false

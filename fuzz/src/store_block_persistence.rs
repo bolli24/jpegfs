@@ -10,32 +10,32 @@ use zerocopy::FromBytes;
 
 const BLOCK_SIZE: usize = 512;
 const MAX_VALUES: usize = 128;
-const MAX_VALUE_BYTES: usize = 128;
+const MAX_VALUE_LENGTH: usize = 128;
 
 #[derive(Arbitrary, Debug)]
 struct Program {
-	values: Vec<Vec<u8>>,
+	values: Vec<String>,
 }
 
-fn persisted_active_slots(block: &StoreBlock<Vec<u8>, BLOCK_SIZE>) -> u32 {
+fn persisted_active_slots(block: &StoreBlock<String, BLOCK_SIZE>) -> u32 {
 	let bytes = block.as_bytes();
 	let header = Header::read_from_bytes(&bytes[..size_of::<Header>()]).expect("header bytes must always decode");
 	header.active_slots
 }
 
 fuzz_target!(|program: Program| {
-	let mut block = StoreBlock::<Vec<u8>, BLOCK_SIZE>::new(PageId(7));
+	let mut block = StoreBlock::<String, BLOCK_SIZE>::new(PageId(7));
 	let mut expected = Vec::new();
 
-	for value in program.values.into_iter().take(MAX_VALUES) {
-		let value = value.into_iter().take(MAX_VALUE_BYTES).collect::<Vec<_>>();
+	for (i, value) in program.values.into_iter().take(MAX_VALUES).enumerate() {
+		let value: String = value.chars().take(MAX_VALUE_LENGTH).collect();
 
 		match block.try_store(value.clone()) {
 			Ok(index) => {
-				assert_eq!(index, StoreSlot::from_raw(expected.len() as u32));
+				assert_eq!(index, StoreSlot::from_raw(i as u32));
 				expected.push(value);
 
-				assert_eq!(persisted_active_slots(&block) as usize, expected.len());
+				assert_eq!(persisted_active_slots(&block) as usize, i + 1);
 			}
 			Err(Error::NoSpace) => break,
 			Err(err) => panic!("unexpected store error: {err:?}"),

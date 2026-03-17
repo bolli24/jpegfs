@@ -257,7 +257,7 @@ impl FileSystem {
 		state.free_inos.push(ino);
 	}
 
-	fn statfs_data(state: &FileSystemState) -> StatfsData {
+	pub fn statfs_data(state: &FileSystemState) -> StatfsData {
 		let blocks = state.pager.max_pages() as u64;
 		let used_blocks = state.pager.block_counts().total() as u64;
 		let bfree = blocks.saturating_sub(used_blocks);
@@ -505,6 +505,7 @@ impl FileSystemState {
 		}
 	}
 
+	/// Validate that a file handle exists, matches the given inode, and that inode is a file
 	fn validate_file_handle(&self, ino: INodeNo, fh: FileHandle) -> FsOpResult<()> {
 		let Some(handle_ino) = self.handles.get(&fh) else {
 			return Err(Errno::EBADF);
@@ -516,6 +517,7 @@ impl FileSystemState {
 		Ok(())
 	}
 
+	/// Create a new file handle
 	fn alloc_file_handle_for(&mut self, ino: INodeNo) -> FsOpResult<FileHandle> {
 		let file_handle = FileHandle(self.next_fh);
 		let Some(next_fh) = self.next_fh.checked_add(1) else {
@@ -526,6 +528,7 @@ impl FileSystemState {
 		Ok(file_handle)
 	}
 
+	/// Grow or shrink a file
 	fn resize_file_len(&mut self, ino: INodeNo, new_len: usize) -> FsOpResult<()> {
 		let old_len = self.pager.bytes_len(ino);
 		if new_len > old_len {
@@ -545,7 +548,10 @@ impl FileSystemState {
 		Ok(())
 	}
 
+	/// update the number of links to a directory
 	fn apply_dir_nlink_delta(&mut self, ino: INodeNo, delta: i32) -> FsOpResult<()> {
+		debug_assert!(delta == 0 || delta == 1 || delta == -1);
+
 		if delta == 0 {
 			return Ok(());
 		}
@@ -565,10 +571,6 @@ impl FileSystemState {
 			_ => return Err(Errno::EIO),
 		}
 		Ok(())
-	}
-
-	pub fn op_getattr(&self, ino: INodeNo) -> FsOpResult<Inode> {
-		self.inode_or_enoent(ino).copied()
 	}
 
 	pub fn op_mkdir(
@@ -783,10 +785,6 @@ impl FileSystemState {
 			});
 		}
 		Ok(entries)
-	}
-
-	pub fn op_statfs(&self) -> StatfsData {
-		FileSystem::statfs_data(self)
 	}
 
 	pub fn op_create(
@@ -1192,8 +1190,8 @@ impl Filesystem for FileSystem {
 	fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
 		info!("getattr(ino={ino:?})");
 		let state = self.state.read();
-		match state.op_getattr(ino) {
-			Ok(inode) => reply.attr(&FUSE_TTL, &Inode::to_file_attr(ino, &inode)),
+		match state.inode_or_enoent(ino) {
+			Ok(inode) => reply.attr(&FUSE_TTL, &Inode::to_file_attr(ino, inode)),
 			Err(err) => reply.error(err),
 		}
 	}
@@ -1514,7 +1512,7 @@ impl Filesystem for FileSystem {
 	fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
 		info!("statfs()");
 		let state = self.state.read();
-		let statfs = state.op_statfs();
+		let statfs = FileSystem::statfs_data(&state);
 		reply.statfs(
 			statfs.blocks,
 			statfs.bfree,
@@ -1834,14 +1832,14 @@ mod tests {
 			state
 				.op_unlink(INodeNo::ROOT, OsStr::new("file"))
 				.expect("unlink should succeed");
-			assert!(state.op_getattr(ino).is_ok());
+			assert!(state.inode_or_enoent(ino).is_ok());
 			state.op_release(fh);
 			ino
 		};
 		let state = fs.state.read();
 		assert_eq!(
 			state
-				.op_getattr(ino)
+				.inode_or_enoent(ino)
 				.map_err(i32::from)
 				.expect_err("inode should be removed"),
 			i32::from(Errno::ENOENT)
@@ -1981,7 +1979,7 @@ mod tests {
 		);
 		assert_eq!(
 			state
-				.op_getattr(dst_ino)
+				.inode_or_enoent(dst_ino)
 				.map_err(i32::from)
 				.expect_err("old dst inode should be removed"),
 			i32::from(Errno::ENOENT)
@@ -2044,7 +2042,7 @@ mod tests {
 		);
 		assert_eq!(
 			state
-				.op_getattr(dst_ino)
+				.inode_or_enoent(dst_ino)
 				.map_err(i32::from)
 				.expect_err("old dst inode should be removed"),
 			i32::from(Errno::ENOENT)
@@ -2091,7 +2089,7 @@ mod tests {
 		assert_eq!(state.pager.dir_entries_get(src_ino, OsStr::new("..")), Some(new_parent));
 		assert_eq!(
 			state
-				.op_getattr(dst_ino)
+				.inode_or_enoent(dst_ino)
 				.map_err(i32::from)
 				.expect_err("old dst inode should be removed"),
 			i32::from(Errno::ENOENT)

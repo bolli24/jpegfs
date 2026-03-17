@@ -230,11 +230,11 @@ fuzz_target!(|program: Program| {
 			}
 			Op::Getattr { inode_slot } => {
 				if let Some(ino) = pick(&inodes, *inode_slot) {
-					let _ = state.op_getattr(ino);
+					let _ = state.pager.inode_get(ino);
 				}
 			}
 			Op::Statfs => {
-				let _ = state.op_statfs();
+				let _ = FileSystem::statfs_data(&state);
 			}
 		}
 

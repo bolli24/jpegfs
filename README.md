@@ -1,4 +1,4 @@
-# jpegfs
+# jpegfs - a steganographic file system
 
 Run with `cargo run <jpeg_directory> <mount_directory>`
 
@@ -7,7 +7,7 @@ Pre-existing mount directories are left in place.
 
 ## Fuzzing
 
-`cargo fuzz` needs a nightly toolchain. Use `x86_64-unknown-linux-gnu` as the fuzz target.
+`cargo fuzz` needs a nightly rust toolchain. Use `x86_64-unknown-linux-gnu` as the fuzz target.
 
 Setup (one-time):
 
@@ -31,9 +31,9 @@ Available fuzz targets:
 
 - `filesystem_state_machine`: fuzzes filesystem operations and checks the resulting state for consistency.
 - `inode_raw_roundtrip`: decodes arbitrary raw inode bytes and checks that valid inodes re-encode and decode stably.
-- `inode_structured_roundtrip`: fuzzes structured inode values and checks round-trips through `InodeRaw`.
+- `inode_structured_roundtrip`: fuzzes structured inode values and checks round-trips.
 - `owned_jpeg_lsb_roundtrip`: fuzzes in-memory `OwnedJpeg` LSB embedding and extraction without running the JPEG codec.
-- `owned_jpeg_read_write`: fuzzes end-to-end JPEG read/write round-trips on a tiny resized test JPEG fixture.
+- `owned_jpeg_read_write`: fuzzes end-to-end JPEG read/write round-trips
 - `pager_state_machine`: fuzzes pager inode, directory, and byte-page operations against a model and persistence checks.
 - `store_block_persistence`: fuzzes `StoreBlock<String, 512>` inserts and validates persisted slot metadata and
   round-trips.

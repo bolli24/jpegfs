@@ -246,6 +246,21 @@ where
 		Ok((removed, remap))
 	}
 
+	#[cfg(test)]
+	pub(crate) fn test_set_slot_length(&mut self, slot: StoreSlot, length: u32) {
+		assert!(
+			slot.into_raw() < self.header.active_slots,
+			"test helper requires an active slot"
+		);
+		let entry_offset = self.entry_at(slot);
+		let mut entry = Entry::read_from_bytes(&self.data[entry_offset..entry_offset + size_of::<Entry>()])
+			.expect("Sizes of source and destination are equal and data is valid.");
+		entry.length = length;
+		entry
+			.write_to(&mut self.data[entry_offset..entry_offset + size_of::<Entry>()])
+			.expect("Sizes of source and destination are equal.");
+	}
+
 	pub fn as_bytes(&self) -> &[u8; SIZE] {
 		&self.data
 	}

@@ -154,13 +154,13 @@ impl FileSystem {
 		let mut pager = Pager::new(max_pages.max(1));
 		pager
 			.inodes_insert(INodeNo::ROOT, root_inode)
-			.map_err(|()| "insufficient page capacity for root inode".to_string())?;
+			.map_err(|_| "insufficient page capacity for root inode".to_string())?;
 		pager
 			.dir_entries_insert(INodeNo::ROOT, OsString::from("."), INodeNo::ROOT)
-			.map_err(|()| "insufficient page capacity for root '.' entry".to_string())?;
+			.map_err(|_| "insufficient page capacity for root '.' entry".to_string())?;
 		pager
 			.dir_entries_insert(INodeNo::ROOT, OsString::from(".."), INodeNo::ROOT)
-			.map_err(|()| "insufficient page capacity for root '..' entry".to_string())?;
+			.map_err(|_| "insufficient page capacity for root '..' entry".to_string())?;
 
 		let state = FileSystemState {
 			pager,
@@ -536,10 +536,10 @@ impl FileSystemState {
 			let Some(new_used_bytes) = self.used_bytes.checked_add(growth as u64) else {
 				return Err(Errno::ENOSPC);
 			};
-			self.pager.bytes_truncate(ino, new_len).map_err(|()| Errno::ENOSPC)?;
+			self.pager.bytes_truncate(ino, new_len)?;
 			self.used_bytes = new_used_bytes;
 		} else {
-			self.pager.bytes_truncate(ino, new_len).map_err(|()| Errno::ENOSPC)?;
+			self.pager.bytes_truncate(ino, new_len)?;
 			self.used_bytes = self.used_bytes.saturating_sub((old_len - new_len) as u64);
 		}
 
@@ -607,33 +607,23 @@ impl FileSystemState {
 			crtime: now,
 		};
 
-		self.pager
-			.inodes_insert(new_ino, new_inode)
-			.map_err(|()| Errno::ENOSPC)?;
-		if self
-			.pager
-			.dir_entries_insert(new_ino, OsString::from("."), new_ino)
-			.is_err()
-		{
+		self.pager.inodes_insert(new_ino, new_inode)?;
+		if let Err(err) = self.pager.dir_entries_insert(new_ino, OsString::from("."), new_ino) {
 			self.pager.inode_remove(new_ino);
 			self.free_inos.push(new_ino);
-			return Err(Errno::ENOSPC);
+			return Err(err.into());
 		}
-		if self
-			.pager
-			.dir_entries_insert(new_ino, OsString::from(".."), parent)
-			.is_err()
-		{
+		if let Err(err) = self.pager.dir_entries_insert(new_ino, OsString::from(".."), parent) {
 			self.pager.dir_entries_clear(new_ino);
 			self.pager.inode_remove(new_ino);
 			self.free_inos.push(new_ino);
-			return Err(Errno::ENOSPC);
+			return Err(err.into());
 		}
-		if self.pager.dir_entries_insert(parent, name.to_owned(), new_ino).is_err() {
+		if let Err(err) = self.pager.dir_entries_insert(parent, name.to_owned(), new_ino) {
 			self.pager.dir_entries_clear(new_ino);
 			self.pager.inode_remove(new_ino);
 			self.free_inos.push(new_ino);
-			return Err(Errno::ENOSPC);
+			return Err(err.into());
 		}
 
 		let parent_inode = self.pager.inode_get_mut(parent).ok_or(Errno::EIO)?;
@@ -655,7 +645,7 @@ impl FileSystemState {
 		}
 
 		let now = SystemTime::now();
-		if self.pager.dir_entries_remove(parent, name).is_none() {
+		if self.pager.dir_entries_remove(parent, name)?.is_none() {
 			return Err(Errno::EIO);
 		}
 
@@ -698,7 +688,7 @@ impl FileSystemState {
 		}
 
 		let now = SystemTime::now();
-		if self.pager.dir_entries_remove(parent, name).is_none() {
+		if self.pager.dir_entries_remove(parent, name)?.is_none() {
 			return Err(Errno::EIO);
 		}
 		self.pager.dir_entries_clear(child_ino);
@@ -749,7 +739,7 @@ impl FileSystemState {
 		if end > current_len {
 			self.resize_file_len(ino, end)?;
 		}
-		self.pager.bytes_write(ino, start, data).map_err(|()| Errno::ENOSPC)?;
+		self.pager.bytes_write(ino, start, data)?;
 
 		let now = SystemTime::now();
 		let inode = self.pager.inode_get_mut(ino).ok_or(Errno::EIO)?;
@@ -821,19 +811,17 @@ impl FileSystemState {
 			crtime: now,
 		};
 
-		self.pager
-			.inodes_insert(new_ino, new_inode)
-			.map_err(|()| Errno::ENOSPC)?;
-		if self.pager.dir_entries_insert(parent, name.to_owned(), new_ino).is_err() {
+		self.pager.inodes_insert(new_ino, new_inode)?;
+		if let Err(err) = self.pager.dir_entries_insert(parent, name.to_owned(), new_ino) {
 			self.pager.inode_remove(new_ino);
 			self.free_inos.push(new_ino);
-			return Err(Errno::ENOSPC);
+			return Err(err.into());
 		}
 
 		let file_handle = match self.alloc_file_handle_for(new_ino) {
 			Ok(file_handle) => file_handle,
 			Err(err) => {
-				self.pager.dir_entries_remove(parent, name);
+				let _ = self.pager.dir_entries_remove(parent, name);
 				self.pager.inode_remove(new_ino);
 				self.free_inos.push(new_ino);
 				return Err(err);
@@ -926,15 +914,24 @@ impl FileSystemState {
 			}
 		}
 
-		if self
-			.pager
-			.dir_entries_insert(newparent, newname.to_owned(), source_ino)
-			.is_err()
-		{
-			return Err(Errno::ENOSPC);
+		if let Err(err) = self.pager.dir_entries_insert(newparent, newname.to_owned(), source_ino) {
+			return Err(err.into());
 		}
 
-		let removed_source = self.pager.dir_entries_remove(parent, name);
+		let removed_source = match self.pager.dir_entries_remove(parent, name) {
+			Ok(removed_source) => removed_source,
+			Err(err) => {
+				// Best-effort rollback after inserting the destination entry.
+				let _ = self.pager.dir_entries_remove(newparent, newname);
+				if let Some(existing_ino) = target_ino {
+					let _ = self
+						.pager
+						.dir_entries_insert(newparent, newname.to_owned(), existing_ino);
+				}
+				let _ = self.pager.dir_entries_insert(parent, name.to_owned(), source_ino);
+				return Err(err.into());
+			}
+		};
 		if removed_source != Some(source_ino) {
 			// Best-effort rollback on unexpected state.
 			let _ = self.pager.dir_entries_remove(newparent, newname);
@@ -975,12 +972,11 @@ impl FileSystemState {
 		}
 
 		if source_is_dir && parent != newparent {
-			if self
+			if let Err(err) = self
 				.pager
 				.dir_entries_insert(source_ino, OsString::from(".."), newparent)
-				.is_err()
 			{
-				return Err(Errno::EIO);
+				return Err(err.into());
 			}
 			old_parent_dir_delta -= 1;
 			new_parent_dir_delta += 1;
@@ -2164,6 +2160,53 @@ mod tests {
 	}
 
 	#[test]
+	fn rename_rolls_back_when_source_remove_reports_pager_error() {
+		let fs = FileSystem::new();
+		let mut state = fs.state.write();
+		let (src_parent, _) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("src_parent"), 0o755, 0, 1000, 1000)
+			.expect("mkdir src_parent should succeed");
+		let (dst_parent, _) = state
+			.op_mkdir(INodeNo::ROOT, OsStr::new("dst_parent"), 0o755, 0, 1000, 1000)
+			.expect("mkdir dst_parent should succeed");
+		let (src_ino, _src_inode, src_fh) = state
+			.op_create(src_parent, OsStr::new("src"), 0o644, 0, 1000, 1000)
+			.expect("create src should succeed");
+		state.op_release(src_fh);
+		let (dst_ino, _dst_inode, dst_fh) = state
+			.op_create(dst_parent, OsStr::new("dst"), 0o644, 0, 1000, 1000)
+			.expect("create dst should succeed");
+		state.op_release(dst_fh);
+
+		assert!(
+			state
+				.pager
+				.test_corrupt_dir_entry_slot_length(src_parent, OsStr::new("src"), 0),
+			"source dir entry should exist for corruption"
+		);
+
+		let err = state
+			.op_rename(
+				src_parent,
+				OsStr::new("src"),
+				dst_parent,
+				OsStr::new("dst"),
+				RenameFlags::empty(),
+			)
+			.expect_err("rename should fail after source removal error");
+		assert_eq!(i32::from(err), i32::from(Errno::EIO));
+
+		assert_eq!(
+			state.pager.dir_entries_get(src_parent, OsStr::new("src")),
+			Some(src_ino)
+		);
+		assert_eq!(
+			state.pager.dir_entries_get(dst_parent, OsStr::new("dst")),
+			Some(dst_ino)
+		);
+	}
+
+	#[test]
 	fn check_invariants_rejects_directory_parent_cycles() {
 		let fs = FileSystem::new();
 		let mut state = fs.state.write();
@@ -2175,12 +2218,18 @@ mod tests {
 			.expect("mkdir b should succeed");
 
 		assert_eq!(
-			state.pager.dir_entries_remove(INodeNo::ROOT, OsStr::new("a")),
+			state
+				.pager
+				.dir_entries_remove(INodeNo::ROOT, OsStr::new("a"))
+				.expect("removing root/a should succeed"),
 			Some(a),
 			"removing root/a should succeed"
 		);
 		assert_eq!(
-			state.pager.dir_entries_remove(INodeNo::ROOT, OsStr::new("b")),
+			state
+				.pager
+				.dir_entries_remove(INodeNo::ROOT, OsStr::new("b"))
+				.expect("removing root/b should succeed"),
 			Some(b),
 			"removing root/b should succeed"
 		);

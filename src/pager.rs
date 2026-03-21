@@ -2,6 +2,7 @@ use crate::{
 	MAGIC,
 	filesystem::BLOCK_SIZE,
 	inode::{Inode, InodeRaw},
+	pager_error::{PagerBytesError, PagerCapacityError, PagerCodecError, PagerDirEntryError},
 	store::{Error as StoreError, StoreBlock, StoreSlot},
 };
 use crc::Crc;
@@ -114,56 +115,6 @@ impl PagerBlockCounts {
 	pub fn total(self) -> usize {
 		self.inodes + self.dir_entries + self.data_bytes
 	}
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PagerCodecError {
-	#[error("unable to read header from bytes: {0:?}")]
-	HeaderDecodeError(Vec<u8>),
-	#[error("invalid magic: {0:?}")]
-	InvalidMagic([u8; 4]),
-	#[error("unsupported version: {0}")]
-	UnsupportedVersion(u16),
-	#[error("reserved header field is non-zero: {0}")]
-	ReservedFieldNonZero(u16),
-	#[error("payload length {payload_len} exceeds capacity {capacity}")]
-	PayloadTooLarge { payload_len: usize, capacity: usize },
-	#[error("payload length {payload_len} does not match expected {expected} for {page_type:?}")]
-	InvalidPayloadLength {
-		page_type: PageType,
-		payload_len: usize,
-		expected: usize,
-	},
-	#[error("page CRC mismatch: expected {expected:#010x}, actual {actual:#010x}")]
-	CrcMismatch { expected: u32, actual: u32 },
-	#[error("{0:?} page header is missing owner inode")]
-	MissingOwnerInHeader(PageType),
-	#[error("inode page entry count ({0}) exceeds capacity")]
-	InodesEntryCountTooLarge(usize),
-	#[error("duplicate inode {0:?} while decoding inode pages")]
-	DuplicateInode(INodeNo),
-	#[error("duplicate page id {0:?}")]
-	DuplicatePageId(PageId),
-	#[error("decoded page id space exhausted")]
-	PageIdSpaceExhausted,
-	#[error("block padding bytes must be zero")]
-	NonZeroPadding,
-	#[error("inode payload is malformed")]
-	MalformedInodesPayload,
-	#[error("data page length {0} exceeds capacity")]
-	DataPageLengthTooLarge(usize),
-	#[error("missing bytes page at index {0}")]
-	MissingDataPageIndex(usize),
-	#[error("file pages for inode {ino:?} are not contiguous: expected {expected}, got {found}")]
-	NonContiguousDataPages { ino: INodeNo, expected: u32, found: u32 },
-	#[error("duplicate directory entry name {0:?} in one page")]
-	DuplicateDirEntryName(OsString),
-	#[error("too many pages to encode: {0}")]
-	TooManyPages(usize),
-	#[error("inodes page conversion failed: {0}")]
-	InodeConversion(#[from] crate::inode::InodeConversionError),
-	#[error("directory page decode failed: {0}")]
-	Store(#[from] StoreError),
 }
 
 pub enum DecodedPage {
@@ -521,7 +472,7 @@ impl Pager {
 		self.inodes.contains_key(&inode)
 	}
 
-	pub fn inodes_insert(&mut self, ino: INodeNo, inode: Inode) -> Result<(), ()> {
+	pub fn inodes_insert(&mut self, ino: INodeNo, inode: Inode) -> Result<(), PagerCapacityError> {
 		if let Some(&existing_index) = self.inodes.get(&ino) {
 			let page = &mut self.inodes_pages[existing_index.0];
 			page.entries.insert(ino, inode);
@@ -544,7 +495,7 @@ impl Pager {
 			}
 		} else {
 			if self.page_count() >= self.max_pages {
-				return Err(());
+				return Err(PagerCapacityError::PageLimitExceeded);
 			}
 			let free_entries = INODES_PAGE_CAPACITY - 1;
 			let new_page = InodesPage {
@@ -594,29 +545,37 @@ impl Pager {
 	}
 
 	/// Caller contract: `inode` must be nonzero.
-	pub fn dir_entries_insert(&mut self, inode: INodeNo, name: OsString, child: INodeNo) -> Result<(), ()> {
+	pub fn dir_entries_insert(
+		&mut self,
+		inode: INodeNo,
+		name: OsString,
+		child: INodeNo,
+	) -> Result<(), PagerDirEntryError> {
 		debug_assert_ne!(inode.0, 0, "directory entry owner inode must be nonzero");
 
 		// Remove existing entry if name already exists
-		let previous_child = match self.remove_dir_entry(inode, name.as_os_str()) {
-			Ok(previous) => previous,
-			Err(()) => return Err(()),
-		};
+		let previous_child = self.remove_dir_entry(inode, name.as_os_str())?;
 
 		// Insert it
-		if self.insert_new_dir_entry(inode, name.clone(), child).is_ok() {
-			return Ok(());
+		match self.insert_new_dir_entry(inode, name.clone(), child) {
+			Ok(()) => return Ok(()),
+			Err(err) => {
+				// If insertion failed: restore previously removed entry and propagate the original error.
+				if let Some(previous_child) = previous_child {
+					if let Err(rollback) = self.insert_new_dir_entry(inode, name, previous_child) {
+						return Err(PagerDirEntryError::RollbackFailed {
+							original: Box::new(err),
+							rollback: Box::new(rollback),
+						});
+					}
+				}
+				return Err(err);
+			}
 		}
-
-		// If insertion failed: restore previously removed entry and error
-		if let Some(previous_child) = previous_child {
-			let _ = self.insert_new_dir_entry(inode, name, previous_child);
-		}
-		Err(())
 	}
 
-	pub fn dir_entries_remove(&mut self, inode: INodeNo, name: &OsStr) -> Option<INodeNo> {
-		self.remove_dir_entry(inode, name).ok().flatten()
+	pub fn dir_entries_remove(&mut self, inode: INodeNo, name: &OsStr) -> Result<Option<INodeNo>, PagerDirEntryError> {
+		self.remove_dir_entry(inode, name)
 	}
 
 	pub fn dir_entries_clear(&mut self, inode: INodeNo) {
@@ -628,9 +587,12 @@ impl Pager {
 		}
 	}
 
-	fn allocate_dir_entries_page(&mut self, inode: INodeNo) -> Result<DirEntriesIndex, ()> {
+	fn allocate_dir_entries_page(&mut self, inode: INodeNo) -> Result<DirEntriesIndex, PagerDirEntryError> {
 		if let Some(page_index) = self.free_dir_entry_pages.pop() {
-			let page = self.dir_entries_pages.get_mut(page_index.0).ok_or(())?;
+			let page = self
+				.dir_entries_pages
+				.get_mut(page_index.0)
+				.ok_or(PagerDirEntryError::MissingPage { index: page_index.0 })?;
 			page.inode = inode;
 			page.indices.clear();
 			page.entries = StoreBlock::new(page.page_id);
@@ -638,7 +600,7 @@ impl Pager {
 		}
 
 		if self.page_count() >= self.max_pages {
-			return Err(());
+			return Err(PagerDirEntryError::PageLimitExceeded);
 		}
 
 		let page_id = self.alloc_page_id();
@@ -660,11 +622,19 @@ impl Pager {
 		}
 	}
 
-	fn insert_new_dir_entry(&mut self, inode: INodeNo, name: OsString, child: INodeNo) -> Result<(), ()> {
+	fn insert_new_dir_entry(
+		&mut self,
+		inode: INodeNo,
+		name: OsString,
+		child: INodeNo,
+	) -> Result<(), PagerDirEntryError> {
 		// Try finding dir entries page with free capacity
 		if let Some(page_indices) = self.dir_entries.get(&inode) {
 			for page_index in page_indices {
-				let page = &mut self.dir_entries_pages[page_index.0];
+				let page = self
+					.dir_entries_pages
+					.get_mut(page_index.0)
+					.ok_or(PagerDirEntryError::MissingPage { index: page_index.0 })?;
 				debug_assert_eq!(page.inode, inode);
 				match page.entries.try_store((name.clone(), child)) {
 					Ok(slot) => {
@@ -672,19 +642,26 @@ impl Pager {
 						return Ok(());
 					}
 					Err(StoreError::NoSpace) => continue,
-					Err(_) => return Err(()),
+					Err(err) => return Err(err.into()),
 				}
 			}
 		}
 
 		// No free space found -> allocate new page
 		let page_index = self.allocate_dir_entries_page(inode)?;
-		let page = self.dir_entries_pages.get_mut(page_index.0).ok_or(())?;
+		let page = self
+			.dir_entries_pages
+			.get_mut(page_index.0)
+			.ok_or(PagerDirEntryError::MissingPage { index: page_index.0 })?;
 		let slot = match page.entries.try_store((name.clone(), child)) {
 			Ok(slot) => slot,
-			Err(_) => {
+			Err(StoreError::NoSpace) => {
 				self.release_dir_entries_page(page_index);
-				return Err(());
+				return Err(PagerDirEntryError::EntryTooLarge);
+			}
+			Err(err) => {
+				self.release_dir_entries_page(page_index);
+				return Err(err.into());
 			}
 		};
 		page.indices.insert(name, (slot, child));
@@ -692,19 +669,22 @@ impl Pager {
 		Ok(())
 	}
 
-	fn remove_dir_entry(&mut self, inode: INodeNo, name: &OsStr) -> Result<Option<INodeNo>, ()> {
+	fn remove_dir_entry(&mut self, inode: INodeNo, name: &OsStr) -> Result<Option<INodeNo>, PagerDirEntryError> {
 		let Some(page_indices) = self.dir_entries.get(&inode) else {
 			return Ok(None);
 		};
 
 		for page_index in page_indices.into_iter().rev() {
 			let removed = {
-				let page = self.dir_entries_pages.get_mut(page_index.0).ok_or(())?;
+				let page = self
+					.dir_entries_pages
+					.get_mut(page_index.0)
+					.ok_or(PagerDirEntryError::MissingPage { index: page_index.0 })?;
 				debug_assert_eq!(page.inode, inode);
 				let Some((slot, child)) = page.indices.remove(name) else {
 					continue;
 				};
-				let (_, remap) = page.entries.remove(slot).map_err(|_| ())?;
+				let (_, remap) = page.entries.remove(slot)?;
 				if let Some((from_slot, to_slot)) = remap {
 					Self::remap_single_dir_entry_slot(page, from_slot, to_slot);
 				}
@@ -812,26 +792,35 @@ impl Pager {
 	}
 
 	/// Caller contract: `inode` must be nonzero.
-	pub fn bytes_write(&mut self, inode: INodeNo, offset: usize, data: &[u8]) -> Result<usize, ()> {
+	pub fn bytes_write(&mut self, inode: INodeNo, offset: usize, data: &[u8]) -> Result<usize, PagerBytesError> {
 		debug_assert_ne!(inode.0, 0, "byte page owner inode must be nonzero");
 
 		if data.is_empty() {
 			return Ok(0);
 		}
 
-		let end = offset.checked_add(data.len()).ok_or(())?;
+		let end = offset.checked_add(data.len()).ok_or(PagerBytesError::LengthOverflow)?;
 		let new_len = self.bytes_len(inode).max(end);
 		self.bytes_resize(inode, new_len)?;
 
-		let page_indices = self.bytes.get(&inode).cloned().ok_or(())?;
+		let page_indices = self
+			.bytes
+			.get(&inode)
+			.cloned()
+			.ok_or(PagerBytesError::MissingPageList { ino: inode })?;
 		let mut data_cursor = 0usize;
 		let mut write_cursor = offset;
 		while data_cursor < data.len() {
 			let page_no = write_cursor / DATA_PAGE_CAPACITY;
 			let in_page = write_cursor % DATA_PAGE_CAPACITY;
 			let take = (data.len() - data_cursor).min(DATA_PAGE_CAPACITY - in_page);
-			let page_index = page_indices.get(page_no).ok_or(())?;
-			let page = self.bytes_pages.get_mut(page_index.0).ok_or(())?;
+			let page_index = page_indices
+				.get(page_no)
+				.ok_or(PagerBytesError::MissingPagePointer { ino: inode, page_no })?;
+			let page = self
+				.bytes_pages
+				.get_mut(page_index.0)
+				.ok_or(PagerBytesError::MissingPage { index: page_index.0 })?;
 			debug_assert_eq!(page.inode, inode);
 			page.data[in_page..in_page + take].copy_from_slice(&data[data_cursor..data_cursor + take]);
 			data_cursor += take;
@@ -841,7 +830,7 @@ impl Pager {
 	}
 
 	/// Caller contract: `inode` must be nonzero.
-	pub fn bytes_truncate(&mut self, inode: INodeNo, new_len: usize) -> Result<(), ()> {
+	pub fn bytes_truncate(&mut self, inode: INodeNo, new_len: usize) -> Result<(), PagerBytesError> {
 		debug_assert_ne!(inode.0, 0, "byte page owner inode must be nonzero");
 
 		self.bytes_resize(inode, new_len)
@@ -856,7 +845,7 @@ impl Pager {
 		}
 	}
 
-	fn bytes_resize(&mut self, inode: INodeNo, new_len: usize) -> Result<(), ()> {
+	fn bytes_resize(&mut self, inode: INodeNo, new_len: usize) -> Result<(), PagerBytesError> {
 		let old_len = self.bytes_len(inode);
 		let current_pages = self.bytes.get(&inode).map_or(0, Vec::len);
 		let required_pages = if new_len == 0 {
@@ -871,12 +860,12 @@ impl Pager {
 			for _ in 0..allocate {
 				match self.allocate_bytes_page(inode) {
 					Ok(new_index) => allocated.push(new_index),
-					Err(()) => {
+					Err(err) => {
 						// Keep resize atomic: return all newly allocated pages on failure.
 						for page_index in allocated {
 							self.release_bytes_page(page_index);
 						}
-						return Err(());
+						return Err(err);
 					}
 				}
 			}
@@ -907,7 +896,10 @@ impl Pager {
 
 		if let Some(page_indices) = self.bytes.get(&inode).cloned() {
 			for (page_no, page_index) in page_indices.iter().enumerate() {
-				let page = self.bytes_pages.get_mut(page_index.0).ok_or(())?;
+				let page = self
+					.bytes_pages
+					.get_mut(page_index.0)
+					.ok_or(PagerBytesError::MissingPage { index: page_index.0 })?;
 				debug_assert_eq!(page.inode, inode);
 				let start = page_no * DATA_PAGE_CAPACITY;
 				let desired = if start >= new_len {
@@ -921,9 +913,12 @@ impl Pager {
 		Ok(())
 	}
 
-	fn allocate_bytes_page(&mut self, inode: INodeNo) -> Result<DataBytesIndex, ()> {
+	fn allocate_bytes_page(&mut self, inode: INodeNo) -> Result<DataBytesIndex, PagerBytesError> {
 		if let Some(page_index) = self.free_bytes_pages.pop() {
-			let page = self.bytes_pages.get_mut(page_index.0).ok_or(())?;
+			let page = self
+				.bytes_pages
+				.get_mut(page_index.0)
+				.ok_or(PagerBytesError::MissingPage { index: page_index.0 })?;
 			page.inode = inode;
 			page.length = 0;
 			page.data.fill(0);
@@ -931,7 +926,7 @@ impl Pager {
 		}
 
 		if self.page_count() >= self.max_pages {
-			return Err(());
+			return Err(PagerBytesError::PageLimitExceeded);
 		}
 
 		let page_id = self.alloc_page_id();
@@ -973,6 +968,23 @@ impl Pager {
 			}
 			cursor += clear;
 		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn test_corrupt_dir_entry_slot_length(&mut self, inode: INodeNo, name: &OsStr, length: u32) -> bool {
+		let Some(page_indices) = self.dir_entries.get(&inode) else {
+			return false;
+		};
+		for page_index in page_indices.iter().rev() {
+			let Some(page) = self.dir_entries_pages.get_mut(page_index.0) else {
+				return false;
+			};
+			if let Some((slot, _)) = page.indices.get(name) {
+				page.entries.test_set_slot_length(*slot, length);
+				return true;
+			}
+		}
+		false
 	}
 
 	/// Encode an inodes page, format:
@@ -1421,7 +1433,7 @@ mod tests {
 			.expect("replace should succeed");
 		assert_eq!(pager.dir_entries_get(parent, &name), Some(INodeNo(12)));
 
-		let removed = pager.dir_entries_remove(parent, &name);
+		let removed = pager.dir_entries_remove(parent, &name).expect("remove should succeed");
 		assert_eq!(removed, Some(INodeNo(12)));
 		assert_eq!(pager.dir_entries_get(parent, &name), None);
 		assert!(!pager.dir_entries_exists(parent));
@@ -1457,9 +1469,13 @@ mod tests {
 		for i in 0..1000u64 {
 			let mut name = OsString::from_vec(vec![b'z'; 128]);
 			name.push(i.to_string());
-			if pager.dir_entries_insert(parent, name, INodeNo(31 + i)).is_err() {
-				hit_limit = true;
-				break;
+			match pager.dir_entries_insert(parent, name, INodeNo(31 + i)) {
+				Ok(()) => {}
+				Err(PagerDirEntryError::PageLimitExceeded) => {
+					hit_limit = true;
+					break;
+				}
+				Err(err) => panic!("unexpected directory insert error: {err}"),
 			}
 		}
 		assert!(hit_limit, "directory inserts should eventually exhaust a single page");
@@ -1555,8 +1571,20 @@ mod tests {
 		let mut pager = Pager::new(1);
 		let ino = INodeNo(46);
 		let data = vec![0x55; DATA_PAGE_CAPACITY + 1];
-		assert!(pager.bytes_write(ino, 0, &data).is_err());
+		assert!(matches!(
+			pager.bytes_write(ino, 0, &data),
+			Err(PagerBytesError::PageLimitExceeded)
+		));
 		pager.check_invariants();
+	}
+
+	#[test]
+	fn bytes_write_reports_length_overflow() {
+		let mut pager = Pager::new(8);
+		let err = pager
+			.bytes_write(INodeNo(46), usize::MAX, &[0x55])
+			.expect_err("offset overflow should fail");
+		assert_eq!(err, PagerBytesError::LengthOverflow);
 	}
 
 	#[test]
@@ -1570,7 +1598,10 @@ mod tests {
 			.bytes_write(a, 0, &one_page)
 			.expect("first inode should consume one page");
 		assert!(
-			pager.bytes_write(b, 0, &vec![0xBB; DATA_PAGE_CAPACITY + 1]).is_err(),
+			matches!(
+				pager.bytes_write(b, 0, &vec![0xBB; DATA_PAGE_CAPACITY + 1]),
+				Err(PagerBytesError::PageLimitExceeded)
+			),
 			"second inode write should fail after partial growth attempt"
 		);
 
@@ -1609,9 +1640,13 @@ mod tests {
 		for i in 0..1000u64 {
 			let mut name = OsString::from_vec(vec![b'c'; 128]);
 			name.push(i.to_string());
-			if pager.dir_entries_insert(inode, name, INodeNo(1000 + i)).is_err() {
-				exhausted = true;
-				break;
+			match pager.dir_entries_insert(inode, name, INodeNo(1000 + i)) {
+				Ok(()) => {}
+				Err(PagerDirEntryError::PageLimitExceeded) => {
+					exhausted = true;
+					break;
+				}
+				Err(err) => panic!("unexpected directory insert error: {err}"),
 			}
 		}
 		assert!(exhausted, "single directory page should eventually fill");
@@ -1662,10 +1697,10 @@ mod tests {
 			{
 				continue;
 			}
-			if candidate_pager
-				.dir_entries_insert(inode, candidate.clone(), INodeNo(u64::MAX))
-				.is_err()
-			{
+			if matches!(
+				candidate_pager.dir_entries_insert(inode, candidate.clone(), INodeNo(u64::MAX)),
+				Err(PagerDirEntryError::EntryTooLarge)
+			) {
 				pager = candidate_pager;
 				target = candidate;
 				found_failure_case = true;
@@ -1678,9 +1713,10 @@ mod tests {
 		);
 
 		assert!(
-			pager
-				.dir_entries_insert(inode, target.clone(), INodeNo(u64::MAX))
-				.is_err(),
+			matches!(
+				pager.dir_entries_insert(inode, target.clone(), INodeNo(u64::MAX)),
+				Err(PagerDirEntryError::EntryTooLarge)
+			),
 			"replacing with larger varint should fail gracefully on full page"
 		);
 		assert_eq!(pager.dir_entries_get(inode, target.as_os_str()), Some(original_child));
@@ -1693,7 +1729,10 @@ mod tests {
 		let inode = INodeNo(62);
 		let too_large_name = OsString::from_vec(vec![b'q'; DIRENTRIES_CAPACITY]);
 
-		assert!(pager.dir_entries_insert(inode, too_large_name, INodeNo(1)).is_err());
+		assert!(matches!(
+			pager.dir_entries_insert(inode, too_large_name, INodeNo(1)),
+			Err(PagerDirEntryError::EntryTooLarge)
+		));
 		assert!(
 			pager
 				.dir_entries_insert(inode, OsString::from("ok"), INodeNo(2))
@@ -1719,10 +1758,29 @@ mod tests {
 			pager
 				.dir_entries_insert(inode, name.clone(), INodeNo(1_000 + i))
 				.expect("insert/remove churn should not exhaust a single page");
-			let removed = pager.dir_entries_remove(inode, name.as_os_str());
+			let removed = pager
+				.dir_entries_remove(inode, name.as_os_str())
+				.expect("remove should succeed");
 			assert_eq!(removed, Some(INodeNo(1_000 + i)));
 		}
 		pager.check_invariants();
+	}
+
+	#[test]
+	fn dir_entries_remove_reports_missing_page() {
+		let mut pager = Pager::new(4);
+		let inode = INodeNo(65);
+		let name = OsString::from("dangling");
+		pager
+			.dir_entries_insert(inode, name.clone(), INodeNo(66))
+			.expect("insert should succeed");
+
+		pager.dir_entries_pages.clear();
+
+		let err = pager
+			.dir_entries_remove(inode, name.as_os_str())
+			.expect_err("missing backing page should be reported");
+		assert!(matches!(err, PagerDirEntryError::MissingPage { index: 0 }));
 	}
 
 	#[test]
@@ -1812,7 +1870,9 @@ mod tests {
 			.dir_entries_insert(first_inode, OsString::from("tmp"), second_inode)
 			.expect("first insert should allocate a dir entries page");
 		assert_eq!(
-			pager.dir_entries_remove(first_inode, OsStr::new("tmp")),
+			pager
+				.dir_entries_remove(first_inode, OsStr::new("tmp"))
+				.expect("remove should succeed"),
 			Some(second_inode)
 		);
 		assert_eq!(pager.dir_entries_get_dir(first_inode), None);

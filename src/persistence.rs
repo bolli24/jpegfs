@@ -1,6 +1,7 @@
 use crate::filesystem::BLOCK_SIZE;
 use crate::jpeg_file::{JpegFileError, JpegFileHandle};
-use crate::pager::{DecodedPages, PageId, Pager, PagerCodecError};
+use crate::pager::{DecodedPages, PageId, Pager};
+use crate::pager_error::PagerCodecError;
 use crc::Crc;
 use std::collections::HashMap;
 use std::mem::size_of;

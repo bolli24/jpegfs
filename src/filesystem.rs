@@ -1144,8 +1144,8 @@ impl FileSystemState {
 }
 
 impl Filesystem for FileSystem {
-	fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
-		info!("init()");
+	fn init(&mut self, req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
+		info!("init(pid={})", req.pid());
 		Ok(())
 	}
 
@@ -1154,8 +1154,8 @@ impl Filesystem for FileSystem {
 	}
 
 	// Get file in directory by name
-	fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-		info!("lookup(parent={parent:?}, name={name:?})");
+	fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+		info!("lookup(pid={}, parent={parent:?}, name={name:?})", req.pid());
 		let state = self.state.read();
 		let file = match state.lookup_child_ino(parent, name) {
 			Ok(file) => file,
@@ -1179,12 +1179,12 @@ impl Filesystem for FileSystem {
 		reply.entry(&FUSE_TTL, &Inode::to_file_attr(file, inode), Generation(0));
 	}
 
-	fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-		info!("forget(ino={ino:?}, nlookup={nlookup})");
+	fn forget(&self, req: &Request, ino: INodeNo, nlookup: u64) {
+		info!("forget(pid={}, ino={ino:?}, nlookup={nlookup})", req.pid());
 	}
 
-	fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-		info!("getattr(ino={ino:?})");
+	fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+		info!("getattr(pid={}, ino={ino:?})", req.pid());
 		let state = self.state.read();
 		match state.inode_or_enoent(ino) {
 			Ok(inode) => reply.attr(&FUSE_TTL, &Inode::to_file_attr(ino, inode)),
@@ -1194,7 +1194,7 @@ impl Filesystem for FileSystem {
 
 	fn setattr(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		mode: Option<u32>,
 		uid: Option<u32>,
@@ -1210,7 +1210,7 @@ impl Filesystem for FileSystem {
 		_flags: Option<BsdFileFlags>,
 		reply: ReplyAttr,
 	) {
-		info!("setattr(ino={ino:?})");
+		info!("setattr(pid={}, ino={ino:?})", req.pid());
 		let now = SystemTime::now();
 		let mut state = self.state.write();
 		let max_file_size = state.max_file_size;
@@ -1302,23 +1302,14 @@ impl Filesystem for FileSystem {
 		reply.attr(&FUSE_TTL, &Inode::to_file_attr(ino, inode));
 	}
 
-	fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-		info!("readlink(ino={ino:?})");
+	fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
+		info!("readlink(pid={}, ino={ino:?})", req.pid());
 		warn!("[Not Implemented] readlink(ino: {ino:#x?})");
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn mknod(
-		&self,
-		_req: &Request,
-		parent: INodeNo,
-		name: &OsStr,
-		mode: u32,
-		umask: u32,
-		rdev: u32,
-		reply: ReplyEntry,
-	) {
-		info!("mknod(parent={parent:?}, name={name:?})");
+	fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, rdev: u32, reply: ReplyEntry) {
+		info!("mknod(pid={}, parent={parent:?}, name={name:?})", req.pid());
 		warn!(
 			"[Not Implemented] mknod(parent: {parent:#x?}, name: {name:?}, \
             mode: {mode}, umask: {umask:#x?}, rdev: {rdev})"
@@ -1327,7 +1318,10 @@ impl Filesystem for FileSystem {
 	}
 
 	fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
-		info!("mkdir(parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})");
+		info!(
+			"mkdir(pid={}, parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})",
+			req.pid()
+		);
 		let mut state = self.state.write();
 		match state.op_mkdir(parent, name, mode, umask, req.uid(), req.gid()) {
 			Ok((ino, inode)) => reply.entry(&FUSE_TTL, &Inode::to_file_attr(ino, &inode), Generation(0)),
@@ -1335,8 +1329,8 @@ impl Filesystem for FileSystem {
 		}
 	}
 
-	fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-		info!("unlink(parent={parent:?}, name={name:?})");
+	fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+		info!("unlink(pid={}, parent={parent:?}, name={name:?})", req.pid());
 		let mut state = self.state.write();
 		match state.op_unlink(parent, name) {
 			Ok(()) => reply.ok(),
@@ -1344,8 +1338,8 @@ impl Filesystem for FileSystem {
 		}
 	}
 
-	fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-		info!("rmdir(parent={parent:?}, name={name:?})");
+	fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+		info!("rmdir(pid={}, parent={parent:?}, name={name:?})", req.pid());
 		let mut state = self.state.write();
 		match state.op_rmdir(parent, name) {
 			Ok(()) => reply.ok(),
@@ -1353,15 +1347,18 @@ impl Filesystem for FileSystem {
 		}
 	}
 
-	fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
-		info!("symlink(parent={parent:?}, link_name={link_name:?}, target={target:?})");
+	fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+		info!(
+			"symlink(pid={}, parent={parent:?}, link_name={link_name:?}, target={target:?})",
+			req.pid()
+		);
 		warn!("[Not Implemented] symlink(parent: {parent:#x?}, link_name: {link_name:?}, target: {target:?})",);
 		reply.error(Errno::EPERM);
 	}
 
 	fn rename(
 		&self,
-		_req: &Request,
+		req: &Request,
 		parent: INodeNo,
 		name: &OsStr,
 		newparent: INodeNo,
@@ -1370,7 +1367,8 @@ impl Filesystem for FileSystem {
 		reply: ReplyEmpty,
 	) {
 		info!(
-			"rename(parent={parent:?}, name={name:?}, newparent={newparent:?}, newname={newname:?}, flags={flags:?})"
+			"rename(pid={}, parent={parent:?}, name={name:?}, newparent={newparent:?}, newname={newname:?}, flags={flags:?})",
+			req.pid()
 		);
 		let mut state = self.state.write();
 		match state.op_rename(parent, name, newparent, newname, flags) {
@@ -1379,14 +1377,17 @@ impl Filesystem for FileSystem {
 		}
 	}
 
-	fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
-		info!("link(ino={ino:?}, newparent={newparent:?}, newname={newname:?})");
+	fn link(&self, req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+		info!(
+			"link(pid={}, ino={ino:?}, newparent={newparent:?}, newname={newname:?})",
+			req.pid()
+		);
 		warn!("[Not Implemented] link(ino: {ino:#x?}, newparent: {newparent:#x?}, newname: {newname:?})");
 		reply.error(Errno::EPERM);
 	}
 
-	fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-		info!("open(ino={ino:?})");
+	fn open(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+		info!("open(pid={}, ino={ino:?})", req.pid());
 		let mut state = self.state.write();
 		match state.op_open(ino) {
 			Ok(file_handle) => reply.opened(file_handle, FopenFlags::empty()),
@@ -1396,7 +1397,7 @@ impl Filesystem for FileSystem {
 
 	fn read(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		fh: FileHandle,
 		offset: u64,
@@ -1405,7 +1406,10 @@ impl Filesystem for FileSystem {
 		_lock_owner: Option<LockOwner>,
 		reply: ReplyData,
 	) {
-		info!("read(ino={ino:?}, fh={fh}, offset={offset}, size={size})");
+		info!(
+			"read(pid={}, ino={ino:?}, fh={fh}, offset={offset}, size={size})",
+			req.pid()
+		);
 		let mut state = self.state.write();
 		match state.op_read(ino, fh, offset, size) {
 			Ok(out) => reply.data(&out),
@@ -1415,7 +1419,7 @@ impl Filesystem for FileSystem {
 
 	fn write(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		fh: FileHandle,
 		offset: u64,
@@ -1425,7 +1429,11 @@ impl Filesystem for FileSystem {
 		_lock_owner: Option<LockOwner>,
 		reply: ReplyWrite,
 	) {
-		info!("write(ino={ino:?}, fh={fh}, offset={offset}, data_len={})", data.len());
+		info!(
+			"write(pid={}, ino={ino:?}, fh={fh}, offset={offset}, data_len={})",
+			req.pid(),
+			data.len()
+		);
 		let mut state = self.state.write();
 		match state.op_write(ino, fh, offset, data) {
 			Ok(written) => reply.written(written),
@@ -1433,14 +1441,17 @@ impl Filesystem for FileSystem {
 		}
 	}
 
-	fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
-		info!("flush(ino={ino:?}, fh={fh}, lock_owner={lock_owner:?})");
+	fn flush(&self, req: &Request, ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
+		info!(
+			"flush(pid={}, ino={ino:?}, fh={fh}, lock_owner={lock_owner:?})",
+			req.pid()
+		);
 		reply.ok();
 	}
 
 	fn release(
 		&self,
-		_req: &Request,
+		req: &Request,
 		_ino: INodeNo,
 		fh: FileHandle,
 		_flags: OpenFlags,
@@ -1448,19 +1459,19 @@ impl Filesystem for FileSystem {
 		_flush: bool,
 		reply: ReplyEmpty,
 	) {
-		info!("release(fh={fh})");
+		info!("release(pid={}, fh={fh})", req.pid());
 		let mut state = self.state.write();
 		state.op_release(fh);
 		reply.ok();
 	}
 
-	fn fsync(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
-		info!("fsync(ino={ino:?}, fh={fh}, datasync={datasync})");
+	fn fsync(&self, req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+		info!("fsync(pid={}, ino={ino:?}, fh={fh}, datasync={datasync})", req.pid());
 		reply.ok();
 	}
 
-	fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-		info!("opendir(ino={ino:?})");
+	fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+		info!("opendir(pid={}, ino={ino:?})", req.pid());
 		let state = self.state.read();
 
 		let Some(inode) = state.pager.inode_get(ino) else {
@@ -1473,8 +1484,8 @@ impl Filesystem for FileSystem {
 		reply.opened(FileHandle(0), FopenFlags::empty());
 	}
 
-	fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-		info!("readdir(ino={ino:?}, offset={offset})");
+	fn readdir(&self, req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+		info!("readdir(pid={}, ino={ino:?}, offset={offset})", req.pid());
 		let state = self.state.read();
 		match state.op_readdir(ino, offset) {
 			Ok(entries) => {
@@ -1489,24 +1500,24 @@ impl Filesystem for FileSystem {
 		}
 	}
 
-	fn readdirplus(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
-		info!("readdirplus(ino={ino:?}, fh={fh}, offset={offset})");
+	fn readdirplus(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, reply: ReplyDirectoryPlus) {
+		info!("readdirplus(pid={}, ino={ino:?}, fh={fh}, offset={offset})", req.pid());
 		warn!("[Not Implemented] readdirplus(ino: {ino:#x?}, fh: {fh}, offset: {offset})");
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn releasedir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
-		info!("releasedir()");
+	fn releasedir(&self, req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, reply: ReplyEmpty) {
+		info!("releasedir(pid={})", req.pid());
 		reply.ok();
 	}
 
-	fn fsyncdir(&self, _req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
-		info!("fsyncdir(ino={ino:?}, fh={fh}, datasync={datasync})");
+	fn fsyncdir(&self, req: &Request, ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+		info!("fsyncdir(pid={}, ino={ino:?}, fh={fh}, datasync={datasync})", req.pid());
 		reply.ok();
 	}
 
-	fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-		info!("statfs()");
+	fn statfs(&self, req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+		info!("statfs(pid={})", req.pid());
 		let state = self.state.read();
 		let statfs = FileSystem::statfs_data(&state);
 		reply.statfs(
@@ -1523,7 +1534,7 @@ impl Filesystem for FileSystem {
 
 	fn setxattr(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		name: &OsStr,
 		_value: &[u8],
@@ -1531,7 +1542,10 @@ impl Filesystem for FileSystem {
 		position: u32,
 		reply: ReplyEmpty,
 	) {
-		info!("setxattr(ino={ino:?}, name={name:?}, flags={flags:#x}, position={position})");
+		info!(
+			"setxattr(pid={}, ino={ino:?}, name={name:?}, flags={flags:#x}, position={position})",
+			req.pid()
+		);
 		warn!(
 			"[Not Implemented] setxattr(ino: {ino:#x?}, name: {name:?}, \
             flags: {flags:#x?}, position: {position})"
@@ -1539,26 +1553,26 @@ impl Filesystem for FileSystem {
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-		info!("getxattr(ino={ino:?}, name={name:?}, size={size})");
+	fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+		info!("getxattr(pid={}, ino={ino:?}, name={name:?}, size={size})", req.pid());
 		warn!("[Not Implemented] getxattr(ino: {ino:#x?}, name: {name:?}, size: {size})");
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-		info!("listxattr(ino={ino:?}, size={size})");
+	fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+		info!("listxattr(pid={}, ino={ino:?}, size={size})", req.pid());
 		warn!("[Not Implemented] listxattr(ino: {ino:#x?}, size: {size})");
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-		info!("removexattr(ino={ino:?}, name={name:?})");
+	fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+		info!("removexattr(pid={}, ino={ino:?}, name={name:?})", req.pid());
 		warn!("[Not Implemented] removexattr(ino: {ino:#x?}, name: {name:?})");
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-		info!("access(ino={ino:?}, mask={mask:?})");
+	fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
+		info!("access(pid={}, ino={ino:?}, mask={mask:?})", req.pid());
 		let state = self.state.read();
 		match state.op_access(ino, mask) {
 			Ok(()) => reply.ok(),
@@ -1576,7 +1590,10 @@ impl Filesystem for FileSystem {
 		_flags: i32,
 		reply: ReplyCreate,
 	) {
-		info!("create(parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})");
+		info!(
+			"create(pid={}, parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})",
+			req.pid()
+		);
 		let mut state = self.state.write();
 		match state.op_create(parent, name, mode, umask, req.uid(), req.gid()) {
 			Ok((ino, new_inode, file_handle)) => reply.created(
@@ -1592,7 +1609,7 @@ impl Filesystem for FileSystem {
 
 	fn getlk(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		fh: FileHandle,
 		lock_owner: LockOwner,
@@ -1602,7 +1619,10 @@ impl Filesystem for FileSystem {
 		pid: u32,
 		reply: ReplyLock,
 	) {
-		info!("getlk(ino={ino:?}, fh={fh}, lock_owner={lock_owner:?}, start={start}, end={end}, typ={typ}, pid={pid})");
+		info!(
+			"getlk(pid={}, ino={ino:?}, fh={fh}, lock_owner={lock_owner:?}, start={start}, end={end}, typ={typ}, pid={pid})",
+			req.pid()
+		);
 		warn!(
 			"[Not Implemented] getlk(ino: {ino:#x?}, fh: {fh}, lock_owner: {lock_owner}, \
             start: {start}, end: {end}, typ: {typ}, pid: {pid})"
@@ -1612,7 +1632,7 @@ impl Filesystem for FileSystem {
 
 	fn setlk(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		fh: FileHandle,
 		lock_owner: LockOwner,
@@ -1624,7 +1644,8 @@ impl Filesystem for FileSystem {
 		reply: ReplyEmpty,
 	) {
 		info!(
-			"setlk(ino={ino:?}, fh={fh}, lock_owner={lock_owner:?}, start={start}, end={end}, typ={typ}, pid={pid}, sleep={sleep})"
+			"setlk(pid={}, ino={ino:?}, fh={fh}, lock_owner={lock_owner:?}, start={start}, end={end}, typ={typ}, pid={pid}, sleep={sleep})",
+			req.pid()
 		);
 		warn!(
 			"[Not Implemented] setlk(ino: {ino:#x?}, fh: {fh}, lock_owner: {lock_owner}, \
@@ -1633,15 +1654,15 @@ impl Filesystem for FileSystem {
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn bmap(&self, _req: &Request, ino: INodeNo, blocksize: u32, idx: u64, reply: ReplyBmap) {
-		info!("bmap(ino={ino:?}, blocksize={blocksize}, idx={idx})");
+	fn bmap(&self, req: &Request, ino: INodeNo, blocksize: u32, idx: u64, reply: ReplyBmap) {
+		info!("bmap(pid={}, ino={ino:?}, blocksize={blocksize}, idx={idx})", req.pid());
 		warn!("[Not Implemented] bmap(ino: {ino:#x?}, blocksize: {blocksize}, idx: {idx})",);
 		reply.error(Errno::ENOSYS);
 	}
 
 	fn ioctl(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		fh: FileHandle,
 		flags: IoctlFlags,
@@ -1651,7 +1672,8 @@ impl Filesystem for FileSystem {
 		reply: ReplyIoctl,
 	) {
 		info!(
-			"ioctl(ino={ino:?}, fh={fh}, flags={flags:?}, cmd={cmd}, in_data_len={}, out_size={out_size})",
+			"ioctl(pid={}, ino={ino:?}, fh={fh}, flags={flags:?}, cmd={cmd}, in_data_len={}, out_size={out_size})",
+			req.pid(),
 			in_data.len()
 		);
 		warn!(
@@ -1664,7 +1686,7 @@ impl Filesystem for FileSystem {
 
 	fn poll(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		fh: FileHandle,
 		ph: PollNotifier,
@@ -1672,7 +1694,10 @@ impl Filesystem for FileSystem {
 		flags: PollFlags,
 		reply: ReplyPoll,
 	) {
-		info!("poll(ino={ino:?}, fh={fh}, ph={ph:?}, events={events:?}, flags={flags:?})");
+		info!(
+			"poll(pid={}, ino={ino:?}, fh={fh}, ph={ph:?}, events={events:?}, flags={flags:?})",
+			req.pid()
+		);
 		warn!(
 			"[Not Implemented] poll(ino: {ino:#x?}, fh: {fh}, \
             ph: {ph:?}, events: {events}, flags: {flags})"
@@ -1682,7 +1707,7 @@ impl Filesystem for FileSystem {
 
 	fn fallocate(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino: INodeNo,
 		fh: FileHandle,
 		offset: u64,
@@ -1690,7 +1715,10 @@ impl Filesystem for FileSystem {
 		mode: i32,
 		reply: ReplyEmpty,
 	) {
-		info!("fallocate(ino={ino:?}, fh={fh}, offset={offset}, length={length}, mode={mode})");
+		info!(
+			"fallocate(pid={}, ino={ino:?}, fh={fh}, offset={offset}, length={length}, mode={mode})",
+			req.pid()
+		);
 		warn!(
 			"[Not Implemented] fallocate(ino: {ino:#x?}, fh: {fh}, \
             offset: {offset}, length: {length}, mode: {mode})"
@@ -1698,8 +1726,11 @@ impl Filesystem for FileSystem {
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn lseek(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: i64, whence: i32, reply: ReplyLseek) {
-		info!("lseek(ino={ino:?}, fh={fh}, offset={offset}, whence={whence})");
+	fn lseek(&self, req: &Request, ino: INodeNo, fh: FileHandle, offset: i64, whence: i32, reply: ReplyLseek) {
+		info!(
+			"lseek(pid={}, ino={ino:?}, fh={fh}, offset={offset}, whence={whence})",
+			req.pid()
+		);
 		warn!(
 			"[Not Implemented] lseek(ino: {ino:#x?}, fh: {fh}, \
             offset: {offset}, whence: {whence})"
@@ -1709,7 +1740,7 @@ impl Filesystem for FileSystem {
 
 	fn copy_file_range(
 		&self,
-		_req: &Request,
+		req: &Request,
 		ino_in: INodeNo,
 		fh_in: FileHandle,
 		offset_in: u64,
@@ -1721,7 +1752,8 @@ impl Filesystem for FileSystem {
 		reply: ReplyWrite,
 	) {
 		info!(
-			"copy_file_range(ino_in={ino_in:?}, fh_in={fh_in}, offset_in={offset_in}, ino_out={ino_out:?}, fh_out={fh_out}, offset_out={offset_out}, len={len}, flags={flags:?})"
+			"copy_file_range(pid={}, ino_in={ino_in:?}, fh_in={fh_in}, offset_in={offset_in}, ino_out={ino_out:?}, fh_out={fh_out}, offset_out={offset_out}, len={len}, flags={flags:?})",
+			req.pid()
 		);
 		warn!(
 			"[Not Implemented] copy_file_range(ino_in: {ino_in:#x?}, fh_in: {fh_in}, \

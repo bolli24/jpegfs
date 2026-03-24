@@ -156,7 +156,7 @@ fuzz_target!(|program: Program| {
 							assert_eq!(inode_model.len(), before_len);
 						}
 					}
-					Err(()) => {
+					Err(_) => {
 						assert!(!existed);
 						assert_eq!(inode_model.len(), before_len);
 					}
@@ -218,7 +218,9 @@ fuzz_target!(|program: Program| {
 					continue;
 				}
 				let name = as_name(&name);
-				let got = pager.dir_entries_remove(ino, name.as_os_str());
+				let got = pager
+					.dir_entries_remove(ino, name.as_os_str())
+					.expect("directory removal should succeed for a consistent pager");
 				let expected = dir_model
 					.get_mut(&ino)
 					.and_then(|entries| entries.remove(name.as_os_str()));

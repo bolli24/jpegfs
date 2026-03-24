@@ -205,21 +205,14 @@ fuzz_target!(|program: Program| {
 				new_name,
 				flags,
 			} => {
-				if let (Some(parent), Some(newparent)) =
-					(pick(&inodes, *parent_slot), pick(&inodes, *new_parent_slot))
+				if let (Some(parent), Some(newparent)) = (pick(&inodes, *parent_slot), pick(&inodes, *new_parent_slot))
 				{
 					let rename_flags = if (flags & 1) == 0 {
 						fuser::RenameFlags::empty()
 					} else {
 						fuser::RenameFlags::RENAME_NOREPLACE
 					};
-					let _ = state.op_rename(
-						parent,
-						&fuzz_name(name),
-						newparent,
-						&fuzz_name(new_name),
-						rename_flags,
-					);
+					let _ = state.op_rename(parent, &fuzz_name(name), newparent, &fuzz_name(new_name), rename_flags);
 				}
 			}
 			Op::Access { inode_slot, mask } => {

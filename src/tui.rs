@@ -21,7 +21,7 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use jpegfs::filesystem::{FileSystem, FsDashboardStats};
+use jpegfs::filesystem::{FileSystem, FsDashboardStats, BLOCK_SIZE};
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
 const OP_RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -312,6 +312,10 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &mut AppState, now: Instant) {
 		Line::from(format!(
 			"Blocks: {} / {} (free: {}, {:.1}%)",
 			app.stats.used_blocks, app.stats.total_blocks, app.stats.free_blocks, used_pct
+		)),
+		Line::from(format!(
+			"{} KiB / {} KiB (free: {} KiB)",
+			app.stats.used_blocks * BLOCK_SIZE / 1024, app.stats.total_blocks * BLOCK_SIZE / 1024, app.stats.free_blocks * BLOCK_SIZE / 1024
 		)),
 		Line::from(format!(
 			"Files: {}    Dirs: {}    Open handles: {}",

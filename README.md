@@ -38,6 +38,12 @@ Available fuzz targets:
 - `store_block_persistence`: fuzzes `StoreBlock<String, 512>` inserts and validates persisted slot metadata and
   round-trips.
 
+Everything but the `owned_jpeg` targets may be run without the address sanitizer for 3-5 times faster iteration:
+
+```bash
+cargo fuzz run --target x86_64-unknown-linux-gnu filesystem_state_machine --sanitizer none
+```
+
 Minimize all copora:
 
 ```bash

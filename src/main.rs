@@ -1,4 +1,5 @@
-use anyhow::{Context, bail};
+use anyhow::Context;
+use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -21,10 +22,31 @@ mod tui;
 /// A filesystem requires at least 2 pages: 1 dir inodes pages, 1 dir entries page
 const MIN_BOOTSTRAP_PAGES: usize = 2;
 
-#[derive(Debug)]
+#[derive(Debug, Eq, Parser, PartialEq)]
+#[command(name = "jpegfs", about = "JPEG-backed steganographic filesystem")]
 struct CliArgs {
-	jpeg_dir: PathBuf,
-	mount_dir: PathBuf,
+	#[command(subcommand)]
+	command: CliCommand,
+}
+
+#[derive(Debug, Eq, PartialEq, Subcommand)]
+enum CliCommand {
+	#[command(
+		about = "Mount the filesystem",
+		long_about = "Mount the filesystem and open the TUI. If the mount directory does not exist, \
+		jpegfs creates it and removes it again on shutdown. Pre-existing mount directories are left in place."
+	)]
+	Mount {
+		#[arg(help = "Directory containing JPEG storage files")]
+		jpeg_dir: PathBuf,
+		#[arg(help = "Mount point for the filesystem; created if missing")]
+		mount_dir: PathBuf,
+	},
+	#[command(about = "Print filesystem statistics")]
+	Stat {
+		#[arg(help = "Directory containing JPEG storage files")]
+		jpeg_dir: PathBuf,
+	},
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -84,10 +106,17 @@ fn main() -> anyhow::Result<()> {
 	tui::init_tui_logger(log_tx).context("failed to initialize tui logger")?;
 
 	let cli_args = parse_cli_args()?;
-	let CliArgs { jpeg_dir, mount_dir } = cli_args;
+	let jpeg_dir = match &cli_args.command {
+		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
+	};
 	let jpeg_paths = discover_jpeg_paths(&jpeg_dir)?;
-	let jpeg_threads = configured_jpeg_threads(jpeg_paths.len())?;
+	let jpeg_threads = configured_jpeg_threads();
 	info!(
+		"JPEG worker threads configured: {} (stores: {})",
+		jpeg_threads,
+		jpeg_paths.len()
+	);
+	println!(
 		"JPEG worker threads configured: {} (stores: {})",
 		jpeg_threads,
 		jpeg_paths.len()
@@ -95,6 +124,21 @@ fn main() -> anyhow::Result<()> {
 
 	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(&jpeg_paths)?;
 	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
+
+	let mount_dir = match cli_args.command {
+		CliCommand::Mount { mount_dir, .. } => mount_dir,
+		CliCommand::Stat { .. } => {
+			let stats = {
+				let state = fs.state.read();
+				state.dashboard_stats()
+			};
+			println!();
+			for line in stats.format(false) {
+				println!("{line}");
+			}
+			return Ok(());
+		}
+	};
 	let mut persistence = PersistOnDrop::new(fs, stores, total_page_capacity);
 
 	let mut config = FuseConfig::default();
@@ -128,27 +172,19 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
-	let mut args = std::env::args_os().into_iter();
-	let program = args.next().unwrap_or_default();
-	let Some(jpeg_dir) = args.next() else {
-		bail!("usage: {} <jpeg_dir> <mount_dir>", Path::new(&program).display());
+	validate_cli_args(CliArgs::parse())
+}
+
+fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
+	let jpeg_dir = match &cli_args.command {
+		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
 	};
-	let Some(mount_dir) = args.next() else {
-		bail!("usage: {} <jpeg_dir> <mount_dir>", Path::new(&program).display());
-	};
-	if args.next().is_some() {
-		bail!("usage: {} <jpeg_dir> <mount_dir>", Path::new(&program).display());
-	}
-	let jpeg_dir = PathBuf::from(jpeg_dir);
 	anyhow::ensure!(
 		jpeg_dir.is_dir(),
 		"jpeg directory does not exist or is not a directory: {}",
 		jpeg_dir.display()
 	);
-	Ok(CliArgs {
-		jpeg_dir,
-		mount_dir: PathBuf::from(mount_dir),
-	})
+	Ok(cli_args)
 }
 
 fn prepare_mount_dir(mount_dir: &Path) -> anyhow::Result<MountDirState> {
@@ -222,7 +258,7 @@ fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
 fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>, DecodedPages, usize)> {
 	let decode_started_at = Instant::now();
-	let pool = jpeg_thread_pool(paths.len())?;
+	let pool = jpeg_thread_pool()?;
 	let loaded: Vec<anyhow::Result<(usize, JpegBlockStore, DecodedPages, usize)>> = pool.install(|| {
 		paths
 			.par_iter()
@@ -415,7 +451,7 @@ fn persist_filesystem(
 		target_page_ids_per_store[store_index] = Some(desired_page_ids);
 	}
 
-	let pool = jpeg_thread_pool(stores.len())?;
+	let pool = jpeg_thread_pool()?;
 	let persist_results: Vec<anyhow::Result<bool>> = pool.install(|| {
 		stores
 			.par_iter_mut()
@@ -485,39 +521,35 @@ fn assign_new_pages_first_fit(
 	Ok(assigned_new_pages)
 }
 
-fn jpeg_thread_pool(job_count: usize) -> anyhow::Result<ThreadPool> {
-	let threads = configured_jpeg_threads(job_count)?;
+fn jpeg_thread_pool() -> anyhow::Result<ThreadPool> {
+	let threads = configured_jpeg_threads();
 	rayon::ThreadPoolBuilder::new()
 		.num_threads(threads)
 		.build()
 		.context("failed to build JPEG worker thread pool")
 }
 
-fn configured_jpeg_threads(job_count: usize) -> anyhow::Result<usize> {
-	if job_count == 0 {
-		return Ok(1);
-	}
-
+fn configured_jpeg_threads() -> usize {
 	let auto_threads = std::thread::available_parallelism()
 		.map(std::num::NonZeroUsize::get)
 		.unwrap_or(1);
-	let max_threads = auto_threads.max(1).min(job_count);
+	let max_threads = auto_threads.max(1);
 
 	match std::env::var("JPEGFS_JPEG_THREADS") {
 		Ok(raw) => match raw.parse::<usize>() {
-			Ok(parsed) if parsed > 0 => Ok(parsed.min(job_count)),
+			Ok(parsed) if parsed > 0 => parsed,
 			_ => {
 				warn!(
 					"invalid JPEGFS_JPEG_THREADS='{}'; using auto thread count ({})",
 					raw, max_threads
 				);
-				Ok(max_threads)
+				max_threads
 			}
 		},
-		Err(std::env::VarError::NotPresent) => Ok(max_threads),
+		Err(std::env::VarError::NotPresent) => max_threads,
 		Err(err) => {
 			warn!("failed reading JPEGFS_JPEG_THREADS ({err}); using auto thread count ({max_threads})");
-			Ok(max_threads)
+			max_threads
 		}
 	}
 }

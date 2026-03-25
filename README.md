@@ -1,9 +1,24 @@
 # jpegfs - a steganographic file system
 
-Run with `cargo run <jpeg_directory> <mount_directory>`
+Mount a file system from a folder of JPEGs:
+
+```bash
+cargo run -- mount <jpeg_directory> <mount_directory>
+```
 
 If the mount directory does not exist, jpegfs creates it and removes it again on shutdown.
 Pre-existing mount directories are left in place.
+
+Print info about a file system:
+
+```bash
+cargo run -- stat <jpeg_directory>
+```
+
+## Config
+
+By default jpegfs uses all available hardware threads to decode and encode jpeg files in parallel.
+Use `JPEGFS_JPEG_THREADS` environment variable to override.
 
 ## Fuzzing
 

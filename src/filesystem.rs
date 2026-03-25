@@ -18,7 +18,7 @@ use thiserror::Error;
 pub const BLOCK_SIZE: usize = 4096;
 const POSIX_BLOCK: u64 = 512;
 
-pub const MAX_INODES: usize = 4096;
+pub const MAX_INODES: usize = usize::MAX;
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_FILE_SIZE: usize = 4 * 1024 * 1024;
 // Only used to size the default memory-only filesystem page budget.
@@ -72,8 +72,6 @@ pub enum FileSystemInvariantError {
 	UsedBytesOverflow,
 	#[error("used_bytes mismatch: actual={actual} computed={computed}")]
 	UsedBytesMismatch { actual: u64, computed: u64 },
-	#[error("inode count exceeds max_inodes")]
-	InodeCountExceedsMax,
 	#[error("free inode set overlaps live inodes: {ino:?}")]
 	FreeInodeOverlapsLiveInodes { ino: INodeNo },
 	#[error("handle points to missing inode: fh={fh:?}, ino={ino:?}")]
@@ -121,15 +119,12 @@ pub enum FileSystemInitError {
 }
 
 impl FileSystem {
-	fn pager_max_pages(file_bytes_budget: usize, max_inodes: usize) -> usize {
-		file_bytes_budget
-			.div_ceil(BLOCK_SIZE)
-			.saturating_add(max_inodes.saturating_mul(8))
-			.max(1)
+	fn pager_max_pages(file_bytes_budget: usize) -> usize {
+		file_bytes_budget.div_ceil(BLOCK_SIZE).max(1)
 	}
 
 	pub fn new() -> Self {
-		Self::new_with_limits(Self::pager_max_pages(TOTAL_BYTES_LIMIT, MAX_INODES))
+		Self::new_with_limits(Self::pager_max_pages(TOTAL_BYTES_LIMIT))
 			.expect("default file system limits must allow root inode and root directory entries")
 	}
 
@@ -214,14 +209,10 @@ impl FileSystem {
 		})
 	}
 
-	fn alloc_ino_with_count(state: &mut FileSystemState, current_inode_count: usize) -> Option<INodeNo> {
+	fn alloc_ino(state: &mut FileSystemState) -> Option<INodeNo> {
 		if let Some(reused) = state.free_inos.pop() {
 			debug_assert_ne!(reused.0, 0, "free inode pool must never contain inode 0");
 			return Some(reused);
-		}
-
-		if current_inode_count >= state.max_inodes {
-			return None;
 		}
 
 		let new = state.next_ino;
@@ -233,8 +224,7 @@ impl FileSystem {
 
 	pub fn get_next(&self) -> Option<INodeNo> {
 		let mut state = self.state.write();
-		let inode_count = state.pager.inodes_len();
-		Self::alloc_ino_with_count(&mut state, inode_count)
+		Self::alloc_ino(&mut state)
 	}
 
 	fn cleanup_unlinked_inode_if_releasable(state: &mut FileSystemState, ino: INodeNo) {
@@ -261,8 +251,8 @@ impl FileSystem {
 		let blocks = state.pager.max_pages() as u64;
 		let used_blocks = state.pager.block_counts().total() as u64;
 		let bfree = blocks.saturating_sub(used_blocks);
-		let files = state.max_inodes as u64;
-		let ffree = state.max_inodes.saturating_sub(state.pager.inodes_len()) as u64;
+		let files = u64::try_from(state.max_inodes).unwrap_or(u64::MAX);
+		let ffree = u64::try_from(state.max_inodes.saturating_sub(state.pager.inodes_len())).unwrap_or(u64::MAX);
 		let namelen = u32::try_from(state.max_name_len).unwrap_or(u32::MAX);
 
 		StatfsData {
@@ -333,6 +323,40 @@ pub struct FsDashboardStats {
 	pub file_count: usize,
 	pub directory_count: usize,
 	pub open_handles: usize,
+}
+
+impl FsDashboardStats {
+	pub fn format(&self, include_open_handles: bool) -> Vec<String> {
+		let used_pct = if self.total_blocks == 0 {
+			0.0
+		} else {
+			(self.used_blocks as f64 / self.total_blocks as f64) * 100.0
+		};
+
+		let mut lines = vec![
+			format!(
+				"Blocks: {} / {} (free: {}, {:.1}%)",
+				self.used_blocks, self.total_blocks, self.free_blocks, used_pct
+			),
+			format!(
+				"{} KiB / {} KiB (free: {} KiB)",
+				self.used_blocks * BLOCK_SIZE / 1024,
+				self.total_blocks * BLOCK_SIZE / 1024,
+				self.free_blocks * BLOCK_SIZE / 1024
+			),
+			format!("Files: {}    Dirs: {}", self.file_count, self.directory_count),
+			format!(
+				"Page split: inodes={} dir_entries={} data={}",
+				self.inode_blocks, self.dir_entry_blocks, self.data_blocks
+			),
+		];
+
+		if include_open_handles {
+			lines.insert(3, format!("Open handles: {}", self.open_handles));
+		}
+
+		lines
+	}
 }
 
 pub type FsOpResult<T> = Result<T, Errno>;
@@ -588,8 +612,7 @@ impl FileSystemState {
 			return Err(Errno::EEXIST);
 		}
 
-		let inode_count = self.pager.inodes_len();
-		let Some(new_ino) = FileSystem::alloc_ino_with_count(self, inode_count) else {
+		let Some(new_ino) = FileSystem::alloc_ino(self) else {
 			return Err(Errno::ENOSPC);
 		};
 
@@ -792,8 +815,7 @@ impl FileSystemState {
 			return Err(Errno::EEXIST);
 		}
 
-		let inode_count = self.pager.inodes_len();
-		let Some(new_ino) = FileSystem::alloc_ino_with_count(self, inode_count) else {
+		let Some(new_ino) = FileSystem::alloc_ino(self) else {
 			return Err(Errno::ENOSPC);
 		};
 
@@ -1061,10 +1083,6 @@ impl FileSystemState {
 				computed: computed_used_bytes,
 			});
 		}
-		if self.pager.inodes_len() > self.max_inodes {
-			return Err(FileSystemInvariantError::InodeCountExceedsMax);
-		}
-
 		for ino in &self.free_inos {
 			if self.pager.inodes_contains(*ino) {
 				return Err(FileSystemInvariantError::FreeInodeOverlapsLiveInodes { ino: *ino });
@@ -1779,8 +1797,8 @@ mod tests {
 		assert_eq!(statfs.blocks, 8);
 		assert_eq!(statfs.bfree, 8 - counts.total() as u64);
 		assert_eq!(statfs.bavail, statfs.bfree);
-		assert_eq!(statfs.files, MAX_INODES as u64);
-		assert_eq!(statfs.ffree, (MAX_INODES - 1) as u64);
+		assert_eq!(statfs.files, u64::MAX);
+		assert_eq!(statfs.ffree, u64::MAX - 1);
 		assert_eq!(statfs.bsize, BLOCK_SIZE as u32);
 		assert_eq!(statfs.frsize, BLOCK_SIZE as u32);
 		assert_eq!(statfs.namelen, MAX_NAME_LEN as u32);
@@ -1836,15 +1854,15 @@ mod tests {
 			}
 		}
 		state.op_release(fh);
-		state.max_inodes = 0;
+		state.max_inodes = usize::MAX;
 		state.max_name_len = usize::MAX;
 
 		let statfs = FileSystem::statfs_data(&state);
 		assert_eq!(statfs.blocks, 6);
 		assert_eq!(statfs.bfree, 0);
 		assert_eq!(statfs.bavail, 0);
-		assert_eq!(statfs.files, 0);
-		assert_eq!(statfs.ffree, 0);
+		assert_eq!(statfs.files, u64::MAX);
+		assert_eq!(statfs.ffree, u64::MAX - (state.pager.inodes_len() as u64));
 		assert_eq!(statfs.namelen, u32::MAX);
 	}
 

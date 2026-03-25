@@ -21,7 +21,7 @@ use std::{
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use jpegfs::filesystem::{FileSystem, FsDashboardStats, BLOCK_SIZE};
+use jpegfs::filesystem::{FileSystem, FsDashboardStats};
 
 const LOG_BUFFER_CAPACITY: usize = 2_000;
 const OP_RATE_WINDOW: Duration = Duration::from_secs(10);
@@ -303,29 +303,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &mut AppState, now: Instant) {
 		.constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
 		.split(layout[0]);
 
-	let used_pct = if app.stats.total_blocks == 0 {
-		0.0
-	} else {
-		(app.stats.used_blocks as f64 / app.stats.total_blocks as f64) * 100.0
-	};
-	let stats_text = vec![
-		Line::from(format!(
-			"Blocks: {} / {} (free: {}, {:.1}%)",
-			app.stats.used_blocks, app.stats.total_blocks, app.stats.free_blocks, used_pct
-		)),
-		Line::from(format!(
-			"{} KiB / {} KiB (free: {} KiB)",
-			app.stats.used_blocks * BLOCK_SIZE / 1024, app.stats.total_blocks * BLOCK_SIZE / 1024, app.stats.free_blocks * BLOCK_SIZE / 1024
-		)),
-		Line::from(format!(
-			"Files: {}    Dirs: {}    Open handles: {}",
-			app.stats.file_count, app.stats.directory_count, app.stats.open_handles
-		)),
-		Line::from(format!(
-			"Page split: inodes={} dir_entries={} data={}",
-			app.stats.inode_blocks, app.stats.dir_entry_blocks, app.stats.data_blocks
-		)),
-	];
+	let stats_text: Vec<Line<'_>> = app.stats.format(true).into_iter().map(Line::from).collect();
 	let stats = Paragraph::new(stats_text).block(Block::default().title("Filesystem").borders(Borders::ALL));
 	frame.render_widget(stats, top[0]);
 

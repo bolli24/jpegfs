@@ -45,6 +45,10 @@ const FILE_HEADER_SIZE: usize = size_of::<FileHeaderV1>();
 const FILE_CRC: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 const FILE_VERSION: u16 = 1;
 const FILE_MAGIC: [u8; 8] = *b"JPGFhdr1";
+const _: () = {
+	assert!(FILE_HEADER_SIZE <= BLOCK_SIZE);
+	assert!(FILE_MAGIC.len() == 8);
+};
 
 pub struct JpegBlockStore {
 	header: FileHeaderV1,

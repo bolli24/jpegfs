@@ -49,6 +49,13 @@ struct InodesPageWireHeader {
 
 const HEADER_SIZE: usize = size_of::<PageHeaderV1>();
 const BLOCK_PAYLOAD_CAPACITY: usize = BLOCK_SIZE - HEADER_SIZE;
+const _: () = {
+	assert!(HEADER_SIZE < BLOCK_SIZE);
+	assert!(BLOCK_PAYLOAD_CAPACITY <= u16::MAX as usize);
+	assert!(size_of::<InodesPageWireHeader>() <= BLOCK_PAYLOAD_CAPACITY);
+	assert!(INODES_PAGE_CAPACITY > 0);
+	assert!(size_of::<InodesPageWireHeader>() + INODES_PAGE_CAPACITY * size_of::<InodeRaw>() <= BLOCK_PAYLOAD_CAPACITY);
+};
 
 // Ensure entries.len() * size_of::<InodeRaw>() + 2 <= BLOCK_PAYLOAD_CAPACITY
 // Persists to header + flattened data as bytes
@@ -188,10 +195,6 @@ impl Pager {
 	}
 
 	pub fn new(max_pages: usize) -> Self {
-		const {
-			assert!(INODES_PAGE_CAPACITY > 0);
-		}
-
 		Self {
 			inodes_pages: vec![],
 			dir_entries_pages: vec![],

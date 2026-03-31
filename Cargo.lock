@@ -888,6 +888,7 @@ dependencies = [
  "ratatui",
  "rayon",
  "serde",
+ "sha2",
  "simplelog",
  "thiserror 2.0.18",
  "zerocopy",

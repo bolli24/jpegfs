@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+pub mod crypto;
 pub mod filesystem;
 pub mod inode;
 pub mod jpeg;

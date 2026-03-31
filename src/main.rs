@@ -7,8 +7,6 @@ use std::time::Instant;
 
 use fuser::{Config as FuseConfig, MountOption, spawn_mount2};
 use log::{error, info, warn};
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
@@ -554,24 +552,6 @@ fn configured_jpeg_threads() -> usize {
 	}
 }
 
-pub fn rng_from_passphrase(passphrase: &str, salt: &[u8]) -> anyhow::Result<ChaCha20Rng> {
-	let params = argon2::Params::new(
-		19 * 1024, // m_cost in KiB (19 MiB)
-		2,         // t_cost iterations
-		1,         // p_cost parallelism
-		Some(32),  // output length (seed size)
-	)
-	.expect("valid params");
-
-	let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-
-	let mut seed = [0u8; 32];
-	argon2
-		.hash_password_into(passphrase.as_bytes(), salt, &mut seed)
-		.context("argon2 failed")?;
-
-	Ok(ChaCha20Rng::from_seed(seed))
-}
 
 #[cfg(test)]
 mod tests {

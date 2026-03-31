@@ -1,3 +1,7 @@
+/// Number of leading zigzag coefficients (DC + low-frequency AC) that are never
+/// used for embedding
+pub const RESERVED_ZIGZAG_COEFFS: usize = 5;
+
 #[rustfmt::skip]
 pub const ZIGZAG_INDICES: [usize; 64] = [
      0,  1,  8, 16,  9,  2,  3, 10,

@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::jpeg::{JpegError, OwnedJpeg, get_capacity, read_owned_jpeg, write_owned_jpeg};
 use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
-use crate::zigzag::ZIGZAG_INDICES;
+use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
 
 #[derive(Debug, Error)]
 pub enum JpegFileError {
@@ -246,7 +246,7 @@ impl JpegSession {
 		let mut bit_slots = Vec::new();
 		for (component_index, component) in owned_jpeg.components.iter().enumerate() {
 			for (block_index, block) in component.blocks.iter().enumerate() {
-				for &coeff_index in ZIGZAG_INDICES.iter().skip(5) {
+				for &coeff_index in ZIGZAG_INDICES.iter().skip(RESERVED_ZIGZAG_COEFFS) {
 					if is_embeddable_coeff(block[coeff_index]) {
 						bit_slots.push(BitSlot {
 							component_index,

@@ -1,4 +1,4 @@
-use crate::zigzag::ZIGZAG_INDICES;
+use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
 
 pub fn set_lsb(coeff: i16, bit: u8) -> i16 {
 	let is_skipped = |c: i16| matches!(c, -1..=1);
@@ -37,7 +37,7 @@ pub fn is_embeddable_coeff(coeff: i16) -> bool {
 pub fn block_capacity_bits(coeffs: &[i16; 64]) -> usize {
 	ZIGZAG_INDICES
 		.iter()
-		.skip(5)
+		.skip(RESERVED_ZIGZAG_COEFFS)
 		.filter(|&&idx| is_embeddable_coeff(coeffs[idx]))
 		.count()
 }

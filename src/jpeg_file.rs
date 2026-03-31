@@ -217,12 +217,18 @@ impl JpegSession {
 		Ok(())
 	}
 
+	/// Re-encodes the (possibly modified) DCT coefficients into JPEG bytes without
+	/// writing to disk.
+	pub fn to_jpeg_bytes(&self) -> Result<Vec<u8>, JpegFileError> {
+		Ok(unsafe { write_owned_jpeg(&self.source_jpeg, &self.owned_jpeg)? })
+	}
+
 	pub fn flush(&mut self) -> Result<(), JpegFileError> {
 		if !self.dirty {
 			return Ok(());
 		}
 
-		let output_jpeg = unsafe { write_owned_jpeg(&self.source_jpeg, &self.owned_jpeg)? };
+		let output_jpeg = self.to_jpeg_bytes()?;
 
 		let mut output_file = File::create(&self.path).map_err(|source| JpegFileError::CreateOutput {
 			path: self.path.clone(),

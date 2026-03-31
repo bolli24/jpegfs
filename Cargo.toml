@@ -16,6 +16,7 @@ argon2 = { version = "0.5", features = ["std"] }
 sha2 = "0.10"
 rand = "0.10"
 rand_chacha = "0.10"
+chacha20poly1305 = "0.10"
 
 serde = "1.0"
 postcard = { version = "1.1", features = ["use-std", "use-crc"] }  # When updating it must be made sure that the binary format does not change

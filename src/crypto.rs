@@ -1,8 +1,16 @@
+use std::mem::size_of;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
+
 use argon2::Argon2;
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::jpeg::{JpegError, OwnedJpeg, read_owned_jpeg};
+use crate::jpeg_file::{JpegFileError, JpegSession};
 use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
 
 /// Argon2id memory cost in KiB (19 MiB).
@@ -12,12 +20,34 @@ pub const ARGON2_T_COST: u32 = 2;
 /// Argon2id parallelism.
 pub const ARGON2_P_COST: u32 = 1;
 
+/// Plaintext of the encrypted header: the per-write data nonce and the payload length.
+/// Stored only as AEAD ciphertext - never in plaintext in the JPEG.
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+struct EncryptedHeaderPlaintext {
+	nonce_data: [u8; 12],
+	data_len: u32,
+}
+
+/// Size of the encrypted header: [`EncryptedHeaderPlaintext`] + 16-byte AEAD tag.
+const ENCRYPTED_HEADER_SIZE: usize = size_of::<EncryptedHeaderPlaintext>() + 16;
+
+const HEADER_NONCE_LABEL: &[u8] = b"jpegfs header nonce v1";
+
+const _: () = assert!(size_of::<EncryptedHeaderPlaintext>() == 16);
+
 #[derive(Debug, Error)]
 pub enum CryptoError {
 	#[error("failed to decode JPEG: {0}")]
 	Jpeg(#[from] JpegError),
 	#[error("key derivation failed: {0}")]
 	KeyDerivation(argon2::Error),
+	#[error("JPEG file error: {0}")]
+	JpegFile(#[from] JpegFileError),
+	#[error("I/O error: {0}")]
+	Io(#[from] io::Error),
+	#[error("AEAD encryption/decryption failed")]
+	Aead,
 }
 
 /// Derives a deterministic 32-byte salt from the DCT coefficients that are never
@@ -51,6 +81,90 @@ pub fn derive_key_for_jpeg(jpeg_data: &[u8], passphrase: &str) -> Result<[u8; 32
 		.map_err(CryptoError::KeyDerivation)?;
 
 	Ok(key)
+}
+
+/// Derives a 12-byte nonce by hashing the key with a domain label.
+fn derive_nonce(key: &[u8; 32], label: &[u8]) -> [u8; 12] {
+	let mut h = Sha256::new();
+	h.update(key);
+	h.update(label);
+	h.finalize()[..12].try_into().unwrap()
+}
+
+/// Encrypts `plaintext` and embeds the ciphertext into the JPEG at `path` via LSB
+/// encrypts `plaintext` and embeds the ciphertext into `jpeg_data`
+///
+/// Nothing written into the JPEG is in plaintext. Layout:
+/// ```text
+/// [ AEAD(key, nonce_h, rand_nonce_data[12] || len_u32[4]) : 32 bytes ]
+/// [ AEAD(key, rand_nonce_data, plaintext)                 : len + 16 bytes ]
+/// ```
+pub fn write_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+	let nonce_header = derive_nonce(key, HEADER_NONCE_LABEL);
+	let nonce_data: [u8; 12] = rand::random();
+
+	let cipher = ChaCha20Poly1305::new(key.into());
+
+	// Encrypt header: random data nonce + payload length.
+	let header_plaintext = EncryptedHeaderPlaintext {
+		nonce_data,
+		data_len: plaintext.len() as u32,
+	};
+	let encrypted_header = cipher
+		.encrypt(Nonce::from_slice(&nonce_header), header_plaintext.as_bytes())
+		.map_err(|_| CryptoError::Aead)?;
+	debug_assert_eq!(encrypted_header.len(), ENCRYPTED_HEADER_SIZE);
+
+	// Encrypt payload.
+	let encrypted_data = cipher
+		.encrypt(Nonce::from_slice(&nonce_data), plaintext)
+		.map_err(|_| CryptoError::Aead)?;
+
+	let mut ciphertext = encrypted_header;
+	ciphertext.extend_from_slice(&encrypted_data);
+
+	let mut session = JpegSession::new(PathBuf::new(), jpeg_data.to_vec())?;
+	session.write_data(&ciphertext)?;
+	session.to_jpeg_bytes().map_err(Into::into)
+}
+
+/// Core decryption: reads and decrypts ciphertext embedded in `jpeg_data`.
+pub fn read_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
+	let nonce_h = derive_nonce(key, HEADER_NONCE_LABEL);
+	let cipher = ChaCha20Poly1305::new(key.into());
+
+	let mut session = JpegSession::new(PathBuf::new(), jpeg_data.to_vec())?;
+
+	// Read and decrypt header to recover the data nonce and payload length.
+	let encrypted_header = session.read_data(ENCRYPTED_HEADER_SIZE)?;
+	let header_plaintext_bytes = cipher
+		.decrypt(Nonce::from_slice(&nonce_h), encrypted_header.as_ref())
+		.map_err(|_| CryptoError::Aead)?;
+	let header_plaintext = EncryptedHeaderPlaintext::read_from_bytes(&header_plaintext_bytes).unwrap();
+
+	// Read and decrypt payload.
+	let encrypted_data = session.read_data(header_plaintext.data_len as usize + 16)?;
+	cipher
+		.decrypt(Nonce::from_slice(&header_plaintext.nonce_data), encrypted_data.as_ref())
+		.map_err(|_| CryptoError::Aead)
+}
+
+/// Encrypts `plaintext` and embeds the ciphertext into the JPEG file at `path`.
+pub fn write_encrypted_to_jpeg(path: &Path, passphrase: &str, plaintext: &[u8]) -> Result<(), CryptoError> {
+	let jpeg_bytes = fs::read(path)?;
+	let key = derive_key_for_jpeg(&jpeg_bytes, passphrase)?;
+	let output = write_encrypted_with_key(&jpeg_bytes, &key, plaintext)?;
+	fs::write(path, output)?;
+	Ok(())
+}
+
+/// Reads and decrypts data previously written to the JPEG at `path` by
+/// [`write_encrypted_to_jpeg`]. Returns an error if the passphrase is wrong or the
+/// JPEG has not been written to with this scheme.
+pub fn read_encrypted_from_jpeg(path: &Path, passphrase: &str) -> Result<Vec<u8>, CryptoError> {
+	let jpeg_bytes = fs::read(path)?;
+	let key = derive_key_for_jpeg(&jpeg_bytes, passphrase)?;
+	read_encrypted_with_key(&jpeg_bytes, &key)
 }
 
 #[cfg(test)]
@@ -112,6 +226,41 @@ mod tests {
 		assert_eq!(
 			salt_before, salt_after,
 			"Salt changed after write round-trip - DC/low-freq AC coefficients shifted"
+		);
+	}
+
+	#[test]
+	fn encrypt_decrypt_roundtrip() {
+		let key = derive_key_for_jpeg(OTHER_JPEG, "secret").unwrap();
+		let plaintext = b"hello encrypted world";
+
+		let new_jpeg = write_encrypted_with_key(OTHER_JPEG, &key, plaintext).unwrap();
+		let recovered = read_encrypted_with_key(&new_jpeg, &key).unwrap();
+
+		assert_eq!(recovered, plaintext);
+	}
+
+	#[test]
+	fn wrong_key_fails_decryption() {
+		let key_correct = derive_key_for_jpeg(OTHER_JPEG, "correct").unwrap();
+		let key_wrong = derive_key_for_jpeg(OTHER_JPEG, "wrong").unwrap();
+
+		let new_jpeg = write_encrypted_with_key(OTHER_JPEG, &key_correct, b"data").unwrap();
+		let result = read_encrypted_with_key(&new_jpeg, &key_wrong);
+
+		assert!(matches!(result, Err(CryptoError::Aead)));
+	}
+
+	#[test]
+	fn each_write_produces_different_ciphertext() {
+		let key = derive_key_for_jpeg(OTHER_JPEG, "pass").unwrap();
+
+		let jpeg_a = write_encrypted_with_key(OTHER_JPEG, &key, b"same plaintext").unwrap();
+		let jpeg_b = write_encrypted_with_key(OTHER_JPEG, &key, b"same plaintext").unwrap();
+
+		assert_ne!(
+			jpeg_a, jpeg_b,
+			"Two writes with same key should differ due to random nonce"
 		);
 	}
 }

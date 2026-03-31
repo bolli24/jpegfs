@@ -64,3 +64,17 @@ path = "src/pager_state_machine.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "encrypted_store_roundtrip"
+path = "src/encrypted_store_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypted_read_no_panic"
+path = "src/encrypted_read_no_panic.rs"
+test = false
+doc = false
+bench = false

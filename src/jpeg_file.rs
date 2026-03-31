@@ -120,6 +120,12 @@ impl JpegSession {
 		})
 	}
 
+	/// Creates an in-memory session not backed by any file.
+	/// `flush()` must not be called on sessions created this way.
+	pub fn in_memory(source_jpeg: Vec<u8>) -> Result<Self, JpegFileError> {
+		Self::new(PathBuf::new(), source_jpeg)
+	}
+
 	pub fn capacity(&self) -> usize {
 		self.bit_slots.len() / 8
 	}

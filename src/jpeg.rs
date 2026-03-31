@@ -1,4 +1,5 @@
-use std::{panic, ptr};
+use std::cell::Cell;
+use std::ptr;
 
 use arbitrary::{Arbitrary, Unstructured};
 use libc::{c_uchar, c_ulong, c_void, free};
@@ -43,8 +44,6 @@ pub enum JpegError {
 	},
 	#[error("{0}")]
 	Libjpeg(String),
-	#[error("unknown libjpeg panic")]
-	UnknownLibjpegPanic,
 }
 
 impl<'a> Arbitrary<'a> for OwnedComponent {
@@ -106,202 +105,218 @@ pub fn get_component_capacity(jpeg_data: &[u8]) -> Result<[usize; 3], JpegError>
 	Ok(owned.component_capacity())
 }
 
-pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> Result<OwnedJpeg, JpegError> {
-	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-		let mut err: jpeg_error_mgr = std::mem::zeroed();
-		jpeg_std_error(&mut err);
-		err.error_exit = Some(custom_error_exit);
+/// Platform-specific jmp_buf storage.
+/// Oversized to 512 bytes to accommodate different libc across all Linux architectures.
+#[repr(C, align(16))]
+struct JmpBuf([u8; 512]);
 
-		with_decompressor(
-			jpeg_data,
-			&mut err,
-			|_| {},
-			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
-				if srcinfo.num_components != 3 {
-					panic::panic_any(JpegError::UnsupportedComponentCount {
-						found: srcinfo.num_components,
-					});
-				}
-
-				let mut components = std::array::from_fn(|comp_idx| {
-					let comp_info = srcinfo.comp_info.add(comp_idx);
-					let width_in_blocks = (*comp_info).width_in_blocks as usize;
-					let height_in_blocks = (*comp_info).height_in_blocks as usize;
-					OwnedComponent {
-						width_in_blocks,
-						height_in_blocks,
-						blocks: vec![[0; 64]; width_in_blocks * height_in_blocks],
-					}
-				});
-
-				for_each_block_ptr(
-					srcinfo,
-					coef_arrays,
-					false,
-					|component_index, row, column, block_ptr| {
-						let component = &mut components[component_index];
-						let idx = component.index(row, column);
-						component.blocks[idx] = *block_ptr;
-					},
-				);
-
-				OwnedJpeg { components }
-			},
-		)
-	}));
-
-	handle_jpeg_panic(result)
+unsafe extern "C" {
+	fn _setjmp(env: *mut JmpBuf) -> libc::c_int;
+	fn longjmp(env: *mut JmpBuf, val: libc::c_int) -> !;
 }
 
-pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> Result<Vec<u8>, JpegError> {
-	let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-		let mut err: jpeg_error_mgr = std::mem::zeroed();
-		jpeg_std_error(&mut err);
-		err.error_exit = Some(custom_error_exit);
-
-		with_decompressor(
-			template_jpeg,
-			&mut err,
-			|srcinfo| {
-				jpeg_save_markers(srcinfo, 0xFE, 0xFFFF);
-				for m in 0..16 {
-					jpeg_save_markers(srcinfo, 0xE0 + m, 0xFFFF);
-				}
-			},
-			|srcinfo: &mut jpeg_decompress_struct, coef_arrays| {
-				if srcinfo.num_components != 3 {
-					panic::panic_any(JpegError::UnsupportedComponentCount {
-						found: srcinfo.num_components,
-					});
-				}
-
-				for comp_idx in 0..3usize {
-					let comp_info = srcinfo.comp_info.add(comp_idx);
-					let width_in_blocks = (*comp_info).width_in_blocks as usize;
-					let height_in_blocks = (*comp_info).height_in_blocks as usize;
-					let expected = &owned_jpeg.components[comp_idx];
-					if width_in_blocks != expected.width_in_blocks || height_in_blocks != expected.height_in_blocks {
-						panic::panic_any(JpegError::ComponentDimensionsMismatch {
-							component_index: comp_idx,
-							template_width: width_in_blocks,
-							template_height: height_in_blocks,
-							owned_width: expected.width_in_blocks,
-							owned_height: expected.height_in_blocks,
-						});
-					}
-				}
-
-				let mut dstinfo: jpeg_compress_struct = std::mem::zeroed();
-
-				dstinfo.common.err = srcinfo.common.err;
-				jpeg_create_compress(&mut dstinfo);
-
-				let mut out_buffer: *mut c_uchar = ptr::null_mut();
-				let mut out_size: c_ulong = 0;
-
-				jpeg_mem_dest(&mut dstinfo, &mut out_buffer, &mut out_size);
-
-				jpeg_copy_critical_parameters(srcinfo, &mut dstinfo);
-				// Force baseline/sequential encoding; avoids progressive AC first/refine passes.
-				// 6x performance
-				jpeg_c_set_int_param(
-					&mut dstinfo,
-					J_INT_PARAM::JINT_COMPRESS_PROFILE,
-					JINT_COMPRESS_PROFILE_VALUE::JCP_FASTEST as libc::c_int,
-				);
-				dstinfo.num_scans = 0;
-				dstinfo.scan_info = ptr::null();
-				dstinfo.optimize_coding = 0;
-				jpeg_c_set_bool_param(&mut dstinfo, J_BOOLEAN_PARAM::JBOOLEAN_OPTIMIZE_SCANS, 0);
-				jpeg_write_coefficients(&mut dstinfo, coef_arrays);
-
-				let mut marker = srcinfo.marker_list;
-				while !marker.is_null() {
-					jpeg_write_marker(
-						&mut dstinfo,
-						(*marker).marker as libc::c_int,
-						(*marker).data,
-						(*marker).data_length,
-					);
-					marker = (*marker).next;
-				}
-
-				for_each_block_ptr(srcinfo, coef_arrays, true, |component_index, row, column, block_ptr| {
-					let component = &owned_jpeg.components[component_index];
-					let idx = component.index(row, column);
-					*block_ptr = component.blocks[idx];
-				});
-
-				jpeg_finish_compress(&mut dstinfo);
-				jpeg_destroy_compress(&mut dstinfo);
-
-				let result_vec = std::slice::from_raw_parts(out_buffer, out_size as usize).to_vec();
-				free(out_buffer as *mut c_void);
-
-				result_vec
-			},
-		)
-	}));
-
-	handle_jpeg_panic(result)
+/// Custom mozjpeg error manager. The `mgr` field MUST be first so that C code
+/// can cast `cinfo->err` (which points to `jpeg_error_mgr`) back to `*mut JpegErrorMgr`
+#[repr(C)]
+struct JpegErrorMgr {
+	mgr: jpeg_error_mgr,
+	jmp_buf: JmpBuf,
 }
 
-extern "C-unwind" fn custom_error_exit(cinfo: &mut jpeg_common_struct) {
-	unsafe {
-		let err = cinfo.err;
-		let msg_code = (*err).msg_code;
+thread_local! {
+	/// Receives the formatted libjpeg error message set just before `longjmp`.
+	static JPEG_ERROR: Cell<Option<String>> = const { Cell::new(None) };
+}
 
-		// mozjpeg-sys strictly expects an 80-byte array here
-		let mut buffer: [u8; 80] = [0; 80];
+/// mozjpeg error callback. Stores the message and `longjmp`s back to the`setjmp` guard in [`with_decompressor`],
+/// avoiding Rust panics through C frames, which  unreliable and breaks in `panic = "abort"` builds.
+unsafe extern "C-unwind" fn jpeg_error_exit(cinfo: &mut jpeg_common_struct) {
+	let err = cinfo.err;
+	let msg_code = (*err).msg_code;
 
-		// Pass the references directly; no raw pointer casting needed
-		((*err).format_message.unwrap())(cinfo, &mut buffer);
-
-		// Find the C-string null terminator to avoid printing trailing zeros
-		let null_pos = buffer.iter().position(|&b| b == 0).unwrap_or(80);
-		let error_msg = String::from_utf8_lossy(&buffer[..null_pos]).into_owned();
-
-		panic::panic_any(JpegError::Libjpeg(format!("libjpeg error {}: {}", msg_code, error_msg)));
+	let mut buffer = [0u8; 80];
+	if let Some(fmt) = (*err).format_message {
+		// mozjpeg_sys binds the buffer as `&[u8; 80]` but C writes into it;
+		// transmute to the correct mutable signature at the call site.
+		let fmt_mut: unsafe extern "C-unwind" fn(&mut jpeg_common_struct, &mut [u8; 80]) = std::mem::transmute(fmt);
+		fmt_mut(cinfo, &mut buffer);
 	}
+	let end = buffer.iter().position(|&b| b == 0).unwrap_or(80);
+	let msg = String::from_utf8_lossy(&buffer[..end]).into_owned();
+	JPEG_ERROR.with(|e| e.set(Some(format!("libjpeg error {}: {}", msg_code, msg))));
+
+	let err_mgr = cinfo.err as *mut JpegErrorMgr;
+	longjmp(&raw mut (*err_mgr).jmp_buf, 1);
 }
 
-fn handle_jpeg_panic<T>(result: std::thread::Result<T>) -> Result<T, JpegError> {
-	match result {
-		Ok(value) => Ok(value),
-		Err(err) => {
-			if let Some(err) = err.downcast_ref::<JpegError>() {
-				Err(err.clone())
-			} else if let Some(msg) = err.downcast_ref::<String>() {
-				Err(JpegError::Libjpeg(msg.clone()))
-			} else if let Some(msg) = err.downcast_ref::<&str>() {
-				Err(JpegError::Libjpeg((*msg).to_string()))
-			} else {
-				Err(JpegError::UnknownLibjpegPanic)
-			}
-		}
-	}
-}
-
-unsafe fn with_decompressor<T, C, F>(jpeg_data: &[u8], err: &mut jpeg_error_mgr, mut configure: C, mut body: F) -> T
+/// Sets up a mozjpeg decompressor, reads DCT coefficients from `jpeg_data`, and calls `body`
+/// Rust objects allocated inside `body` before the error will leak because `longjmp` bypasses drop
+unsafe fn with_decompressor<T, C, F>(
+	jpeg_data: &[u8],
+	err_mgr: &mut JpegErrorMgr,
+	configure: C,
+	body: F,
+) -> Result<T, JpegError>
 where
-	C: FnMut(&mut jpeg_decompress_struct),
-	F: FnMut(&mut jpeg_decompress_struct, *mut *mut jvirt_barray_control) -> T,
+	C: FnOnce(&mut jpeg_decompress_struct),
+	F: FnOnce(&mut jpeg_decompress_struct, *mut *mut jvirt_barray_control) -> Result<T, JpegError>,
 {
 	let mut srcinfo: jpeg_decompress_struct = std::mem::zeroed();
-	srcinfo.common.err = err;
-	jpeg_create_decompress(&mut srcinfo);
+	srcinfo.common.err = &mut err_mgr.mgr;
 
+	// setjmp before jpeg_create_decompress
+	// All libjpeg errors longjmp here so jpeg_destroy_decompress can always be called safely.
+	if _setjmp(&raw mut err_mgr.jmp_buf) != 0 {
+		jpeg_destroy_decompress(&mut srcinfo);
+		let msg = JPEG_ERROR.take().unwrap_or_default();
+		return Err(JpegError::Libjpeg(msg));
+	}
+
+	jpeg_create_decompress(&mut srcinfo);
 	jpeg_mem_src(&mut srcinfo, jpeg_data.as_ptr(), jpeg_data.len() as c_ulong);
 	configure(&mut srcinfo);
 	jpeg_read_header(&mut srcinfo, 1);
-
 	let coef_arrays = jpeg_read_coefficients(&mut srcinfo);
+
 	let output = body(&mut srcinfo, coef_arrays);
 
-	jpeg_finish_decompress(&mut srcinfo);
+	// Finish only on the success path; always destroy.
+	if output.is_ok() {
+		jpeg_finish_decompress(&mut srcinfo);
+	}
 	jpeg_destroy_decompress(&mut srcinfo);
 
 	output
+}
+
+pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> Result<OwnedJpeg, JpegError> {
+	let mut err_mgr: JpegErrorMgr = std::mem::zeroed();
+	jpeg_std_error(&mut err_mgr.mgr);
+	err_mgr.mgr.error_exit = Some(jpeg_error_exit);
+
+	with_decompressor(
+		jpeg_data,
+		&mut err_mgr,
+		|_| {},
+		|srcinfo, coef_arrays| {
+			if srcinfo.num_components != 3 {
+				return Err(JpegError::UnsupportedComponentCount {
+					found: srcinfo.num_components,
+				});
+			}
+
+			let mut components = std::array::from_fn(|comp_idx| {
+				let comp_info = srcinfo.comp_info.add(comp_idx);
+				let width_in_blocks = (*comp_info).width_in_blocks as usize;
+				let height_in_blocks = (*comp_info).height_in_blocks as usize;
+				OwnedComponent {
+					width_in_blocks,
+					height_in_blocks,
+					blocks: vec![[0; 64]; width_in_blocks * height_in_blocks],
+				}
+			});
+
+			for_each_block_ptr(
+				srcinfo,
+				coef_arrays,
+				false,
+				|component_index, row, column, block_ptr| {
+					let component = &mut components[component_index];
+					let idx = component.index(row, column);
+					component.blocks[idx] = *block_ptr;
+				},
+			);
+
+			Ok(OwnedJpeg { components })
+		},
+	)
+}
+
+pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> Result<Vec<u8>, JpegError> {
+	let mut err_mgr: JpegErrorMgr = std::mem::zeroed();
+	jpeg_std_error(&mut err_mgr.mgr);
+	err_mgr.mgr.error_exit = Some(jpeg_error_exit);
+
+	with_decompressor(
+		template_jpeg,
+		&mut err_mgr,
+		|srcinfo| {
+			jpeg_save_markers(srcinfo, 0xFE, 0xFFFF);
+			for m in 0..16 {
+				jpeg_save_markers(srcinfo, 0xE0 + m, 0xFFFF);
+			}
+		},
+		|srcinfo, coef_arrays| {
+			if srcinfo.num_components != 3 {
+				return Err(JpegError::UnsupportedComponentCount {
+					found: srcinfo.num_components,
+				});
+			}
+
+			for comp_idx in 0..3usize {
+				let comp_info = srcinfo.comp_info.add(comp_idx);
+				let width_in_blocks = (*comp_info).width_in_blocks as usize;
+				let height_in_blocks = (*comp_info).height_in_blocks as usize;
+				let expected = &owned_jpeg.components[comp_idx];
+				if width_in_blocks != expected.width_in_blocks || height_in_blocks != expected.height_in_blocks {
+					return Err(JpegError::ComponentDimensionsMismatch {
+						component_index: comp_idx,
+						template_width: width_in_blocks,
+						template_height: height_in_blocks,
+						owned_width: expected.width_in_blocks,
+						owned_height: expected.height_in_blocks,
+					});
+				}
+			}
+
+			let mut dstinfo: jpeg_compress_struct = std::mem::zeroed();
+			dstinfo.common.err = srcinfo.common.err;
+			jpeg_create_compress(&mut dstinfo);
+
+			let mut out_buffer: *mut c_uchar = ptr::null_mut();
+			let mut out_size: c_ulong = 0;
+			jpeg_mem_dest(&mut dstinfo, &mut out_buffer, &mut out_size);
+
+			jpeg_copy_critical_parameters(srcinfo, &mut dstinfo);
+			// Force baseline/sequential encoding; avoids progressive AC first/refine passes.
+			// 6x performance
+			jpeg_c_set_int_param(
+				&mut dstinfo,
+				J_INT_PARAM::JINT_COMPRESS_PROFILE,
+				JINT_COMPRESS_PROFILE_VALUE::JCP_FASTEST as libc::c_int,
+			);
+			dstinfo.num_scans = 0;
+			dstinfo.scan_info = ptr::null();
+			dstinfo.optimize_coding = 0;
+			jpeg_c_set_bool_param(&mut dstinfo, J_BOOLEAN_PARAM::JBOOLEAN_OPTIMIZE_SCANS, 0);
+			jpeg_write_coefficients(&mut dstinfo, coef_arrays);
+
+			let mut marker = srcinfo.marker_list;
+			while !marker.is_null() {
+				jpeg_write_marker(
+					&mut dstinfo,
+					(*marker).marker as libc::c_int,
+					(*marker).data,
+					(*marker).data_length,
+				);
+				marker = (*marker).next;
+			}
+
+			for_each_block_ptr(srcinfo, coef_arrays, true, |component_index, row, column, block_ptr| {
+				let component = &owned_jpeg.components[component_index];
+				let idx = component.index(row, column);
+				*block_ptr = component.blocks[idx];
+			});
+
+			jpeg_finish_compress(&mut dstinfo);
+			jpeg_destroy_compress(&mut dstinfo);
+
+			let result_vec = std::slice::from_raw_parts(out_buffer, out_size as usize).to_vec();
+			free(out_buffer as *mut c_void);
+
+			Ok(result_vec)
+		},
+	)
 }
 
 unsafe fn for_each_block_ptr<F>(
@@ -332,5 +347,39 @@ unsafe fn for_each_block_ptr<F>(
 				visit(comp_idx as usize, row as usize, col as usize, block_ptr);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const TINY_JPEG: &[u8] = include_bytes!("../fuzz/fixtures/tiny_crw_2609_16x8.jpg");
+
+	#[test]
+	fn malformed_jpeg_empty() {
+		let err = unsafe { read_owned_jpeg(&[]) }.unwrap_err();
+		assert!(matches!(err, JpegError::Libjpeg(_)), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn malformed_jpeg_truncated_soi() {
+		// Just the SOI marker, no further segments
+		let err = unsafe { read_owned_jpeg(&[0xFF, 0xD8]) }.unwrap_err();
+		assert!(matches!(err, JpegError::Libjpeg(_)), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn malformed_jpeg_random_garbage() {
+		let err = unsafe { read_owned_jpeg(&[0x00, 0x01, 0x02, 0x03, 0xDE, 0xAD]) }.unwrap_err();
+		assert!(matches!(err, JpegError::Libjpeg(_)), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn malformed_jpeg_corrupted_first_byte() {
+		let mut corrupted = TINY_JPEG.to_vec();
+		corrupted[0] = 0x00; // destroy the 0xFF SOI marker
+		let err = unsafe { read_owned_jpeg(&corrupted) }.unwrap_err();
+		assert!(matches!(err, JpegError::Libjpeg(_)), "unexpected error: {err}");
 	}
 }

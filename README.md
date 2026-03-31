@@ -44,6 +44,10 @@ cargo fuzz run --target x86_64-unknown-linux-gnu filesystem_state_machine -- -ma
 
 Available fuzz targets:
 
+- `encrypted_read_no_panic`: writes arbitrary bytes into a JPEG's LSB payload and verifies that
+  `read_encrypted_with_key` never panics
+- `encrypted_store_roundtrip`: fuzzes encrypted write/read round-trips and asserts the recovered plaintext matches the
+  original.
 - `filesystem_state_machine`: fuzzes filesystem operations and checks the resulting state for consistency.
 - `inode_raw_roundtrip`: decodes arbitrary raw inode bytes and checks that valid inodes re-encode and decode stably.
 - `inode_structured_roundtrip`: fuzzes structured inode values and checks round-trips.
@@ -53,7 +57,8 @@ Available fuzz targets:
 - `store_block_persistence`: fuzzes `StoreBlock<String, 512>` inserts and validates persisted slot metadata and
   round-trips.
 
-Everything but the `owned_jpeg` targets may be run without the address sanitizer for 3-5 times faster iteration:
+Everything but the `owned_jpeg` and `encrypted` targets may be run without the address sanitizer for 3-5 times faster
+iteration:
 
 ```bash
 cargo fuzz run --target x86_64-unknown-linux-gnu filesystem_state_machine --sanitizer none

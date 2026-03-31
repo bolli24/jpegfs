@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::{fs, io};
 
 use argon2::Argon2;
@@ -91,8 +91,7 @@ fn derive_nonce(key: &[u8; 32], label: &[u8]) -> [u8; 12] {
 	h.finalize()[..12].try_into().unwrap()
 }
 
-/// Encrypts `plaintext` and embeds the ciphertext into the JPEG at `path` via LSB
-/// encrypts `plaintext` and embeds the ciphertext into `jpeg_data`
+/// Encrypts `plaintext` and embeds the ciphertext into `jpeg_data`
 ///
 /// Nothing written into the JPEG is in plaintext. Layout:
 /// ```text
@@ -123,7 +122,7 @@ pub fn write_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32], plaintext: &[u
 	let mut ciphertext = encrypted_header;
 	ciphertext.extend_from_slice(&encrypted_data);
 
-	let mut session = JpegSession::new(PathBuf::new(), jpeg_data.to_vec())?;
+	let mut session = JpegSession::in_memory(jpeg_data.to_vec())?;
 	session.write_data(&ciphertext)?;
 	session.to_jpeg_bytes().map_err(Into::into)
 }
@@ -133,14 +132,15 @@ pub fn read_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32]) -> Result<Vec<u
 	let nonce_h = derive_nonce(key, HEADER_NONCE_LABEL);
 	let cipher = ChaCha20Poly1305::new(key.into());
 
-	let mut session = JpegSession::new(PathBuf::new(), jpeg_data.to_vec())?;
+	let mut session = JpegSession::in_memory(jpeg_data.to_vec())?;
 
 	// Read and decrypt header to recover the data nonce and payload length.
 	let encrypted_header = session.read_data(ENCRYPTED_HEADER_SIZE)?;
 	let header_plaintext_bytes = cipher
 		.decrypt(Nonce::from_slice(&nonce_h), encrypted_header.as_ref())
 		.map_err(|_| CryptoError::Aead)?;
-	let header_plaintext = EncryptedHeaderPlaintext::read_from_bytes(&header_plaintext_bytes).unwrap();
+
+	let header_plaintext = EncryptedHeaderPlaintext::read_from_bytes(&header_plaintext_bytes).expect("size is checked");
 
 	// Read and decrypt payload.
 	let encrypted_data = session.read_data(header_plaintext.data_len as usize + 16)?;

@@ -32,6 +32,11 @@ struct EncryptedHeaderPlaintext {
 /// Size of the encrypted header: [`EncryptedHeaderPlaintext`] + 16-byte AEAD tag.
 const ENCRYPTED_HEADER_SIZE: usize = size_of::<EncryptedHeaderPlaintext>() + 16;
 
+/// Total bytes added by the encryption layer to any plaintext written into a JPEG.
+/// Consists of the 32-byte encrypted header and the 16-byte AEAD tag on the payload.
+pub const CRYPTO_OVERHEAD: usize = ENCRYPTED_HEADER_SIZE + 16;
+const _: () = assert!(CRYPTO_OVERHEAD == 48);
+
 const HEADER_NONCE_LABEL: &[u8] = b"jpegfs header nonce v1";
 
 const _: () = assert!(size_of::<EncryptedHeaderPlaintext>() == 16);

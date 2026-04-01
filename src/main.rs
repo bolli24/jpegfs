@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -10,8 +11,9 @@ use log::{error, info, warn};
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
+use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key};
 use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
-use jpegfs::jpeg_file::init_file;
+use jpegfs::jpeg::get_capacity;
 use jpegfs::pager::{DecodedPages, PageId, Pager};
 use jpegfs::persistence::JpegBlockStore;
 
@@ -104,6 +106,8 @@ fn main() -> anyhow::Result<()> {
 	tui::init_tui_logger(log_tx).context("failed to initialize tui logger")?;
 
 	let cli_args = parse_cli_args()?;
+	let passphrase = resolve_passphrase()?;
+
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
 	};
@@ -120,23 +124,14 @@ fn main() -> anyhow::Result<()> {
 		jpeg_paths.len()
 	);
 
-	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(&jpeg_paths)?;
-	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
+	let probed_stores = probe_stores(&jpeg_paths, &passphrase)?;
 
 	let mount_dir = match cli_args.command {
 		CliCommand::Mount { mount_dir, .. } => mount_dir,
-		CliCommand::Stat { .. } => {
-			let stats = {
-				let state = fs.state.read();
-				state.dashboard_stats()
-			};
-			println!();
-			for line in stats.format(false) {
-				println!("{line}");
-			}
-			return Ok(());
-		}
+		CliCommand::Stat { .. } => return run_stat(probed_stores),
 	};
+	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(probed_stores, &passphrase)?;
+	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
 	let mut persistence = PersistOnDrop::new(fs, stores, total_page_capacity);
 
 	let mut config = FuseConfig::default();
@@ -167,6 +162,13 @@ fn main() -> anyhow::Result<()> {
 	);
 
 	Ok(())
+}
+
+fn resolve_passphrase() -> anyhow::Result<String> {
+	if let Ok(p) = std::env::var("JPEGFS_PASSPHRASE") {
+		return Ok(p);
+	}
+	rpassword::prompt_password("jpegfs passphrase: ").context("failed to read passphrase from terminal")
 }
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
@@ -254,50 +256,223 @@ fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 	Ok(paths)
 }
 
-fn load_or_init_stores(paths: &[PathBuf]) -> anyhow::Result<(Vec<JpegBlockStore>, DecodedPages, usize)> {
+struct LoadedStore {
+	store: JpegBlockStore,
+	pages: DecodedPages,
+}
+
+struct ProbedStore {
+	index: usize,
+	path: PathBuf,
+	jpeg_capacity: usize,
+	theoretical_page_capacity: usize,
+	jpeg_bytes: Vec<u8>,
+	key: [u8; 32],
+	decrypted_data: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum StatProbeSummary {
+	FilesystemStats,
+	CapacityOnly {
+		failed_paths: Vec<PathBuf>,
+		total_theoretical_page_capacity: usize,
+	},
+}
+
+fn probe_stores(paths: &[PathBuf], passphrase: &str) -> anyhow::Result<Vec<ProbedStore>> {
 	let decode_started_at = Instant::now();
 	let pool = jpeg_thread_pool()?;
-	let loaded: Vec<anyhow::Result<(usize, JpegBlockStore, DecodedPages, usize)>> = pool.install(|| {
+	let probed: Vec<anyhow::Result<ProbedStore>> = pool.install(|| {
 		paths
 			.par_iter()
 			.enumerate()
-			.map(|(index, path)| load_one_store(index, path.as_path()))
+			.map(|(index, path)| probe_one_store(index, path.as_path(), passphrase))
 			.collect()
 	});
 
-	let mut loaded = loaded.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
-	loaded.sort_by_key(|(index, _, _, _)| *index);
-
-	let mut stores = Vec::with_capacity(paths.len());
-	let mut decoded_pages = DecodedPages::empty();
-	let mut total_page_capacity = 0usize;
-
-	for (_, store, pages, page_capacity) in loaded {
-		total_page_capacity = total_page_capacity
-			.checked_add(page_capacity)
-			.context("total page capacity overflow while loading JPEG stores")?;
-		decoded_pages.append(pages);
-		stores.push(store);
-	}
+	let mut probed = probed.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+	probed.sort_by_key(|store| store.index);
 
 	info!(
-		"Decoded {} JPEG stores in {:?}",
+		"Probed {} JPEG stores in {:?}",
 		paths.len(),
 		decode_started_at.elapsed()
 	);
 
+	Ok(probed)
+}
+
+fn load_or_init_stores(
+	probed_stores: Vec<ProbedStore>,
+	passphrase: &str,
+) -> anyhow::Result<(Vec<JpegBlockStore>, DecodedPages, usize)> {
+	// Collect stores whose decryption failed (wrong passphrase or fresh JPEG).
+	let failed_paths: Vec<&PathBuf> = probed_stores
+		.iter()
+		.filter(|store| store.decrypted_data.is_none())
+		.map(|store| &store.path)
+		.collect();
+
+	if !failed_paths.is_empty() {
+		eprintln!("{} JPEG store(s) could not be decrypted:", failed_paths.len());
+		for path in &failed_paths {
+			eprintln!("  {}", path.display());
+		}
+		eprintln!("Passphrase wrong or stores not initialized.");
+		eprint!("Type OVERWRITE to initialize empty (possible existing data will be lost), or press Enter to abort: ");
+
+		let stdin = std::io::stdin();
+		let mut input = String::new();
+		stdin
+			.lock()
+			.read_line(&mut input)
+			.context("failed to read confirmation from stdin")?;
+		anyhow::ensure!(
+			input.trim() == "OVERWRITE",
+			"aborted: encrypted JPEG stores could not be decrypted"
+		);
+
+		// Re-prompt for the passphrase so the user confirms their intended key
+		// before irreversibly overwriting data.
+		let confirmed = rpassword::prompt_password("confirm passphrase: ")
+			.context("failed to read passphrase confirmation from terminal")?;
+		anyhow::ensure!(
+			confirmed == passphrase,
+			"passphrase confirmation did not match - aborting to avoid data loss"
+		);
+	}
+
+	let mut stores = Vec::with_capacity(probed_stores.len());
+	let mut decoded_pages = DecodedPages::empty();
+	let mut total_page_capacity = 0usize;
+
+	for probed_store in probed_stores {
+		let ProbedStore {
+			path,
+			jpeg_capacity,
+			jpeg_bytes,
+			key,
+			decrypted_data,
+			..
+		} = probed_store;
+		let decrypted_data = decrypted_data.unwrap_or_default();
+		let (store, pages) =
+			JpegBlockStore::from_bytes_or_init_strict(path.clone(), &decrypted_data, jpeg_capacity, key, jpeg_bytes)
+				.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
+		let loaded_store = LoadedStore { pages, store };
+		total_page_capacity = total_page_capacity
+			.checked_add(loaded_store.store.page_capacity())
+			.context("total page capacity overflow while loading JPEG stores")?;
+		decoded_pages.append(loaded_store.pages);
+		stores.push(loaded_store.store);
+	}
+
 	Ok((stores, decoded_pages, total_page_capacity))
 }
 
-fn load_one_store(index: usize, path: &Path) -> anyhow::Result<(usize, JpegBlockStore, DecodedPages, usize)> {
-	let mut file = init_file(path).with_context(|| format!("failed to open JPEG store at {}", path.display()))?;
-	let data = file
-		.read_data(file.capacity())
-		.with_context(|| format!("failed to read JPEG store data from {}", path.display()))?;
-	let (store, pages) = JpegBlockStore::from_bytes_or_init_strict(file, &data)
-		.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
-	let page_capacity = store.page_capacity();
-	Ok((index, store, pages, page_capacity))
+fn probe_one_store(index: usize, path: &Path, passphrase: &str) -> anyhow::Result<ProbedStore> {
+	let jpeg_bytes =
+		std::fs::read(path).with_context(|| format!("failed to read JPEG bytes from {}", path.display()))?;
+
+	let jpeg_capacity =
+		get_capacity(&jpeg_bytes).with_context(|| format!("failed to compute JPEG capacity for {}", path.display()))?;
+	let theoretical_page_capacity = JpegBlockStore::page_capacity_for_jpeg_capacity(jpeg_capacity)
+		.with_context(|| format!("failed to compute theoretical store capacity for {}", path.display()))?;
+
+	let key = derive_key_for_jpeg(&jpeg_bytes, passphrase)
+		.with_context(|| format!("failed to derive encryption key for {}", path.display()))?;
+
+	let decrypted_data = match read_encrypted_with_key(&jpeg_bytes, &key) {
+		Ok(data) => Some(data),
+		Err(CryptoError::Aead) => None,
+		Err(e) => return Err(e).context(format!("unexpected error decrypting {}", path.display())),
+	};
+
+	Ok(ProbedStore {
+		index,
+		path: path.to_path_buf(),
+		jpeg_capacity,
+		theoretical_page_capacity,
+		jpeg_bytes,
+		key,
+		decrypted_data,
+	})
+}
+
+fn run_stat(probed_stores: Vec<ProbedStore>) -> anyhow::Result<()> {
+	match summarize_stat_probes(&probed_stores)? {
+		StatProbeSummary::FilesystemStats => {}
+		StatProbeSummary::CapacityOnly {
+			failed_paths,
+			total_theoretical_page_capacity,
+		} => {
+			eprintln!("{} JPEG store(s) could not be decrypted:", failed_paths.len());
+			for path in &failed_paths {
+				eprintln!("  {}", path.display());
+			}
+			eprintln!("Usage cannot be verified without decrypting every JPEG store.");
+			print_theoretical_capacity(total_theoretical_page_capacity);
+			return Ok(());
+		}
+	}
+
+	let mut decoded_pages = DecodedPages::empty();
+	let mut total_page_capacity = 0usize;
+	for probed_store in probed_stores {
+		let ProbedStore {
+			path, decrypted_data, ..
+		} = probed_store;
+		let decrypted_data = decrypted_data.context("internal error: stat expected decrypted store data")?;
+		let (page_capacity, pages) = JpegBlockStore::decode_stat(&decrypted_data)
+			.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
+		total_page_capacity = total_page_capacity
+			.checked_add(page_capacity)
+			.context("total page capacity overflow while loading JPEG stores")?;
+		decoded_pages.append(pages);
+	}
+
+	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
+	let stats = {
+		let state = fs.state.read();
+		state.dashboard_stats()
+	};
+	println!();
+	for line in stats.format(false) {
+		println!("{line}");
+	}
+	Ok(())
+}
+
+fn summarize_stat_probes(probed_stores: &[ProbedStore]) -> anyhow::Result<StatProbeSummary> {
+	let total_theoretical_page_capacity = probed_stores.iter().try_fold(0usize, |sum, store| {
+		sum.checked_add(store.theoretical_page_capacity)
+			.context("total theoretical page capacity overflow while probing JPEG stores")
+	})?;
+	let failed_paths: Vec<PathBuf> = probed_stores
+		.iter()
+		.filter(|store| store.decrypted_data.is_none())
+		.map(|store| store.path.clone())
+		.collect();
+
+	if failed_paths.is_empty() {
+		return Ok(StatProbeSummary::FilesystemStats);
+	}
+
+	Ok(StatProbeSummary::CapacityOnly {
+		failed_paths,
+		total_theoretical_page_capacity,
+	})
+}
+
+fn print_theoretical_capacity(total_page_capacity: usize) {
+	println!();
+	println!("Usage: unavailable");
+	println!(
+		"Theoretical capacity: {} blocks ({} KiB)",
+		total_page_capacity,
+		total_page_capacity.saturating_mul(BLOCK_SIZE) / 1024
+	);
 }
 
 fn init_filesystem(decoded_pages: DecodedPages, total_page_capacity: usize) -> anyhow::Result<FileSystem> {
@@ -421,6 +596,15 @@ fn persist_filesystem(
 			continue;
 		}
 		dirty_store_indices.insert(store_index);
+	}
+
+	// Fresh stores (newly initialized this session) must be written even if they
+	// receive no pages, so that subsequent mounts can decrypt the empty header
+	// rather than triggering the OVERWRITE prompt.
+	for (store_index, store) in stores.iter().enumerate() {
+		if store.needs_initial_write() {
+			dirty_store_indices.insert(store_index);
+		}
 	}
 
 	if dirty_store_indices.is_empty() {
@@ -552,10 +736,21 @@ fn configured_jpeg_threads() -> usize {
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn probed_store(path: &str, theoretical_page_capacity: usize, decrypted_data: Option<Vec<u8>>) -> ProbedStore {
+		ProbedStore {
+			index: 0,
+			path: PathBuf::from(path),
+			jpeg_capacity: 0,
+			theoretical_page_capacity,
+			jpeg_bytes: Vec::new(),
+			key: [0; 32],
+			decrypted_data,
+		}
+	}
 
 	#[test]
 	fn assign_new_pages_first_fit_uses_slots_freed_by_removals() {
@@ -583,5 +778,33 @@ mod tests {
 			err.to_string().contains("not enough JPEG store capacity"),
 			"unexpected error: {err:#}"
 		);
+	}
+
+	#[test]
+	fn summarize_stat_probes_returns_capacity_only_when_any_store_fails_decryption() {
+		let summary = summarize_stat_probes(&[
+			probed_store("a.jpg", 3, Some(vec![1, 2, 3])),
+			probed_store("b.jpg", 5, None),
+		])
+		.expect("summary should succeed");
+
+		assert_eq!(
+			summary,
+			StatProbeSummary::CapacityOnly {
+				failed_paths: vec![PathBuf::from("b.jpg")],
+				total_theoretical_page_capacity: 8,
+			}
+		);
+	}
+
+	#[test]
+	fn summarize_stat_probes_returns_filesystem_stats_when_all_stores_decrypt() {
+		let summary = summarize_stat_probes(&[
+			probed_store("a.jpg", 3, Some(vec![1])),
+			probed_store("b.jpg", 5, Some(vec![2])),
+		])
+		.expect("summary should succeed");
+
+		assert_eq!(summary, StatProbeSummary::FilesystemStats);
 	}
 }

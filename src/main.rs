@@ -13,7 +13,7 @@ use rayon::prelude::*;
 
 use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key};
 use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
-use jpegfs::jpeg::get_capacity;
+use jpegfs::jpeg::{get_capacity, read_owned_jpeg, write_owned_jpeg};
 use jpegfs::pager::{DecodedPages, PageId, Pager};
 use jpegfs::persistence::JpegBlockStore;
 
@@ -46,6 +46,13 @@ enum CliCommand {
 	Stat {
 		#[arg(help = "Directory containing JPEG storage files")]
 		jpeg_dir: PathBuf,
+	},
+	#[command(about = "Re-encode JPEGs without embedding")]
+	Reencode {
+		#[arg(help = "Directory containing input JPEG files")]
+		input_dir: PathBuf,
+		#[arg(help = "Directory to write re-encoded JPEG files")]
+		output_dir: PathBuf,
 	},
 }
 
@@ -106,10 +113,16 @@ fn main() -> anyhow::Result<()> {
 	tui::init_tui_logger(log_tx).context("failed to initialize tui logger")?;
 
 	let cli_args = parse_cli_args()?;
+
+	if let CliCommand::Reencode { input_dir, output_dir } = cli_args.command {
+		return run_reencode(&input_dir, &output_dir);
+	}
+
 	let passphrase = resolve_passphrase()?;
 
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
+		CliCommand::Reencode { .. } => unreachable!(),
 	};
 	let jpeg_paths = discover_jpeg_paths(&jpeg_dir)?;
 	let jpeg_threads = configured_jpeg_threads();
@@ -129,6 +142,7 @@ fn main() -> anyhow::Result<()> {
 	let mount_dir = match cli_args.command {
 		CliCommand::Mount { mount_dir, .. } => mount_dir,
 		CliCommand::Stat { .. } => return run_stat(probed_stores),
+		CliCommand::Reencode { .. } => unreachable!(),
 	};
 	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(probed_stores, &passphrase)?;
 	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
@@ -178,6 +192,7 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
 fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
+		CliCommand::Reencode { input_dir, .. } => input_dir,
 	};
 	anyhow::ensure!(
 		jpeg_dir.is_dir(),
@@ -441,6 +456,51 @@ fn run_stat(probed_stores: Vec<ProbedStore>) -> anyhow::Result<()> {
 	for line in stats.format(false) {
 		println!("{line}");
 	}
+	Ok(())
+}
+
+fn run_reencode(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
+	let jpeg_paths = discover_jpeg_paths(input_dir)?;
+	std::fs::create_dir_all(output_dir)
+		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
+
+	let pool = jpeg_thread_pool()?;
+	let results: Vec<anyhow::Result<()>> = pool.install(|| {
+		jpeg_paths
+			.par_iter()
+			.map(|input_path| reencode_one(input_path, output_dir))
+			.collect()
+	});
+
+	for result in results {
+		result?;
+	}
+	Ok(())
+}
+
+fn reencode_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
+	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
+
+	let owned = unsafe { read_owned_jpeg(&jpeg_bytes) }
+		.with_context(|| format!("failed to decode JPEG {}", input_path.display()))?;
+
+	let output_bytes = unsafe { write_owned_jpeg(&jpeg_bytes, &owned) }
+		.with_context(|| format!("failed to re-encode JPEG {}", input_path.display()))?;
+
+	let file_name = input_path
+		.file_name()
+		.with_context(|| format!("no filename in path {}", input_path.display()))?;
+	let output_path = output_dir.join(file_name);
+
+	std::fs::write(&output_path, &output_bytes)
+		.with_context(|| format!("failed to write {}", output_path.display()))?;
+
+	println!(
+		"Reencoded '{}' -> '{}' ({}KiB)",
+		input_path.display(),
+		output_path.display(),
+		output_bytes.len() / 1024
+	);
 	Ok(())
 }
 

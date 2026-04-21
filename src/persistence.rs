@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 use crate::crypto::{self, CRYPTO_OVERHEAD, CryptoError};
-use crate::filesystem::BLOCK_SIZE;
+use crate::pager::BLOCK_SIZE;
 use crate::pager::{DecodedPages, PageId, Pager};
 use crate::pager_error::PagerCodecError;
 use crc::Crc;
@@ -367,14 +367,14 @@ impl JpegBlockStore {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
-	use crate::inode::Inode;
+	use crate::ino::{INodeNo, ino_from_u64};
+	use crate::inode::{FileType, Inode};
 	use crate::jpeg::get_capacity;
 	use crate::pager::Pager;
 	use crc::Crc;
-	use fuser::{FileType, INodeNo};
 	use std::ffi::OsString;
 	use std::mem::size_of;
 	use std::path::PathBuf;
@@ -514,7 +514,7 @@ mod tests {
 	#[test]
 	fn from_bytes_or_init_strict_rejects_invalid_stored_page_block() {
 		let mut pager = Pager::new(4);
-		let ino = INodeNo(3);
+		let ino = ino_from_u64(3);
 		pager.bytes_write(ino, 0, b"crc-check").expect("write should succeed");
 		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
 		encoded[0][32] ^= 0xFF;
@@ -540,7 +540,7 @@ mod tests {
 	#[test]
 	fn from_bytes_or_init_strict_rejects_duplicate_page_ids() {
 		let mut pager = Pager::new(4);
-		let ino = INodeNo(5);
+		let ino = ino_from_u64(5);
 		pager
 			.bytes_write(ino, 0, &vec![0xAB; 5000])
 			.expect("write should succeed");
@@ -594,7 +594,7 @@ mod tests {
 	fn from_bytes_or_init_strict_allows_fragmented_inode_pages_per_store() {
 		let mut pager = Pager::new(8);
 		pager
-			.bytes_write(INodeNo(42), 0, &[0xAB; BLOCK_SIZE * 2])
+			.bytes_write(ino_from_u64(42), 0, &[0xAB; BLOCK_SIZE * 2])
 			.expect("write should succeed");
 		let mut encoded = pager.encode_blocks().expect("encoding should succeed");
 		assert!(encoded.len() >= 2, "expected at least two data pages");
@@ -643,12 +643,12 @@ mod tests {
 	#[test]
 	fn successful_strict_load_tracks_page_slots() {
 		let mut pager_b = Pager::new(8);
-		let ino_b = INodeNo(22);
+		let ino_b = ino_from_u64(22);
 		pager_b
 			.inodes_insert(ino_b, sample_inode())
 			.expect("insert should succeed");
 		pager_b
-			.dir_entries_insert(ino_b, OsString::from("child"), INodeNo(23))
+			.dir_entries_insert(ino_b, OsString::from("child"), ino_from_u64(23))
 			.expect("dir entry insert should succeed");
 		pager_b.bytes_write(ino_b, 0, b"payload").expect("write should succeed");
 		let encoded_b = pager_b.encode_blocks().expect("encoding should succeed");
@@ -734,7 +734,7 @@ mod tests {
 
 		let mut pager = Pager::new(8);
 		pager
-			.bytes_write(INodeNo(99), 0, b"payload")
+			.bytes_write(ino_from_u64(99), 0, b"payload")
 			.expect("write should succeed");
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
 		let wrote = store.persist_blocks(&encoded).expect("persist should succeed");
@@ -782,7 +782,7 @@ mod tests {
 
 		let mut pager = Pager::new(8);
 		pager
-			.bytes_write(INodeNo(123), 0, b"write failure test payload")
+			.bytes_write(ino_from_u64(123), 0, b"write failure test payload")
 			.expect("write should succeed");
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
 

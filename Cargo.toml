@@ -17,15 +17,14 @@ sha2 = "0.11"
 rand = "0.10"
 chacha20poly1305 = "0.10"
 
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.1", features = [
     "use-std",
     "use-crc",
 ] } # When updating it must be made sure that the binary format does not change
 crc = "3.4"
-zerocopy = "0.8"
+zerocopy = { version = "0.8", features = ["derive"] }
 
-fuser = { version = "0.17", features = ["serializable"] }
 parking_lot = "0.12"
 simplelog = "0.12"
 ctrlc = "3.4"
@@ -34,6 +33,9 @@ crossterm = "0.29"
 rayon = "1.11"
 clap = { version = "4.5", features = ["derive"] }
 rpassword = "7"
+
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.17", features = ["serializable"] }
 
 [profile.release]
 debug = true

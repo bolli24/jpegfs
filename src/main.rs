@@ -1,27 +1,37 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::io::BufRead;
+#[cfg(unix)]
 use std::sync::mpsc;
+#[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
 use fuser::{Config as FuseConfig, MountOption, spawn_mount2};
 use log::{error, info, warn};
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
+#[cfg(unix)]
 use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key};
-use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
+#[cfg(unix)]
+use jpegfs::filesystem::FileSystem;
 use jpegfs::jpeg::{get_capacity, read_owned_jpeg, write_owned_jpeg};
 use jpegfs::jpeg_file::JpegSession;
-use jpegfs::pager::{DecodedPages, PageId, Pager};
+#[cfg(unix)]
+use jpegfs::pager::{BLOCK_SIZE, DecodedPages, PageId, Pager};
 use jpegfs::persistence::JpegBlockStore;
 
+#[cfg(unix)]
 mod tui;
 
-/// A filesystem requires at least 2 pages: 1 dir inodes pages, 1 dir entries page
+#[cfg(unix)]
 const MIN_BOOTSTRAP_PAGES: usize = 2;
 
 #[derive(Debug, Eq, Parser, PartialEq)]
@@ -33,6 +43,7 @@ struct CliArgs {
 
 #[derive(Debug, Eq, PartialEq, Subcommand)]
 enum CliCommand {
+	#[cfg(unix)]
 	#[command(
 		about = "Mount the filesystem",
 		long_about = "Mount the filesystem and open the TUI. If the mount directory does not exist, \
@@ -44,6 +55,7 @@ enum CliCommand {
 		#[arg(help = "Mount point for the filesystem; created if missing")]
 		mount_dir: PathBuf,
 	},
+	#[cfg(unix)]
 	#[command(about = "Print filesystem statistics")]
 	Stat {
 		#[arg(help = "Directory containing JPEG storage files")]
@@ -65,12 +77,14 @@ enum CliCommand {
 	},
 }
 
+#[cfg(unix)]
 #[derive(Debug, Eq, PartialEq)]
 struct MountDirState {
 	mount_dir: PathBuf,
 	created_by_process: bool,
 }
 
+#[cfg(unix)]
 impl Drop for MountDirState {
 	fn drop(&mut self) {
 		if let Err(err) = cleanup_mount_dir(&self.mount_dir, self.created_by_process) {
@@ -79,6 +93,7 @@ impl Drop for MountDirState {
 	}
 }
 
+#[cfg(unix)]
 struct PersistOnDrop {
 	fs: FileSystem,
 	stores: Vec<JpegBlockStore>,
@@ -86,6 +101,7 @@ struct PersistOnDrop {
 	persisted: bool,
 }
 
+#[cfg(unix)]
 impl PersistOnDrop {
 	fn new(fs: FileSystem, stores: Vec<JpegBlockStore>, total_page_capacity: usize) -> Self {
 		Self {
@@ -106,6 +122,7 @@ impl PersistOnDrop {
 	}
 }
 
+#[cfg(unix)]
 impl Drop for PersistOnDrop {
 	fn drop(&mut self) {
 		if self.persisted {
@@ -118,9 +135,6 @@ impl Drop for PersistOnDrop {
 }
 
 fn main() -> anyhow::Result<()> {
-	let (log_tx, log_rx) = mpsc::sync_channel(8_192);
-	tui::init_tui_logger(log_tx).context("failed to initialize tui logger")?;
-
 	let cli_args = parse_cli_args()?;
 
 	if let CliCommand::Reencode { input_dir, output_dir } = cli_args.command {
@@ -130,13 +144,24 @@ fn main() -> anyhow::Result<()> {
 		return run_simulate(&input_dir, &output_dir);
 	}
 
+	#[cfg(unix)]
+	return run_mount_or_stat(cli_args);
+
+	#[cfg(not(unix))]
+	unreachable!("only reencode and simulate are available on non-unix platforms")
+}
+
+#[cfg(unix)]
+fn run_mount_or_stat(cli_args: CliArgs) -> anyhow::Result<()> {
+	let (log_tx, log_rx) = mpsc::sync_channel(8_192);
+	tui::init_tui_logger(log_tx).context("failed to initialize tui logger")?;
+
 	let passphrase = resolve_passphrase()?;
 
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
-		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
 	};
-	let jpeg_paths = discover_jpeg_paths(&jpeg_dir)?;
+	let jpeg_paths = discover_jpeg_paths(jpeg_dir)?;
 	let jpeg_threads = configured_jpeg_threads();
 	info!(
 		"JPEG worker threads configured: {} (stores: {})",
@@ -154,7 +179,6 @@ fn main() -> anyhow::Result<()> {
 	let mount_dir = match cli_args.command {
 		CliCommand::Mount { mount_dir, .. } => mount_dir,
 		CliCommand::Stat { .. } => return run_stat(probed_stores),
-		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
 	};
 	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(probed_stores, &passphrase)?;
 	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
@@ -190,6 +214,7 @@ fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
+#[cfg(unix)]
 fn resolve_passphrase() -> anyhow::Result<String> {
 	if let Ok(p) = std::env::var("JPEGFS_PASSPHRASE") {
 		return Ok(p);
@@ -203,7 +228,10 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
 
 fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
 	let jpeg_dir = match &cli_args.command {
-		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
+		#[cfg(unix)]
+		CliCommand::Mount { jpeg_dir, .. } => jpeg_dir,
+		#[cfg(unix)]
+		CliCommand::Stat { jpeg_dir } => jpeg_dir,
 		CliCommand::Reencode { input_dir, .. } | CliCommand::Simulate { input_dir, .. } => input_dir,
 	};
 	anyhow::ensure!(
@@ -214,6 +242,7 @@ fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
 	Ok(cli_args)
 }
 
+#[cfg(unix)]
 fn prepare_mount_dir(mount_dir: &Path) -> anyhow::Result<MountDirState> {
 	if mount_dir.exists() {
 		anyhow::ensure!(
@@ -235,6 +264,7 @@ fn prepare_mount_dir(mount_dir: &Path) -> anyhow::Result<MountDirState> {
 	})
 }
 
+#[cfg(unix)]
 fn cleanup_mount_dir(mount_dir: &Path, created_by_process: bool) -> anyhow::Result<bool> {
 	if !created_by_process || !mount_dir.exists() {
 		return Ok(false);
@@ -283,11 +313,13 @@ fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 	Ok(paths)
 }
 
+#[cfg(unix)]
 struct LoadedStore {
 	store: JpegBlockStore,
 	pages: DecodedPages,
 }
 
+#[cfg(unix)]
 struct ProbedStore {
 	index: usize,
 	path: PathBuf,
@@ -298,6 +330,7 @@ struct ProbedStore {
 	decrypted_data: Option<Vec<u8>>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Eq, PartialEq)]
 enum StatProbeSummary {
 	FilesystemStats,
@@ -307,6 +340,7 @@ enum StatProbeSummary {
 	},
 }
 
+#[cfg(unix)]
 fn probe_stores(paths: &[PathBuf], passphrase: &str) -> anyhow::Result<Vec<ProbedStore>> {
 	let decode_started_at = Instant::now();
 	let pool = jpeg_thread_pool()?;
@@ -330,6 +364,7 @@ fn probe_stores(paths: &[PathBuf], passphrase: &str) -> anyhow::Result<Vec<Probe
 	Ok(probed)
 }
 
+#[cfg(unix)]
 fn load_or_init_stores(
 	probed_stores: Vec<ProbedStore>,
 	passphrase: &str,
@@ -398,6 +433,7 @@ fn load_or_init_stores(
 	Ok((stores, decoded_pages, total_page_capacity))
 }
 
+#[cfg(unix)]
 fn probe_one_store(index: usize, path: &Path, passphrase: &str) -> anyhow::Result<ProbedStore> {
 	let jpeg_bytes =
 		std::fs::read(path).with_context(|| format!("failed to read JPEG bytes from {}", path.display()))?;
@@ -427,6 +463,7 @@ fn probe_one_store(index: usize, path: &Path, passphrase: &str) -> anyhow::Resul
 	})
 }
 
+#[cfg(unix)]
 fn run_stat(probed_stores: Vec<ProbedStore>) -> anyhow::Result<()> {
 	match summarize_stat_probes(&probed_stores)? {
 		StatProbeSummary::FilesystemStats => {}
@@ -579,6 +616,7 @@ fn simulate_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	Ok(())
 }
 
+#[cfg(unix)]
 fn summarize_stat_probes(probed_stores: &[ProbedStore]) -> anyhow::Result<StatProbeSummary> {
 	let total_theoretical_page_capacity = probed_stores.iter().try_fold(0usize, |sum, store| {
 		sum.checked_add(store.theoretical_page_capacity)
@@ -600,6 +638,7 @@ fn summarize_stat_probes(probed_stores: &[ProbedStore]) -> anyhow::Result<StatPr
 	})
 }
 
+#[cfg(unix)]
 fn print_theoretical_capacity(total_page_capacity: usize) {
 	println!();
 	println!("Usage: unavailable");
@@ -610,6 +649,7 @@ fn print_theoretical_capacity(total_page_capacity: usize) {
 	);
 }
 
+#[cfg(unix)]
 fn init_filesystem(decoded_pages: DecodedPages, total_page_capacity: usize) -> anyhow::Result<FileSystem> {
 	anyhow::ensure!(
 		total_page_capacity >= MIN_BOOTSTRAP_PAGES,
@@ -630,6 +670,7 @@ fn init_filesystem(decoded_pages: DecodedPages, total_page_capacity: usize) -> a
 	Ok(fs)
 }
 
+#[cfg(unix)]
 fn log_filesystem_capacity(stage: &str, fs: &FileSystem, total_page_capacity: usize) {
 	let (counts, used_bytes) = {
 		let state = fs.state.read();
@@ -646,6 +687,7 @@ fn log_filesystem_capacity(stage: &str, fs: &FileSystem, total_page_capacity: us
 	);
 }
 
+#[cfg(unix)]
 fn persist_filesystem(
 	stores: &mut [JpegBlockStore],
 	fs: &FileSystem,
@@ -808,6 +850,7 @@ fn persist_filesystem(
 	Ok(())
 }
 
+#[cfg(unix)]
 fn assign_new_pages_first_fit(
 	retained_page_counts: &[usize],
 	store_capacities: &[usize],
@@ -871,7 +914,7 @@ fn configured_jpeg_threads() -> usize {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
 

@@ -1,7 +1,9 @@
+use crate::ino::INodeNo;
 use crate::inode::InodeConversionError;
 use crate::pager::{PageId, PageType};
 use crate::store::Error as StoreError;
-use fuser::{Errno, INodeNo};
+#[cfg(unix)]
+use fuser::Errno;
 use std::ffi::OsString;
 
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +93,7 @@ pub enum PagerBytesError {
 	MissingPage { index: usize },
 }
 
+#[cfg(unix)]
 impl From<PagerCapacityError> for Errno {
 	fn from(err: PagerCapacityError) -> Self {
 		match err {
@@ -99,6 +102,7 @@ impl From<PagerCapacityError> for Errno {
 	}
 }
 
+#[cfg(unix)]
 impl From<PagerDirEntryError> for Errno {
 	fn from(err: PagerDirEntryError) -> Self {
 		match err {
@@ -110,6 +114,7 @@ impl From<PagerDirEntryError> for Errno {
 	}
 }
 
+#[cfg(unix)]
 impl From<PagerBytesError> for Errno {
 	fn from(err: PagerBytesError) -> Self {
 		match err {

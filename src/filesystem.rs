@@ -8,14 +8,40 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use crate::inode::Inode;
-use crate::pager::Pager;
+use crate::inode::{FileType, Inode};
+use crate::pager::{BLOCK_SIZE, Pager};
 use fuser::*;
 use log::{info, warn};
 use parking_lot::RwLock;
 use thiserror::Error;
 
-pub const BLOCK_SIZE: usize = 4096;
+impl From<FileType> for fuser::FileType {
+	fn from(kind: FileType) -> Self {
+		match kind {
+			FileType::NamedPipe => fuser::FileType::NamedPipe,
+			FileType::CharDevice => fuser::FileType::CharDevice,
+			FileType::BlockDevice => fuser::FileType::BlockDevice,
+			FileType::Directory => fuser::FileType::Directory,
+			FileType::RegularFile => fuser::FileType::RegularFile,
+			FileType::Symlink => fuser::FileType::Symlink,
+			FileType::Socket => fuser::FileType::Socket,
+		}
+	}
+}
+
+impl From<fuser::FileType> for FileType {
+	fn from(ft: fuser::FileType) -> Self {
+		match ft {
+			fuser::FileType::NamedPipe => FileType::NamedPipe,
+			fuser::FileType::CharDevice => FileType::CharDevice,
+			fuser::FileType::BlockDevice => FileType::BlockDevice,
+			fuser::FileType::Directory => FileType::Directory,
+			fuser::FileType::RegularFile => FileType::RegularFile,
+			fuser::FileType::Symlink => FileType::Symlink,
+			fuser::FileType::Socket => FileType::Socket,
+		}
+	}
+}
 const POSIX_BLOCK: u64 = 512;
 
 pub const MAX_INODES: usize = usize::MAX;
@@ -285,7 +311,7 @@ impl Inode {
 			mtime: inode.mtime,
 			ctime: inode.ctime,
 			crtime: inode.crtime,
-			kind: inode.kind,
+			kind: inode.kind.into(),
 			perm: inode.perm,
 			nlink: inode.nlink,
 			uid: inode.uid,
@@ -1508,7 +1534,7 @@ impl Filesystem for FileSystem {
 		match state.op_readdir(ino, offset) {
 			Ok(entries) => {
 				for (i, entry) in entries.iter().enumerate() {
-					if reply.add(entry.ino, offset + i as u64 + 1, entry.kind, &entry.name) {
+					if reply.add(entry.ino, offset + i as u64 + 1, entry.kind.into(), &entry.name) {
 						break;
 					}
 				}

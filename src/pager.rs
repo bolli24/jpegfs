@@ -1,17 +1,19 @@
 use crate::{
 	MAGIC,
-	filesystem::BLOCK_SIZE,
+	ino::{self, INodeNo},
 	inode::{Inode, InodeRaw},
 	pager_error::{PagerBytesError, PagerCapacityError, PagerCodecError, PagerDirEntryError},
 	store::{Error as StoreError, StoreBlock, StoreSlot},
 };
 use crc::Crc;
-use fuser::INodeNo;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::mem::size_of;
 use std::num::{NonZeroU32, NonZeroU64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
+
+pub const BLOCK_SIZE: usize = 4096;
+
 const PAGE_VERSION: u16 = 1;
 const PAGE_CRC: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
@@ -190,8 +192,7 @@ impl DecodedPages {
 
 impl Pager {
 	fn owner_inode(ino: INodeNo) -> NonZeroU64 {
-		debug_assert_ne!(ino.0, 0, "pager owner inode must be nonzero");
-		NonZeroU64::new(ino.0).unwrap_or_else(|| unreachable!("pager owner inode contract violated"))
+		ino::ino_to_nonzero(ino)
 	}
 
 	pub fn new(max_pages: usize) -> Self {
@@ -554,7 +555,7 @@ impl Pager {
 		name: OsString,
 		child: INodeNo,
 	) -> Result<(), PagerDirEntryError> {
-		debug_assert_ne!(inode.0, 0, "directory entry owner inode must be nonzero");
+		debug_assert_ne!(ino::ino_to_u64(inode), 0, "directory entry owner inode must be nonzero");
 
 		// Remove existing entry if name already exists
 		let previous_child = self.remove_dir_entry(inode, name.as_os_str())?;
@@ -794,9 +795,8 @@ impl Pager {
 		out
 	}
 
-	/// Caller contract: `inode` must be nonzero.
 	pub fn bytes_write(&mut self, inode: INodeNo, offset: usize, data: &[u8]) -> Result<usize, PagerBytesError> {
-		debug_assert_ne!(inode.0, 0, "byte page owner inode must be nonzero");
+		debug_assert_ne!(ino::ino_to_u64(inode), 0, "byte page owner inode must be nonzero");
 
 		if data.is_empty() {
 			return Ok(0);
@@ -832,10 +832,8 @@ impl Pager {
 		Ok(data.len())
 	}
 
-	/// Caller contract: `inode` must be nonzero.
 	pub fn bytes_truncate(&mut self, inode: INodeNo, new_len: usize) -> Result<(), PagerBytesError> {
-		debug_assert_ne!(inode.0, 0, "byte page owner inode must be nonzero");
-
+		debug_assert_ne!(ino::ino_to_u64(inode), 0, "byte page owner inode must be nonzero");
 		self.bytes_resize(inode, new_len)
 	}
 
@@ -1133,20 +1131,18 @@ impl Pager {
 		match header.page_type {
 			PageType::Inodes => Self::decode_inodes_page(header.page_id, payload_len, payload),
 			PageType::DirEntries => {
-				let owner_ino = INodeNo(
+				let owner_ino = ino::ino_from_nonzero(
 					header
 						.owner_ino
-						.map(NonZeroU64::get)
 						.ok_or(PagerCodecError::MissingOwnerInHeader(PageType::DirEntries))?,
 				);
 				Self::decode_dir_entries_page(header.page_id, owner_ino, payload_len, payload)
 			}
 			PageType::DataBytes => Self::decode_data_bytes_page(
 				header.page_id,
-				INodeNo(
+				ino::ino_from_nonzero(
 					header
 						.owner_ino
-						.map(NonZeroU64::get)
 						.ok_or(PagerCodecError::MissingOwnerInHeader(PageType::DataBytes))?,
 				),
 				header.file_page_no.map(NonZeroU32::get).unwrap_or(0),
@@ -1312,10 +1308,10 @@ impl Pager {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
-	use fuser::FileType;
+	use crate::inode::FileType;
 	use std::collections::HashSet;
 	use std::os::unix::ffi::OsStringExt;
 	use std::time::SystemTime;

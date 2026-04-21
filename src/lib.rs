@@ -1,7 +1,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod crypto;
+#[cfg(unix)]
 pub mod filesystem;
+pub mod ino;
 pub mod inode;
 pub mod jpeg;
 pub mod jpeg_file;

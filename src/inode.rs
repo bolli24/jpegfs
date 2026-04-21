@@ -1,7 +1,18 @@
+use crate::ino::{self, INodeNo};
 use arbitrary::Arbitrary;
-use fuser::{FileType, INodeNo};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum FileType {
+	NamedPipe,
+	CharDevice,
+	BlockDevice,
+	Directory,
+	RegularFile,
+	Symlink,
+	Socket,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Inode {
@@ -139,7 +150,7 @@ impl InodeRaw {
 		let (crtime_sec, crtime_nsec) = encode_system_time(inode.crtime)?;
 
 		Ok(Self {
-			ino: ino.0,
+			ino: ino::ino_to_u64(ino),
 			size: inode.size,
 			atime_sec,
 			mtime_sec,
@@ -160,7 +171,7 @@ impl InodeRaw {
 
 	pub fn into_parts(&self) -> Result<(INodeNo, Inode), InodeConversionError> {
 		Ok((
-			INodeNo(self.ino),
+			ino::ino_from_u64(self.ino),
 			Inode {
 				kind: decode_file_type(self.kind),
 				perm: self.perm,
@@ -177,9 +188,10 @@ impl InodeRaw {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
+	use crate::ino::ino_from_u64;
 
 	#[test]
 	fn inode_raw_roundtrip_preserves_inode_fields() {
@@ -195,7 +207,7 @@ mod tests {
 			ctime: UNIX_EPOCH + Duration::from_secs(9000),
 			crtime: UNIX_EPOCH + Duration::from_secs(99_999),
 		};
-		let ino = INodeNo(42);
+		let ino = ino_from_u64(42);
 
 		let raw = InodeRaw::from_parts(ino, &inode).expect("inode -> raw conversion should succeed");
 		let (restored_ino, restored) = raw.into_parts().expect("raw -> inode conversion should succeed");
@@ -218,7 +230,7 @@ mod tests {
 			ctime: UNIX_EPOCH,
 			crtime: UNIX_EPOCH + Duration::from_secs(5),
 		};
-		let ino = INodeNo(43);
+		let ino = ino_from_u64(43);
 
 		let raw = InodeRaw::from_parts(ino, &inode).expect("inode -> raw conversion should succeed");
 		let (restored_ino, restored) = raw.into_parts().expect("raw -> inode conversion should succeed");
@@ -243,7 +255,7 @@ mod tests {
 			ctime: UNIX_EPOCH - Duration::from_secs(i64::MAX as u64),
 			crtime: UNIX_EPOCH + Duration::from_secs(5),
 		};
-		let ino = INodeNo(44);
+		let ino = ino_from_u64(44);
 
 		let raw = InodeRaw::from_parts(ino, &inode).expect("inode -> raw conversion should succeed");
 		assert_eq!(raw.atime_sec, i64::MIN);

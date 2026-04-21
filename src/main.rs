@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use rayon::prelude::*;
 use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key};
 use jpegfs::filesystem::{BLOCK_SIZE, FileSystem};
 use jpegfs::jpeg::{get_capacity, read_owned_jpeg, write_owned_jpeg};
+use jpegfs::jpeg_file::JpegSession;
 use jpegfs::pager::{DecodedPages, PageId, Pager};
 use jpegfs::persistence::JpegBlockStore;
 
@@ -52,6 +54,13 @@ enum CliCommand {
 		#[arg(help = "Directory containing input JPEG files")]
 		input_dir: PathBuf,
 		#[arg(help = "Directory to write re-encoded JPEG files")]
+		output_dir: PathBuf,
+	},
+	#[command(about = "Simulate a real persist by embedding random bytes of the correct length (skips encryption).")]
+	Simulate {
+		#[arg(help = "Directory containing input JPEG files")]
+		input_dir: PathBuf,
+		#[arg(help = "Directory to write encoded JPEG files")]
 		output_dir: PathBuf,
 	},
 }
@@ -117,12 +126,15 @@ fn main() -> anyhow::Result<()> {
 	if let CliCommand::Reencode { input_dir, output_dir } = cli_args.command {
 		return run_reencode(&input_dir, &output_dir);
 	}
+	if let CliCommand::Simulate { input_dir, output_dir } = cli_args.command {
+		return run_simulate(&input_dir, &output_dir);
+	}
 
 	let passphrase = resolve_passphrase()?;
 
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
-		CliCommand::Reencode { .. } => unreachable!(),
+		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
 	};
 	let jpeg_paths = discover_jpeg_paths(&jpeg_dir)?;
 	let jpeg_threads = configured_jpeg_threads();
@@ -142,7 +154,7 @@ fn main() -> anyhow::Result<()> {
 	let mount_dir = match cli_args.command {
 		CliCommand::Mount { mount_dir, .. } => mount_dir,
 		CliCommand::Stat { .. } => return run_stat(probed_stores),
-		CliCommand::Reencode { .. } => unreachable!(),
+		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
 	};
 	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(probed_stores, &passphrase)?;
 	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
@@ -192,7 +204,7 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
 fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
-		CliCommand::Reencode { input_dir, .. } => input_dir,
+		CliCommand::Reencode { input_dir, .. } | CliCommand::Simulate { input_dir, .. } => input_dir,
 	};
 	anyhow::ensure!(
 		jpeg_dir.is_dir(),
@@ -497,6 +509,69 @@ fn reencode_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
 
 	println!(
 		"Reencoded '{}' -> '{}' ({}KiB)",
+		input_path.display(),
+		output_path.display(),
+		output_bytes.len() / 1024
+	);
+	Ok(())
+}
+
+fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
+	let jpeg_paths = discover_jpeg_paths(input_dir)?;
+	std::fs::create_dir_all(output_dir)
+		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
+
+	let jpeg_threads = configured_jpeg_threads();
+	println!(
+		"JPEG worker threads configured: {} (stores: {})",
+		jpeg_threads,
+		jpeg_paths.len()
+	);
+
+	let pool = jpeg_thread_pool()?;
+	let results: Vec<anyhow::Result<()>> = pool.install(|| {
+		jpeg_paths
+			.par_iter()
+			.map(|input_path| simulate_one(input_path, output_dir))
+			.collect()
+	});
+
+	for result in results {
+		result?;
+	}
+	Ok(())
+}
+
+fn simulate_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
+	let file_name = input_path
+		.file_name()
+		.with_context(|| format!("no filename in path {}", input_path.display()))?;
+	let output_path = output_dir.join(file_name);
+
+	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
+
+	let jpeg_capacity = get_capacity(&jpeg_bytes)
+		.with_context(|| format!("failed to compute JPEG capacity for {}", input_path.display()))?;
+	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity)
+		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
+
+	let mut random_bytes = vec![0u8; embed_len];
+	rand::rng().fill_bytes(&mut random_bytes);
+
+	let mut session = JpegSession::in_memory(jpeg_bytes)
+		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
+	session
+		.write_data(&random_bytes)
+		.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;
+	let output_bytes = session
+		.to_jpeg_bytes()
+		.with_context(|| format!("failed to re-encode JPEG {}", input_path.display()))?;
+
+	std::fs::write(&output_path, &output_bytes)
+		.with_context(|| format!("failed to write {}", output_path.display()))?;
+
+	println!(
+		"Simulated '{}' -> '{}' ({}KiB)",
 		input_path.display(),
 		output_path.display(),
 		output_bytes.len() / 1024

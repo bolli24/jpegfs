@@ -144,6 +144,13 @@ impl JpegBlockStore {
 		Ok(((plaintext_capacity - FILE_HEADER_SIZE) / BLOCK_SIZE).min(usize::from(u16::MAX)))
 	}
 
+	/// Returns the exact number of bytes `persist_blocks` embeds into the JPEG for a store given `jpeg_capacity`
+	pub fn persisted_embed_len(jpeg_capacity: usize) -> Result<usize, Error> {
+		let page_capacity = Self::page_capacity_for_jpeg_capacity(jpeg_capacity)?;
+		let plaintext_len = FILE_HEADER_SIZE + page_capacity * BLOCK_SIZE;
+		Ok(CRYPTO_OVERHEAD + plaintext_len)
+	}
+
 	fn decode_header_strict(decrypted_data: &[u8]) -> Result<FileHeaderV1, Error> {
 		if decrypted_data.len() < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(decrypted_data.len()));

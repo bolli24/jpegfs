@@ -1,8 +1,8 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use fuser::{FileType, INodeNo};
-use jpegfs::inode::{Inode, InodeKindRaw, InodeRaw};
+use fuser::INodeNo;
+use jpegfs::inode::{FileType, Inode, InodeKindRaw, InodeRaw};
 use libfuzzer_sys::fuzz_target;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zerocopy::{IntoBytes, TryFromBytes};

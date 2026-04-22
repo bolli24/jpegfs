@@ -162,6 +162,7 @@ fn run_mount_or_stat(cli_args: CliArgs) -> anyhow::Result<()> {
 
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
+		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
 	};
 	let jpeg_paths = discover_jpeg_paths(jpeg_dir)?;
 	let probed_stores = probe_stores(&jpeg_paths, &passphrase)?;
@@ -169,6 +170,7 @@ fn run_mount_or_stat(cli_args: CliArgs) -> anyhow::Result<()> {
 	let mount_dir = match cli_args.command {
 		CliCommand::Mount { mount_dir, .. } => mount_dir,
 		CliCommand::Stat { .. } => return run_stat(probed_stores),
+		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
 	};
 	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(probed_stores, &passphrase)?;
 	let fs = init_filesystem(decoded_pages, total_page_capacity)?;

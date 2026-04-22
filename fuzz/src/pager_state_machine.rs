@@ -8,9 +8,9 @@ use std::{
 };
 
 use arbitrary::Arbitrary;
-use fuser::{FileType, INodeNo};
+use fuser::INodeNo;
 use jpegfs::{
-	inode::Inode,
+	inode::{FileType, Inode},
 	pager::{DecodedPages, Pager},
 };
 use libfuzzer_sys::fuzz_target;

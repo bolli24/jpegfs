@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use rand::Rng;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 #[cfg(unix)]
 use std::collections::{HashMap, HashSet};
@@ -269,6 +270,7 @@ fn cleanup_mount_dir(mount_dir: &Path, created_by_process: bool) -> anyhow::Resu
 	Ok(true)
 }
 
+#[cfg(unix)]
 fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 	let mut paths = Vec::new();
 	for entry in std::fs::read_dir(jpeg_dir)
@@ -299,6 +301,27 @@ fn discover_jpeg_paths(jpeg_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 		"no JPEG files found in directory {}; expected at least one *.jpg or *.jpeg file",
 		jpeg_dir.display()
 	);
+	Ok(paths)
+}
+
+fn discover_jpeg_paths_recursive(input_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+	let mut paths = Vec::new();
+	for entry in WalkDir::new(input_dir).sort_by_file_name() {
+		let entry = entry.with_context(|| format!("failed to read directory entry under {}", input_dir.display()))?;
+		if !entry.file_type().is_file() {
+			continue;
+		}
+		let path = entry.into_path();
+		let is_jpeg = path
+			.extension()
+			.and_then(|ext| ext.to_str())
+			.map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+			.unwrap_or(false);
+		if is_jpeg {
+			paths.push(path);
+		}
+	}
+	anyhow::ensure!(!paths.is_empty(), "no JPEG files found under {}", input_dir.display());
 	Ok(paths)
 }
 
@@ -504,7 +527,7 @@ fn run_stat(probed_stores: Vec<ProbedStore>) -> anyhow::Result<()> {
 }
 
 fn run_reencode(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
-	let jpeg_paths = discover_jpeg_paths(input_dir)?;
+	let jpeg_paths = discover_jpeg_paths_recursive(input_dir)?;
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
 
@@ -513,7 +536,7 @@ fn run_reencode(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 		jpeg_paths
 			.par_iter()
 			.map(|input_path| {
-				let result = reencode_one(input_path, output_dir, &pb);
+				let result = reencode_one(input_path, input_dir, output_dir, &pb);
 				pb.inc(1);
 				result
 			})
@@ -528,7 +551,7 @@ fn run_reencode(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn reencode_one(input_path: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
+fn reencode_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
 	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
 
 	let owned = unsafe { read_owned_jpeg(&jpeg_bytes) }
@@ -537,10 +560,13 @@ fn reencode_one(input_path: &Path, output_dir: &Path, pb: &ProgressBar) -> anyho
 	let output_bytes = unsafe { write_owned_jpeg(&jpeg_bytes, &owned) }
 		.with_context(|| format!("failed to re-encode JPEG {}", input_path.display()))?;
 
-	let file_name = input_path
-		.file_name()
-		.with_context(|| format!("no filename in path {}", input_path.display()))?;
-	let output_path = output_dir.join(file_name);
+	let rel = input_path
+		.strip_prefix(input_dir)
+		.with_context(|| format!("path {} is not under {}", input_path.display(), input_dir.display()))?;
+	let output_path = output_dir.join(rel);
+	if let Some(parent) = output_path.parent() {
+		std::fs::create_dir_all(parent).with_context(|| format!("failed to create directory {}", parent.display()))?;
+	}
 
 	std::fs::write(&output_path, &output_bytes)
 		.with_context(|| format!("failed to write {}", output_path.display()))?;
@@ -555,7 +581,7 @@ fn reencode_one(input_path: &Path, output_dir: &Path, pb: &ProgressBar) -> anyho
 }
 
 fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
-	let jpeg_paths = discover_jpeg_paths(input_dir)?;
+	let jpeg_paths = discover_jpeg_paths_recursive(input_dir)?;
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
 
@@ -564,7 +590,7 @@ fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 		jpeg_paths
 			.par_iter()
 			.map(|input_path| {
-				let result = simulate_one(input_path, output_dir, &pb);
+				let result = simulate_one(input_path, input_dir, output_dir, &pb);
 				pb.inc(1);
 				result
 			})
@@ -579,11 +605,14 @@ fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn simulate_one(input_path: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
-	let file_name = input_path
-		.file_name()
-		.with_context(|| format!("no filename in path {}", input_path.display()))?;
-	let output_path = output_dir.join(file_name);
+fn simulate_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
+	let rel = input_path
+		.strip_prefix(input_dir)
+		.with_context(|| format!("path {} is not under {}", input_path.display(), input_dir.display()))?;
+	let output_path = output_dir.join(rel);
+	if let Some(parent) = output_path.parent() {
+		std::fs::create_dir_all(parent).with_context(|| format!("failed to create directory {}", parent.display()))?;
+	}
 
 	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
 

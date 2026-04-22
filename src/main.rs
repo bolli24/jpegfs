@@ -14,6 +14,7 @@ use std::time::Instant;
 
 #[cfg(unix)]
 use fuser::{Config as FuseConfig, MountOption, spawn_mount2};
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use rayon::ThreadPool;
 use rayon::prelude::*;
@@ -162,18 +163,6 @@ fn run_mount_or_stat(cli_args: CliArgs) -> anyhow::Result<()> {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
 	};
 	let jpeg_paths = discover_jpeg_paths(jpeg_dir)?;
-	let jpeg_threads = configured_jpeg_threads();
-	info!(
-		"JPEG worker threads configured: {} (stores: {})",
-		jpeg_threads,
-		jpeg_paths.len()
-	);
-	println!(
-		"JPEG worker threads configured: {} (stores: {})",
-		jpeg_threads,
-		jpeg_paths.len()
-	);
-
 	let probed_stores = probe_stores(&jpeg_paths, &passphrase)?;
 
 	let mount_dir = match cli_args.command {
@@ -343,14 +332,20 @@ enum StatProbeSummary {
 #[cfg(unix)]
 fn probe_stores(paths: &[PathBuf], passphrase: &str) -> anyhow::Result<Vec<ProbedStore>> {
 	let decode_started_at = Instant::now();
-	let pool = jpeg_thread_pool()?;
+	let (pool, pb, label) = jpeg_operation_setup("probe", paths.len())?;
 	let probed: Vec<anyhow::Result<ProbedStore>> = pool.install(|| {
 		paths
 			.par_iter()
 			.enumerate()
-			.map(|(index, path)| probe_one_store(index, path.as_path(), passphrase))
+			.map(|(index, path)| {
+				let result = probe_one_store(index, path.as_path(), passphrase);
+				pb.inc(1);
+				result
+			})
 			.collect()
 	});
+	eprintln!("[{label}] done in {:.1?}", pb.elapsed());
+	pb.finish_and_clear();
 
 	let mut probed = probed.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
 	probed.sort_by_key(|store| store.index);
@@ -513,13 +508,19 @@ fn run_reencode(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
 
-	let pool = jpeg_thread_pool()?;
+	let (pool, pb, label) = jpeg_operation_setup("reencode", jpeg_paths.len())?;
 	let results: Vec<anyhow::Result<()>> = pool.install(|| {
 		jpeg_paths
 			.par_iter()
-			.map(|input_path| reencode_one(input_path, output_dir))
+			.map(|input_path| {
+				let result = reencode_one(input_path, output_dir, &pb);
+				pb.inc(1);
+				result
+			})
 			.collect()
 	});
+	eprintln!("[{label}] done in {:.1?}", pb.elapsed());
+	pb.finish_and_clear();
 
 	for result in results {
 		result?;
@@ -527,7 +528,7 @@ fn run_reencode(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn reencode_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
+fn reencode_one(input_path: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
 	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
 
 	let owned = unsafe { read_owned_jpeg(&jpeg_bytes) }
@@ -544,12 +545,12 @@ fn reencode_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	std::fs::write(&output_path, &output_bytes)
 		.with_context(|| format!("failed to write {}", output_path.display()))?;
 
-	println!(
+	pb.println(format!(
 		"Reencoded '{}' -> '{}' ({}KiB)",
 		input_path.display(),
 		output_path.display(),
 		output_bytes.len() / 1024
-	);
+	));
 	Ok(())
 }
 
@@ -558,20 +559,19 @@ fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
 
-	let jpeg_threads = configured_jpeg_threads();
-	println!(
-		"JPEG worker threads configured: {} (stores: {})",
-		jpeg_threads,
-		jpeg_paths.len()
-	);
-
-	let pool = jpeg_thread_pool()?;
+	let (pool, pb, label) = jpeg_operation_setup("simulate", jpeg_paths.len())?;
 	let results: Vec<anyhow::Result<()>> = pool.install(|| {
 		jpeg_paths
 			.par_iter()
-			.map(|input_path| simulate_one(input_path, output_dir))
+			.map(|input_path| {
+				let result = simulate_one(input_path, output_dir, &pb);
+				pb.inc(1);
+				result
+			})
 			.collect()
 	});
+	eprintln!("[{label}] done in {:.1?}", pb.elapsed());
+	pb.finish_and_clear();
 
 	for result in results {
 		result?;
@@ -579,7 +579,7 @@ fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn simulate_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
+fn simulate_one(input_path: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
 	let file_name = input_path
 		.file_name()
 		.with_context(|| format!("no filename in path {}", input_path.display()))?;
@@ -607,12 +607,12 @@ fn simulate_one(input_path: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	std::fs::write(&output_path, &output_bytes)
 		.with_context(|| format!("failed to write {}", output_path.display()))?;
 
-	println!(
+	pb.println(format!(
 		"Simulated '{}' -> '{}' ({}KiB)",
 		input_path.display(),
 		output_path.display(),
 		output_bytes.len() / 1024
-	);
+	));
 	Ok(())
 }
 
@@ -810,13 +810,14 @@ fn persist_filesystem(
 		target_page_ids_per_store[store_index] = Some(desired_page_ids);
 	}
 
-	let pool = jpeg_thread_pool()?;
+	let (pool, pb, label) = jpeg_operation_setup("persist", stores.len())?;
 	let persist_results: Vec<anyhow::Result<bool>> = pool.install(|| {
 		stores
 			.par_iter_mut()
 			.enumerate()
 			.map(|(store_index, store)| {
 				let Some(target_page_ids) = target_page_ids_per_store[store_index].as_ref() else {
+					pb.inc(1);
 					return Ok(false);
 				};
 				let mut blocks = Vec::with_capacity(target_page_ids.len());
@@ -826,12 +827,16 @@ fn persist_filesystem(
 						.with_context(|| format!("missing encoded block for page {page_id:?}"))?;
 					blocks.push(*block);
 				}
-				store
+				let result = store
 					.persist_blocks(&blocks)
-					.with_context(|| format!("failed to persist encoded pages to JPEG store index {}", store_index))
+					.with_context(|| format!("failed to persist encoded pages to JPEG store index {}", store_index));
+				pb.inc(1);
+				result
 			})
 			.collect()
 	});
+	eprintln!("[{label}] done in {:.1?}", pb.elapsed());
+	pb.finish_and_clear();
 	let written_stores = persist_results
 		.into_iter()
 		.collect::<anyhow::Result<Vec<_>>>()?
@@ -881,12 +886,20 @@ fn assign_new_pages_first_fit(
 	Ok(assigned_new_pages)
 }
 
-fn jpeg_thread_pool() -> anyhow::Result<ThreadPool> {
+fn jpeg_operation_setup(label: &'static str, count: usize) -> anyhow::Result<(ThreadPool, ProgressBar, &'static str)> {
 	let threads = configured_jpeg_threads();
-	rayon::ThreadPoolBuilder::new()
+	eprintln!("[{label}] {count} file(s), {threads} worker thread(s)");
+	let pool = rayon::ThreadPoolBuilder::new()
 		.num_threads(threads)
 		.build()
-		.context("failed to build JPEG worker thread pool")
+		.context("failed to build JPEG worker thread pool")?;
+	let pb = ProgressBar::new(count as u64);
+	pb.set_style(
+		ProgressStyle::with_template("{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} elapsed:{elapsed} eta:{eta}")
+			.unwrap()
+			.progress_chars("=>-"),
+	);
+	Ok((pool, pb, label))
 }
 
 fn configured_jpeg_threads() -> usize {

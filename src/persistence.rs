@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use crate::crypto::{self, CRYPTO_OVERHEAD, CryptoError};
@@ -287,6 +287,10 @@ impl JpegBlockStore {
 		digest.update(header.as_bytes());
 		digest.update(payload);
 		digest.finalize()
+	}
+
+	pub fn path(&self) -> &Path {
+		&self.path
 	}
 
 	pub fn page_capacity(&self) -> usize {

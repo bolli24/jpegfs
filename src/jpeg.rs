@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::ptr;
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -105,98 +104,226 @@ pub fn get_component_capacity(jpeg_data: &[u8]) -> Result<[usize; 3], JpegError>
 	Ok(owned.component_capacity())
 }
 
-/// Platform-specific jmp_buf storage.
-/// Oversized to 512 bytes to accommodate different libc across all Linux architectures.
-#[repr(C, align(16))]
-struct JmpBuf([u8; 512]);
+// ---------- platform error-handling strategy ----------
+//
+// On non-MSVC platforms (Linux, macOS, MinGW) we use setjmp/longjmp.
+// This is So that errors work with panic=abort (eg. fuzz targets)
+//
+// On MSVC x64 we use panic/catch_unwind instead because MSVC's _setjmp requires a frame-pointer (cant get that in Rust)
+// fuzzing is unix only anyway
 
-unsafe extern "C" {
-	fn _setjmp(env: *mut JmpBuf) -> libc::c_int;
-	fn longjmp(env: *mut JmpBuf, val: libc::c_int) -> !;
-}
+#[cfg(not(target_env = "msvc"))]
+mod error_impl {
+	use std::cell::Cell;
 
-/// Custom mozjpeg error manager. The `mgr` field MUST be first so that C code
-/// can cast `cinfo->err` (which points to `jpeg_error_mgr`) back to `*mut JpegErrorMgr`
-#[repr(C)]
-struct JpegErrorMgr {
-	mgr: jpeg_error_mgr,
-	jmp_buf: JmpBuf,
-}
+	use libc::{c_int, c_ulong};
+	use mozjpeg_sys::*;
 
-thread_local! {
-	/// Receives the formatted libjpeg error message set just before `longjmp`.
-	static JPEG_ERROR: Cell<Option<String>> = const { Cell::new(None) };
-}
+	use super::{DecompressGuard, JpegError};
 
-/// mozjpeg error callback. Stores the message and `longjmp`s back to the`setjmp` guard in [`with_decompressor`],
-/// avoiding Rust panics through C frames, which  unreliable and breaks in `panic = "abort"` builds.
-unsafe extern "C-unwind" fn jpeg_error_exit(cinfo: &mut jpeg_common_struct) {
-	let err = cinfo.err;
-	let msg_code = (*err).msg_code;
+	/// Platform-specific jmp_buf storage.
+	/// Oversized to 512 bytes to accommodate different libc across all Linux architectures.
+	#[repr(C, align(16))]
+	pub struct JmpBuf(pub [u8; 512]);
 
-	let mut buffer = [0u8; 80];
-	if let Some(fmt) = (*err).format_message {
-		// mozjpeg_sys binds the buffer as `&[u8; 80]` but C writes into it;
-		// transmute to the correct mutable signature at the call site.
-		let fmt_mut: unsafe extern "C-unwind" fn(&mut jpeg_common_struct, &mut [u8; 80]) = std::mem::transmute(fmt);
-		fmt_mut(cinfo, &mut buffer);
+	unsafe extern "C" {
+		pub fn _setjmp(env: *mut JmpBuf) -> c_int;
+		fn longjmp(env: *mut JmpBuf, val: c_int) -> !;
 	}
-	let end = buffer.iter().position(|&b| b == 0).unwrap_or(80);
-	let msg = String::from_utf8_lossy(&buffer[..end]).into_owned();
-	JPEG_ERROR.with(|e| e.set(Some(format!("libjpeg error {}: {}", msg_code, msg))));
 
-	let err_mgr = cinfo.err as *mut JpegErrorMgr;
-	longjmp(&raw mut (*err_mgr).jmp_buf, 1);
+	/// Custom mozjpeg error manager. The `mgr` field MUST be first so that C
+	/// can cast `cinfo->err` back to `*mut JpegErrorMgr`.
+	#[repr(C)]
+	pub struct JpegErrorMgr {
+		pub mgr: jpeg_error_mgr,
+		pub jmp_buf: JmpBuf,
+	}
+
+	thread_local! {
+		/// Receives the formatted libjpeg error message set just before `longjmp`.
+		static JPEG_ERROR: Cell<Option<String>> = const { Cell::new(None) };
+	}
+
+	pub unsafe extern "C-unwind" fn jpeg_error_exit(cinfo: &mut jpeg_common_struct) {
+		let err = cinfo.err;
+		let msg_code = (*err).msg_code;
+
+		let mut buffer = [0u8; 80];
+		if let Some(fmt) = (*err).format_message {
+			// mozjpeg_sys binds the buffer as `&[u8; 80]` but C writes into it;
+			// transmute to the correct mutable signature at the call site.
+			let fmt_mut: unsafe extern "C-unwind" fn(&mut jpeg_common_struct, &mut [u8; 80]) = std::mem::transmute(fmt);
+			fmt_mut(cinfo, &mut buffer);
+		}
+		let end = buffer.iter().position(|&b| b == 0).unwrap_or(80);
+		let msg = String::from_utf8_lossy(&buffer[..end]).into_owned();
+		JPEG_ERROR.with(|e| e.set(Some(format!("libjpeg error {}: {}", msg_code, msg))));
+
+		let err_mgr = cinfo.err as *mut JpegErrorMgr;
+		longjmp(&raw mut (*err_mgr).jmp_buf, 1);
+	}
+
+	/// Sets up a mozjpeg decompressor, reads DCT coefficients from `jpeg_data`, and calls `body`
+	/// Rust objects allocated inside `body` before the error will leak because `longjmp` bypasses drop
+	pub unsafe fn with_decompressor<T, C, F>(jpeg_data: &[u8], configure: C, body: F) -> Result<T, JpegError>
+	where
+		C: FnOnce(&mut jpeg_decompress_struct),
+		F: FnOnce(&mut jpeg_decompress_struct, *mut *mut jvirt_barray_control) -> Result<T, JpegError>,
+	{
+		let mut err_mgr: JpegErrorMgr = std::mem::zeroed();
+		jpeg_std_error(&mut err_mgr.mgr);
+		err_mgr.mgr.error_exit = Some(jpeg_error_exit);
+
+		let mut srcinfo: jpeg_decompress_struct = std::mem::zeroed();
+		srcinfo.common.err = &mut err_mgr.mgr;
+
+		// setjmp before jpeg_create_decompress
+		// All libjpeg errors longjmp here so jpeg_destroy_decompress can always be called safely.
+		if _setjmp(&raw mut err_mgr.jmp_buf) != 0 {
+			jpeg_destroy_decompress(&mut srcinfo);
+			let msg = JPEG_ERROR.with(|e| e.take()).unwrap_or_default();
+			return Err(JpegError::Libjpeg(msg));
+		}
+
+		jpeg_create_decompress(&mut srcinfo);
+		// longjmp bypasses drop, so this guard only fires on the normal return path.
+		// The setjmp branch above handles cleanup when longjmp is called.
+		let _decompress_guard = DecompressGuard(&mut srcinfo as *mut _);
+		jpeg_mem_src(&mut srcinfo, jpeg_data.as_ptr(), jpeg_data.len() as c_ulong);
+		configure(&mut srcinfo);
+		jpeg_read_header(&mut srcinfo, 1);
+		let coef_arrays = jpeg_read_coefficients(&mut srcinfo);
+
+		let output = body(&mut srcinfo, coef_arrays);
+
+		if output.is_ok() {
+			jpeg_finish_decompress(&mut srcinfo);
+		}
+		// _decompress_guard drops here, calling jpeg_destroy_decompress.
+		output
+	}
 }
 
-/// Sets up a mozjpeg decompressor, reads DCT coefficients from `jpeg_data`, and calls `body`
-/// Rust objects allocated inside `body` before the error will leak because `longjmp` bypasses drop
-unsafe fn with_decompressor<T, C, F>(
-	jpeg_data: &[u8],
-	err_mgr: &mut JpegErrorMgr,
-	configure: C,
-	body: F,
-) -> Result<T, JpegError>
+#[cfg(target_env = "msvc")]
+mod error_impl {
+	use std::cell::Cell;
+
+	use libc::c_ulong;
+	use mozjpeg_sys::*;
+
+	use super::{DecompressGuard, JpegError};
+
+	/// Panic payload used to signal a libjpeg error through `catch_unwind`.
+	pub struct JpegPanic;
+
+	/// Suppresses the default stderr output for [`JpegPanic`] panics.
+	/// Those are controlled errors caught immediately by `catch_unwind`.
+	/// Call once at program startup.
+	pub fn suppress_jpeg_panic_output() {
+		let prev = std::panic::take_hook();
+		std::panic::set_hook(Box::new(move |info| {
+			if info.payload().downcast_ref::<JpegPanic>().is_none() {
+				prev(info);
+			}
+		}));
+	}
+
+	thread_local! {
+		static JPEG_PANIC_MSG: Cell<Option<String>> = const { Cell::new(None) };
+	}
+
+	pub unsafe extern "C-unwind" fn jpeg_error_exit(cinfo: &mut jpeg_common_struct) {
+		let err = cinfo.err;
+		let msg_code = (*err).msg_code;
+
+		let mut buffer = [0u8; 80];
+		if let Some(fmt) = (*err).format_message {
+			let fmt_mut: unsafe extern "C-unwind" fn(&mut jpeg_common_struct, &mut [u8; 80]) = std::mem::transmute(fmt);
+			fmt_mut(cinfo, &mut buffer);
+		}
+		let end = buffer.iter().position(|&b| b == 0).unwrap_or(80);
+		let msg = String::from_utf8_lossy(&buffer[..end]).into_owned();
+		JPEG_PANIC_MSG.with(|cell| cell.set(Some(format!("libjpeg error {}: {}", msg_code, msg))));
+		std::panic::panic_any(JpegPanic);
+	}
+
+	pub unsafe fn with_decompressor<T, C, F>(jpeg_data: &[u8], configure: C, body: F) -> Result<T, JpegError>
+	where
+		C: FnOnce(&mut jpeg_decompress_struct),
+		F: FnOnce(&mut jpeg_decompress_struct, *mut *mut jvirt_barray_control) -> Result<T, JpegError>,
+	{
+		let mut err_mgr: jpeg_error_mgr = std::mem::zeroed();
+		jpeg_std_error(&mut err_mgr);
+		err_mgr.error_exit = Some(jpeg_error_exit);
+
+		let mut srcinfo: jpeg_decompress_struct = std::mem::zeroed();
+		srcinfo.common.err = &mut err_mgr;
+
+		let p = &mut srcinfo as *mut jpeg_decompress_struct;
+
+		let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			jpeg_create_decompress(&mut *p);
+			// Guard fires on both the normal return and panic-unwind paths.
+			let _decompress_guard = DecompressGuard(p);
+			jpeg_mem_src(&mut *p, jpeg_data.as_ptr(), jpeg_data.len() as c_ulong);
+			configure(&mut *p);
+			jpeg_read_header(&mut *p, 1);
+			let coef_arrays = jpeg_read_coefficients(&mut *p);
+
+			let output = body(&mut *p, coef_arrays);
+
+			if output.is_ok() {
+				jpeg_finish_decompress(&mut *p);
+			}
+			// _decompress_guard drops here on the normal path.
+			output
+		}));
+
+		match result {
+			Ok(output) => output,
+			Err(payload) => {
+				// _decompress_guard already ran jpeg_destroy_decompress during unwind.
+				let msg = JPEG_PANIC_MSG.with(|cell| cell.take());
+				if let Some(msg) = msg {
+					Err(JpegError::Libjpeg(msg))
+				} else {
+					std::panic::resume_unwind(payload)
+				}
+			}
+		}
+	}
+}
+
+#[cfg(target_env = "msvc")]
+pub use error_impl::suppress_jpeg_panic_output;
+
+struct CompressGuard(*mut jpeg_compress_struct);
+
+impl Drop for CompressGuard {
+	fn drop(&mut self) {
+		unsafe { jpeg_destroy_compress(&mut *self.0) }
+	}
+}
+
+struct DecompressGuard(*mut jpeg_decompress_struct);
+
+impl Drop for DecompressGuard {
+	fn drop(&mut self) {
+		unsafe { jpeg_destroy_decompress(&mut *self.0) }
+	}
+}
+
+unsafe fn with_decompressor<T, C, F>(jpeg_data: &[u8], configure: C, body: F) -> Result<T, JpegError>
 where
 	C: FnOnce(&mut jpeg_decompress_struct),
 	F: FnOnce(&mut jpeg_decompress_struct, *mut *mut jvirt_barray_control) -> Result<T, JpegError>,
 {
-	let mut srcinfo: jpeg_decompress_struct = std::mem::zeroed();
-	srcinfo.common.err = &mut err_mgr.mgr;
-
-	// setjmp before jpeg_create_decompress
-	// All libjpeg errors longjmp here so jpeg_destroy_decompress can always be called safely.
-	if _setjmp(&raw mut err_mgr.jmp_buf) != 0 {
-		jpeg_destroy_decompress(&mut srcinfo);
-		let msg = JPEG_ERROR.take().unwrap_or_default();
-		return Err(JpegError::Libjpeg(msg));
-	}
-
-	jpeg_create_decompress(&mut srcinfo);
-	jpeg_mem_src(&mut srcinfo, jpeg_data.as_ptr(), jpeg_data.len() as c_ulong);
-	configure(&mut srcinfo);
-	jpeg_read_header(&mut srcinfo, 1);
-	let coef_arrays = jpeg_read_coefficients(&mut srcinfo);
-
-	let output = body(&mut srcinfo, coef_arrays);
-
-	// Finish only on the success path; always destroy.
-	if output.is_ok() {
-		jpeg_finish_decompress(&mut srcinfo);
-	}
-	jpeg_destroy_decompress(&mut srcinfo);
-
-	output
+	error_impl::with_decompressor(jpeg_data, configure, body)
 }
 
 pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> Result<OwnedJpeg, JpegError> {
-	let mut err_mgr: JpegErrorMgr = std::mem::zeroed();
-	jpeg_std_error(&mut err_mgr.mgr);
-	err_mgr.mgr.error_exit = Some(jpeg_error_exit);
-
 	with_decompressor(
 		jpeg_data,
-		&mut err_mgr,
 		|_| {},
 		|srcinfo, coef_arrays| {
 			if srcinfo.num_components != 3 {
@@ -233,13 +360,8 @@ pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> Result<OwnedJpeg, JpegError> 
 }
 
 pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> Result<Vec<u8>, JpegError> {
-	let mut err_mgr: JpegErrorMgr = std::mem::zeroed();
-	jpeg_std_error(&mut err_mgr.mgr);
-	err_mgr.mgr.error_exit = Some(jpeg_error_exit);
-
 	with_decompressor(
 		template_jpeg,
-		&mut err_mgr,
 		|srcinfo| {
 			jpeg_save_markers(srcinfo, 0xFE, 0xFFFF);
 			for m in 0..16 {
@@ -272,6 +394,8 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 			let mut dstinfo: jpeg_compress_struct = std::mem::zeroed();
 			dstinfo.common.err = srcinfo.common.err;
 			jpeg_create_compress(&mut dstinfo);
+			// Guard ensures jpeg_destroy_compress is called even if a mozjpeg error panics below.
+			let _compress_guard = CompressGuard(&mut dstinfo as *mut _);
 
 			let mut out_buffer: *mut c_uchar = ptr::null_mut();
 			let mut out_size: c_ulong = 0;
@@ -309,11 +433,11 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 			});
 
 			jpeg_finish_compress(&mut dstinfo);
-			jpeg_destroy_compress(&mut dstinfo);
 
 			let result_vec = std::slice::from_raw_parts(out_buffer, out_size as usize).to_vec();
 			free(out_buffer as *mut c_void);
 
+			// _compress_guard drops here, calling jpeg_destroy_compress.
 			Ok(result_vec)
 		},
 	)

@@ -24,7 +24,9 @@ use rayon::prelude::*;
 use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key};
 #[cfg(unix)]
 use jpegfs::filesystem::FileSystem;
-use jpegfs::jpeg::{get_capacity, read_owned_jpeg, write_owned_jpeg};
+#[cfg(unix)]
+use jpegfs::jpeg::get_capacity;
+use jpegfs::jpeg::{read_owned_jpeg, write_owned_jpeg};
 use jpegfs::jpeg_file::JpegSession;
 #[cfg(unix)]
 use jpegfs::pager::{BLOCK_SIZE, DecodedPages, PageId, Pager};
@@ -76,6 +78,8 @@ enum CliCommand {
 		input_dir: PathBuf,
 		#[arg(help = "Directory to write encoded JPEG files")]
 		output_dir: PathBuf,
+		#[arg(long, help = "Skip files whose output already exists in the output directory")]
+		skip_existing: bool,
 	},
 }
 
@@ -137,13 +141,20 @@ impl Drop for PersistOnDrop {
 }
 
 fn main() -> anyhow::Result<()> {
+	#[cfg(target_env = "msvc")]
+	jpegfs::jpeg::suppress_jpeg_panic_output();
 	let cli_args = parse_cli_args()?;
 
 	if let CliCommand::Reencode { input_dir, output_dir } = cli_args.command {
 		return run_reencode(&input_dir, &output_dir);
 	}
-	if let CliCommand::Simulate { input_dir, output_dir } = cli_args.command {
-		return run_simulate(&input_dir, &output_dir);
+	if let CliCommand::Simulate {
+		input_dir,
+		output_dir,
+		skip_existing,
+	} = cli_args.command
+	{
+		return run_simulate(&input_dir, &output_dir, skip_existing);
 	}
 
 	#[cfg(unix)]
@@ -582,10 +593,36 @@ fn reencode_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &Pro
 	Ok(())
 }
 
-fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
-	let jpeg_paths = discover_jpeg_paths_recursive(input_dir)?;
+fn run_simulate(input_dir: &Path, output_dir: &Path, skip_existing: bool) -> anyhow::Result<()> {
+	let all_paths = discover_jpeg_paths_recursive(input_dir)?;
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
+
+	let jpeg_paths: Vec<PathBuf> = if skip_existing {
+		let before = all_paths.len();
+		let remaining: Vec<PathBuf> = all_paths
+			.into_iter()
+			.filter(|p| {
+				let exists = p
+					.strip_prefix(input_dir)
+					.map(|rel| output_dir.join(rel).exists())
+					.unwrap_or(false);
+				!exists
+			})
+			.collect();
+		eprintln!(
+			"[simulate] skipping {} already-existing file(s)",
+			before - remaining.len()
+		);
+		remaining
+	} else {
+		all_paths
+	};
+
+	if jpeg_paths.is_empty() {
+		eprintln!("[simulate] nothing to do");
+		return Ok(());
+	}
 
 	let (pool, pb, label) = jpeg_operation_setup("simulate", jpeg_paths.len())?;
 	let results: Vec<anyhow::Result<()>> = pool.install(|| {
@@ -601,8 +638,13 @@ fn run_simulate(input_dir: &Path, output_dir: &Path) -> anyhow::Result<()> {
 	eprintln!("[{label}] done in {:.1?}", pb.elapsed());
 	pb.finish_and_clear();
 
-	for result in results {
-		result?;
+	let errors: Vec<anyhow::Error> = results.into_iter().filter_map(|r| r.err()).collect();
+	if !errors.is_empty() {
+		eprintln!("{} file(s) failed to simulate:", errors.len());
+		for err in &errors {
+			eprintln!("  {err:#}");
+		}
+		anyhow::bail!("{} file(s) failed to simulate", errors.len());
 	}
 	Ok(())
 }
@@ -618,16 +660,14 @@ fn simulate_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &Pro
 
 	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
 
-	let jpeg_capacity = get_capacity(&jpeg_bytes)
-		.with_context(|| format!("failed to compute JPEG capacity for {}", input_path.display()))?;
-	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity)
+	let mut session = JpegSession::in_memory(jpeg_bytes)
+		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
+
+	let embed_len = JpegBlockStore::persisted_embed_len(session.capacity())
 		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
 
 	let mut random_bytes = vec![0u8; embed_len];
 	rand::rng().fill_bytes(&mut random_bytes);
-
-	let mut session = JpegSession::in_memory(jpeg_bytes)
-		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
 	session
 		.write_data(&random_bytes)
 		.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;
@@ -958,8 +998,32 @@ fn configured_jpeg_threads() -> usize {
 	}
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+	use super::*;
+
+	const TRUNCATED_SOI: &[u8] = include_bytes!("../fuzz/fixtures/truncated_soi.jpg");
+
+	/// Exercises the error path through simulate_one so that a broken setjmp/longjmp
+	/// or panic/catch_unwind setup surfaces as a test failure rather than a mid-batch crash.
+	#[test]
+	fn simulate_one_returns_error_on_invalid_jpeg() {
+		// Suppress the JpegPanic stderr noise on MSVC builds where tests don't go through main().
+		#[cfg(target_env = "msvc")]
+		jpegfs::jpeg::suppress_jpeg_panic_output();
+
+		let dir = std::env::temp_dir();
+		let input_path = dir.join("truncated_soi.jpg");
+		std::fs::write(&input_path, TRUNCATED_SOI).expect("failed to write fixture");
+
+		let pb = indicatif::ProgressBar::hidden();
+		let result = simulate_one(&input_path, &dir, &dir, &pb);
+		assert!(result.is_err(), "expected an error for a truncated JPEG, got Ok");
+	}
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
 	use super::*;
 
 	fn probed_store(path: &str, theoretical_page_capacity: usize, decrypted_data: Option<Vec<u8>>) -> ProbedStore {

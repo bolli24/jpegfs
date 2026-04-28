@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -80,6 +80,11 @@ enum CliCommand {
 		output_dir: PathBuf,
 		#[arg(long, help = "Skip files whose output already exists in the output directory")]
 		skip_existing: bool,
+		#[arg(
+			long,
+			help = "Seed for deterministic random data (same seed + same files -> identical jpeg output)"
+		)]
+		seed: Option<u64>,
 	},
 }
 
@@ -152,9 +157,10 @@ fn main() -> anyhow::Result<()> {
 		input_dir,
 		output_dir,
 		skip_existing,
+		seed,
 	} = cli_args.command
 	{
-		return run_simulate(&input_dir, &output_dir, skip_existing);
+		return run_simulate(&input_dir, &output_dir, skip_existing, seed);
 	}
 
 	#[cfg(unix)]
@@ -593,7 +599,7 @@ fn reencode_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &Pro
 	Ok(())
 }
 
-fn run_simulate(input_dir: &Path, output_dir: &Path, skip_existing: bool) -> anyhow::Result<()> {
+fn run_simulate(input_dir: &Path, output_dir: &Path, skip_existing: bool, seed: Option<u64>) -> anyhow::Result<()> {
 	let all_paths = discover_jpeg_paths_recursive(input_dir)?;
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
@@ -629,7 +635,7 @@ fn run_simulate(input_dir: &Path, output_dir: &Path, skip_existing: bool) -> any
 		jpeg_paths
 			.par_iter()
 			.map(|input_path| {
-				let result = simulate_one(input_path, input_dir, output_dir, &pb);
+				let result = simulate_one(input_path, input_dir, output_dir, &pb, seed);
 				pb.inc(1);
 				result
 			})
@@ -649,7 +655,13 @@ fn run_simulate(input_dir: &Path, output_dir: &Path, skip_existing: bool) -> any
 	Ok(())
 }
 
-fn simulate_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &ProgressBar) -> anyhow::Result<()> {
+fn simulate_one(
+	input_path: &Path,
+	input_dir: &Path,
+	output_dir: &Path,
+	pb: &ProgressBar,
+	seed: Option<u64>,
+) -> anyhow::Result<()> {
 	let rel = input_path
 		.strip_prefix(input_dir)
 		.with_context(|| format!("path {} is not under {}", input_path.display(), input_dir.display()))?;
@@ -660,6 +672,14 @@ fn simulate_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &Pro
 
 	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
 
+	let file_seed: Option<u64> = seed.map(|base_seed| {
+		// FNV-1a: https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function
+		let path_hash = rel.to_string_lossy().bytes().fold(0xcbf29ce484222325u64, |h, b| {
+			(h ^ (b as u64)).wrapping_mul(0x100000001b3)
+		});
+		base_seed ^ path_hash
+	});
+
 	let mut session = JpegSession::in_memory(jpeg_bytes)
 		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
 
@@ -667,7 +687,10 @@ fn simulate_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &Pro
 		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
 
 	let mut random_bytes = vec![0u8; embed_len];
-	rand::rng().fill_bytes(&mut random_bytes);
+	match file_seed {
+		None => rand::rng().fill_bytes(&mut random_bytes),
+		Some(s) => rand::rngs::StdRng::seed_from_u64(s).fill_bytes(&mut random_bytes),
+	}
 	session
 		.write_data(&random_bytes)
 		.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;
@@ -1017,7 +1040,7 @@ mod tests {
 		std::fs::write(&input_path, TRUNCATED_SOI).expect("failed to write fixture");
 
 		let pb = indicatif::ProgressBar::hidden();
-		let result = simulate_one(&input_path, &dir, &dir, &pb);
+		let result = simulate_one(&input_path, &dir, &dir, &pb, None);
 		assert!(result.is_err(), "expected an error for a truncated JPEG, got Ok");
 	}
 }

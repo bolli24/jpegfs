@@ -374,7 +374,7 @@ impl JpegBlockStore {
 #[cfg(all(test, unix))]
 mod tests {
 	use super::*;
-	use crate::ino::{INodeNo, ino_from_u64};
+	use crate::ino::ino_from_u64;
 	use crate::inode::{FileType, Inode};
 	use crate::jpeg::get_capacity;
 	use crate::pager::Pager;

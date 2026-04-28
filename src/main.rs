@@ -904,15 +904,15 @@ fn persist_filesystem(
 		target_page_ids_per_store[store_index] = Some(desired_page_ids);
 	}
 
-	let (pool, pb, label) = jpeg_operation_setup("persist", stores.len())?;
-	let persist_results: Vec<anyhow::Result<bool>> = pool.install(|| {
+	let dirty_count = target_page_ids_per_store.iter().filter(|t| t.is_some()).count();
+	let (pool, pb, label) = jpeg_operation_setup("persist", dirty_count)?;
+	let persist_results: Vec<anyhow::Result<usize>> = pool.install(|| {
 		stores
 			.par_iter_mut()
 			.enumerate()
 			.map(|(store_index, store)| {
 				let Some(target_page_ids) = target_page_ids_per_store[store_index].as_ref() else {
-					pb.inc(1);
-					return Ok(false);
+					return Ok(0);
 				};
 				let mut blocks = Vec::with_capacity(target_page_ids.len());
 				for page_id in target_page_ids {
@@ -924,6 +924,11 @@ fn persist_filesystem(
 				let result = store
 					.persist_blocks(&blocks)
 					.with_context(|| format!("failed to persist encoded pages to JPEG store index {}", store_index));
+				if let Ok(n) = result {
+					if n > 0 {
+						pb.println(format!("Wrote '{}': {}KiB", store.path().display(), n / 1024));
+					}
+				}
 				pb.inc(1);
 				result
 			})
@@ -935,7 +940,7 @@ fn persist_filesystem(
 		.into_iter()
 		.collect::<anyhow::Result<Vec<_>>>()?
 		.into_iter()
-		.filter(|wrote| *wrote)
+		.filter(|n| *n > 0)
 		.count();
 	let skipped_stores = stores.len().saturating_sub(written_stores);
 	info!(

@@ -313,7 +313,7 @@ impl JpegBlockStore {
 		self.persisted_blocks.get(slot)
 	}
 
-	pub fn persist_blocks(&mut self, blocks: &[[u8; BLOCK_SIZE]]) -> Result<bool, Error> {
+	pub fn persist_blocks(&mut self, blocks: &[[u8; BLOCK_SIZE]]) -> Result<usize, Error> {
 		let pages_used = u16::try_from(blocks.len()).unwrap_or(u16::MAX);
 		if pages_used > self.header.page_capacity {
 			return Err(Error::InvalidPageCount {
@@ -338,7 +338,7 @@ impl JpegBlockStore {
 				.zip(self.persisted_blocks.iter())
 				.any(|(new_block, old_block)| new_block != old_block);
 		if !is_dirty {
-			return Ok(false);
+			return Ok(0);
 		}
 
 		let payload_len = usize::from(self.header.page_capacity) * BLOCK_SIZE;
@@ -359,7 +359,7 @@ impl JpegBlockStore {
 		let new_jpeg =
 			crypto::write_encrypted_with_key(&self.jpeg_bytes, &self.key, &plaintext).map_err(Error::JpegEncrypt)?;
 		fs::write(&self.path, &new_jpeg).map_err(Error::Io)?;
-		println!("Wrote '{}': {}KiB", self.path.display(), new_jpeg.len() / 1024);
+		let written_len = new_jpeg.len();
 
 		self.header = next_header;
 		self.pages_map = new_pages_map;
@@ -367,7 +367,7 @@ impl JpegBlockStore {
 		self.jpeg_bytes = new_jpeg;
 		self.needs_initial_write = false;
 
-		Ok(true)
+		Ok(written_len)
 	}
 }
 
@@ -742,11 +742,11 @@ mod tests {
 			.expect("write should succeed");
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
 		let wrote = store.persist_blocks(&encoded).expect("persist should succeed");
-		assert!(wrote, "changed blocks should be persisted");
+		assert!(wrote > 0, "changed blocks should be persisted");
 		let wrote_again = store
 			.persist_blocks(&encoded)
 			.expect("idempotent persist should succeed");
-		assert!(!wrote_again, "unchanged blocks should not be persisted");
+		assert!(wrote_again == 0, "unchanged blocks should not be persisted");
 		drop(store);
 
 		let jpeg_bytes2 = fs::read(&path).expect("persisted jpeg should be readable");

@@ -248,6 +248,7 @@ fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
 		"jpeg directory does not exist or is not a directory: {}",
 		jpeg_dir.display()
 	);
+
 	Ok(cli_args)
 }
 
@@ -259,6 +260,17 @@ fn prepare_mount_dir(mount_dir: &Path) -> anyhow::Result<MountDirState> {
 			"mount path exists but is not a directory: {}",
 			mount_dir.display()
 		);
+
+		let mut dir_entries = mount_dir
+			.read_dir()
+			.with_context(|| format!("failed to read mount directory: {}", mount_dir.display()))?;
+
+		anyhow::ensure!(
+			dir_entries.next().is_none(),
+			"mount directory is not empty: {}",
+			mount_dir.display()
+		);
+
 		return Ok(MountDirState {
 			mount_dir: mount_dir.to_path_buf(),
 			created_by_process: false,

@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use rand::{Rng, SeedableRng};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use walkdir::WalkDir;
 
 #[cfg(unix)]
@@ -228,7 +229,10 @@ fn resolve_passphrase() -> anyhow::Result<String> {
 	if let Ok(p) = std::env::var("JPEGFS_PASSPHRASE") {
 		return Ok(p);
 	}
-	rpassword::prompt_password("jpegfs passphrase: ").context("failed to read passphrase from terminal")
+	let passphrase =
+		rpassword::prompt_password("jpegfs passphrase: ").context("failed to read passphrase from terminal")?;
+	eprintln!();
+	Ok(passphrase)
 }
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
@@ -448,6 +452,7 @@ fn load_or_init_stores(
 		// before irreversibly overwriting data.
 		let confirmed = rpassword::prompt_password("confirm passphrase: ")
 			.context("failed to read passphrase confirmation from terminal")?;
+		eprintln!();
 		anyhow::ensure!(
 			confirmed == passphrase,
 			"passphrase confirmation did not match - aborting to avoid data loss"
@@ -1010,6 +1015,8 @@ fn jpeg_operation_setup(label: &'static str, count: usize) -> anyhow::Result<(Th
 			.unwrap()
 			.progress_chars("=>-"),
 	);
+	pb.enable_steady_tick(Duration::from_millis(100));
+	pb.tick();
 	Ok((pool, pb, label))
 }
 

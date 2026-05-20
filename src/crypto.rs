@@ -137,6 +137,7 @@ fn decode_strategy_marker(key: &[u8; 32], encoded: u8) -> Result<EmbeddingStrate
 ///
 /// Nothing written into the JPEG is in plaintext. Layout:
 /// ```text
+/// [ embedding strategy marker : 8 bytes]
 /// [ AEAD(key, nonce_h, rand_nonce_data[12] || len_u32[4]) : 32 bytes ]
 /// [ AEAD(key, rand_nonce_data, plaintext)                 : len + 16 bytes ]
 /// ```

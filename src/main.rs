@@ -497,7 +497,7 @@ fn probe_one_store(index: usize, path: &Path, passphrase: &str) -> anyhow::Resul
 
 	let decrypted_data = match read_encrypted_with_key(&jpeg_bytes, &key) {
 		Ok(data) => Some(data),
-		Err(CryptoError::Aead) => None,
+		Err(CryptoError::Aead | CryptoError::UnsupportedEmbeddingStrategy { .. }) => None,
 		Err(e) => return Err(e).context(format!("unexpected error decrypting {}", path.display())),
 	};
 

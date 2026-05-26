@@ -138,6 +138,7 @@ struct AppState {
 	mount_path: String,
 	started_at: Instant,
 	stats: FsDashboardStats,
+	process_memory_bytes: Option<u64>,
 	logs: VecDeque<LogEvent>,
 	filter: LogFilter,
 	scroll: u16,
@@ -151,6 +152,7 @@ impl AppState {
 			mount_path: mount_path.display().to_string(),
 			started_at: Instant::now(),
 			stats,
+			process_memory_bytes: current_process_memory_bytes(),
 			logs: VecDeque::with_capacity(LOG_BUFFER_CAPACITY),
 			filter: LogFilter::Info,
 			scroll: 0,
@@ -192,6 +194,7 @@ impl AppState {
 	fn refresh_stats(&mut self, fs: &FileSystem) {
 		let state = fs.state.read();
 		self.stats = state.dashboard_stats();
+		self.process_memory_bytes = current_process_memory_bytes();
 	}
 }
 
@@ -325,6 +328,7 @@ fn draw_ui(frame: &mut ratatui::Frame<'_>, app: &mut AppState, now: Instant) {
 		Line::from(format!("Ops total: {}", app.op_counters.total)),
 		Line::from(format!("Ops/10s: {rate}")),
 		Line::from(top_ops_line),
+		Line::from(format!("Memory: {}", format_memory_usage(app.process_memory_bytes))),
 		Line::from(format!("Log filter: {}", app.filter.label())),
 	];
 	let ops = Paragraph::new(ops_text).block(Block::default().title("Activity").borders(Borders::ALL));
@@ -393,6 +397,24 @@ fn parse_op_name(message: &str) -> Option<&str> {
 		Some(name)
 	} else {
 		None
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_memory_bytes() -> Option<u64> {
+	let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+	let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+	let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+	if page_size <= 0 {
+		return None;
+	}
+	Some(resident_pages.saturating_mul(page_size as u64))
+}
+
+fn format_memory_usage(bytes: Option<u64>) -> String {
+	match bytes {
+		Some(bytes) => format!("{:.1} MiB", bytes as f64 / 1024.0 / 1024.0),
+		None => "unavailable".to_string(),
 	}
 }
 

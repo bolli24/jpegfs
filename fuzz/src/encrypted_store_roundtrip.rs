@@ -1,16 +1,16 @@
 #![no_main]
 
-#[path = "common.rs"]
 mod common;
 
 use jpegfs::crypto::{CryptoError, read_encrypted_with_key, write_encrypted_with_key};
 use jpegfs::jpeg_file::JpegFileError;
+use jpegfs::strategy::EmbeddingStrategyId;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|plaintext: Vec<u8>| {
 	let key = common::key();
 
-	let new_jpeg = match write_encrypted_with_key(common::TEMPLATE_JPEG, key, &plaintext) {
+	let new_jpeg = match write_encrypted_with_key(common::TEMPLATE_JPEG, key, &plaintext, EmbeddingStrategyId::Lsb) {
 		Ok(j) => j,
 		// Plaintext too large for this cover image — not a bug.
 		Err(CryptoError::JpegFile(JpegFileError::WriteOutOfCapacity { .. })) => return,

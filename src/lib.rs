@@ -12,6 +12,7 @@ pub mod pager;
 pub mod pager_error;
 pub mod persistence;
 pub mod store;
+pub mod strategy;
 pub mod zigzag;
 
 pub const MAGIC: [u8; 4] = *b"JPGF";

@@ -7,6 +7,7 @@ use crate::crypto::{self, CRYPTO_OVERHEAD, CryptoError};
 use crate::pager::BLOCK_SIZE;
 use crate::pager::{DecodedPages, PageId, Pager};
 use crate::pager_error::PagerCodecError;
+use crate::strategy::EmbeddingStrategyId;
 use crc::Crc;
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -61,6 +62,7 @@ pub struct JpegBlockStore {
 	header: FileHeaderV1,
 	path: PathBuf,
 	key: [u8; 32],
+	embedding_strategy_id: EmbeddingStrategyId,
 	/// Cached raw JPEG bytes. `persist_blocks` uses this directly instead of re-reading from disk,
 	/// then updates it to the data after each successful write.
 	jpeg_bytes: Vec<u8>,
@@ -81,13 +83,33 @@ impl JpegBlockStore {
 		key: [u8; 32],
 		jpeg_bytes: Vec<u8>,
 	) -> Result<(Self, DecodedPages), Error> {
+		Self::from_bytes_or_init_strict_with_strategy(
+			path,
+			decrypted_data,
+			jpeg_capacity,
+			key,
+			jpeg_bytes,
+			EmbeddingStrategyId::Lsb,
+		)
+	}
+
+	pub fn from_bytes_or_init_strict_with_strategy(
+		path: PathBuf,
+		decrypted_data: &[u8],
+		jpeg_capacity: usize,
+		key: [u8; 32],
+		jpeg_bytes: Vec<u8>,
+		embedding_strategy_id: EmbeddingStrategyId,
+	) -> Result<(Self, DecodedPages), Error> {
 		if decrypted_data.is_empty() {
-			return Self::init_new(path, jpeg_capacity, key, jpeg_bytes);
+			return Self::init_new_with_strategy(path, jpeg_capacity, key, jpeg_bytes, embedding_strategy_id);
 		}
 
 		let header = match Self::decode_header_strict(decrypted_data) {
 			Ok(header) => header,
-			Err(Error::MissingHeaderMagic) => return Self::init_new(path, jpeg_capacity, key, jpeg_bytes),
+			Err(Error::MissingHeaderMagic) => {
+				return Self::init_new_with_strategy(path, jpeg_capacity, key, jpeg_bytes, embedding_strategy_id);
+			}
 			Err(err) => return Err(err),
 		};
 
@@ -204,6 +226,7 @@ impl JpegBlockStore {
 				header,
 				path,
 				key,
+				embedding_strategy_id: EmbeddingStrategyId::Lsb,
 				jpeg_bytes,
 				pages_map,
 				persisted_blocks,
@@ -218,6 +241,16 @@ impl JpegBlockStore {
 		jpeg_capacity: usize,
 		key: [u8; 32],
 		jpeg_bytes: Vec<u8>,
+	) -> Result<(Self, DecodedPages), Error> {
+		Self::init_new_with_strategy(path, jpeg_capacity, key, jpeg_bytes, EmbeddingStrategyId::Lsb)
+	}
+
+	pub fn init_new_with_strategy(
+		path: PathBuf,
+		jpeg_capacity: usize,
+		key: [u8; 32],
+		jpeg_bytes: Vec<u8>,
+		embedding_strategy_id: EmbeddingStrategyId,
 	) -> Result<(Self, DecodedPages), Error> {
 		let page_capacity = Self::page_capacity_for_jpeg_capacity(jpeg_capacity)?
 			.try_into()
@@ -240,6 +273,7 @@ impl JpegBlockStore {
 				header,
 				path,
 				key,
+				embedding_strategy_id,
 				jpeg_bytes,
 				pages_map: HashMap::new(),
 				persisted_blocks: Vec::new(),
@@ -357,7 +391,8 @@ impl JpegBlockStore {
 		plaintext.extend_from_slice(&payload);
 
 		let new_jpeg =
-			crypto::write_encrypted_with_key(&self.jpeg_bytes, &self.key, &plaintext).map_err(Error::JpegEncrypt)?;
+			crypto::write_encrypted_with_key(&self.jpeg_bytes, &self.key, &plaintext, self.embedding_strategy_id)
+				.map_err(Error::JpegEncrypt)?;
 		fs::write(&self.path, &new_jpeg).map_err(Error::Io)?;
 		let written_len = new_jpeg.len();
 

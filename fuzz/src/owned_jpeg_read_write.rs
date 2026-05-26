@@ -2,15 +2,34 @@
 
 use jpegfs::{
 	jpeg::{OwnedJpeg, read_owned_jpeg, write_owned_jpeg},
-	jpeg_file::JpegSession,
+	jpeg_file::BitSlot,
 	lsb::{get_lsb, read_bit_from_bytes, set_lsb, write_bit_to_bytes},
+	zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES},
 };
 use libfuzzer_sys::fuzz_target;
 
 const TEMPLATE_JPEG: &[u8] = include_bytes!("../fixtures/tiny_crw_2609_16x8.jpg");
 
+fn collect_bit_slots(owned: &OwnedJpeg) -> Vec<BitSlot> {
+	let mut bit_slots = Vec::new();
+	for (component_index, component) in owned.components.iter().enumerate() {
+		for (block_index, block) in component.blocks.iter().enumerate() {
+			for &coeff_index in ZIGZAG_INDICES.iter().skip(RESERVED_ZIGZAG_COEFFS) {
+				if !matches!(block[coeff_index], -1..=1) {
+					bit_slots.push(BitSlot {
+						component_index,
+						block_index,
+						coeff_index,
+					});
+				}
+			}
+		}
+	}
+	bit_slots
+}
+
 fn overwrite_bytes(owned: &mut OwnedJpeg, data: &[u8], offset: usize) {
-	let bit_slots = JpegSession::collect_bit_slots(owned);
+	let bit_slots = collect_bit_slots(owned);
 	let start_bit = offset * 8;
 
 	for data_bit in 0..(data.len() * 8) {
@@ -22,7 +41,7 @@ fn overwrite_bytes(owned: &mut OwnedJpeg, data: &[u8], offset: usize) {
 }
 
 fn read_back_bytes(owned: &OwnedJpeg, len: usize, offset: usize) -> Vec<u8> {
-	let bit_slots = JpegSession::collect_bit_slots(owned);
+	let bit_slots = collect_bit_slots(owned);
 	let start_bit = offset * 8;
 	let mut read_back = vec![0u8; len];
 
@@ -52,7 +71,7 @@ fuzz_target!(|input: (Vec<u8>, u8)| {
 		assert_eq!(component.height_in_blocks, 1);
 	}
 
-	let bit_slots = JpegSession::collect_bit_slots(&owned);
+	let bit_slots = collect_bit_slots(&owned);
 	let capacity_bytes = bit_slots.len() / 8;
 	data.truncate(capacity_bytes);
 

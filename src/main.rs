@@ -21,6 +21,7 @@ use log::{error, info, warn};
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
+use jpegfs::crypto::STRATEGY_MARKER_SIZE;
 #[cfg(unix)]
 use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key};
 #[cfg(unix)]
@@ -32,6 +33,7 @@ use jpegfs::jpeg_file::JpegSession;
 #[cfg(unix)]
 use jpegfs::pager::{BLOCK_SIZE, DecodedPages, PageId, Pager};
 use jpegfs::persistence::JpegBlockStore;
+use jpegfs::strategy::EmbeddingStrategyId;
 
 #[cfg(unix)]
 mod tui;
@@ -86,6 +88,8 @@ enum CliCommand {
 			help = "Seed for deterministic random data (same seed + same files -> identical jpeg output)"
 		)]
 		seed: Option<u64>,
+		#[arg(long, default_value = "lsb", value_parser = parse_embedding_strategy)]
+		strategy: EmbeddingStrategyId,
 	},
 }
 
@@ -159,9 +163,10 @@ fn main() -> anyhow::Result<()> {
 		output_dir,
 		skip_existing,
 		seed,
+		strategy,
 	} = cli_args.command
 	{
-		return run_simulate(&input_dir, &output_dir, skip_existing, seed);
+		return run_simulate(&input_dir, &output_dir, skip_existing, seed, strategy);
 	}
 
 	#[cfg(unix)]
@@ -237,6 +242,46 @@ fn resolve_passphrase() -> anyhow::Result<String> {
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
 	validate_cli_args(CliArgs::parse())
+}
+
+fn parse_embedding_strategy(value: &str) -> Result<EmbeddingStrategyId, String> {
+	match value {
+		"lsb" => Ok(EmbeddingStrategyId::Lsb),
+		"lsb50" => Ok(EmbeddingStrategyId::Lsb50),
+		_ => Err(format!(
+			"unsupported embedding strategy '{value}', expected 'lsb' or 'lsb50'"
+		)),
+	}
+}
+
+#[cfg(unix)]
+fn prompt_embedding_strategy() -> anyhow::Result<EmbeddingStrategyId> {
+	eprintln!("Choose embedding strategy for the newly initialized stores:");
+	for (index, strategy) in EmbeddingStrategyId::ALL.iter().enumerate() {
+		eprintln!("  {}. {} ({})", index + 1, strategy, strategy.description());
+	}
+	eprint!("Embedding strategy [1]: ");
+
+	let stdin = std::io::stdin();
+	let mut input = String::new();
+	stdin
+		.lock()
+		.read_line(&mut input)
+		.context("failed to read embedding strategy selection from stdin")?;
+
+	let trimmed = input.trim();
+	if trimmed.is_empty() {
+		return Ok(EmbeddingStrategyId::ALL[0]);
+	}
+
+	let choice = trimmed
+		.parse::<usize>()
+		.with_context(|| format!("invalid embedding strategy selection '{trimmed}'"))?;
+	anyhow::ensure!(choice > 0, "embedding strategy selection 0 is out of range");
+	EmbeddingStrategyId::ALL
+		.get(choice - 1)
+		.copied()
+		.with_context(|| format!("embedding strategy selection {choice} is out of range"))
 }
 
 fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
@@ -429,39 +474,62 @@ fn load_or_init_stores(
 		.map(|store| &store.path)
 		.collect();
 
-	if !failed_paths.is_empty() {
-		eprintln!("{} JPEG store(s) could not be decrypted:", failed_paths.len());
-		for path in &failed_paths {
-			eprintln!("  {}", path.display());
-		}
-		eprintln!("Passphrase wrong or stores not initialized.");
-		eprint!("Type OVERWRITE to initialize empty (possible existing data will be lost), or press Enter to abort: ");
-
-		let stdin = std::io::stdin();
-		let mut input = String::new();
-		stdin
-			.lock()
-			.read_line(&mut input)
-			.context("failed to read confirmation from stdin")?;
-		anyhow::ensure!(
-			input.trim() == "OVERWRITE",
-			"aborted: encrypted JPEG stores could not be decrypted"
-		);
-
-		// Re-prompt for the passphrase so the user confirms their intended key
-		// before irreversibly overwriting data.
-		let confirmed = rpassword::prompt_password("confirm passphrase: ")
-			.context("failed to read passphrase confirmation from terminal")?;
-		eprintln!();
-		anyhow::ensure!(
-			confirmed == passphrase,
-			"passphrase confirmation did not match - aborting to avoid data loss"
-		);
-	}
-
 	let mut stores = Vec::with_capacity(probed_stores.len());
 	let mut decoded_pages = DecodedPages::empty();
 	let mut total_page_capacity = 0usize;
+
+	if failed_paths.is_empty() {
+		for probed_store in probed_stores {
+			let ProbedStore {
+				path,
+				jpeg_bytes,
+				key,
+				decrypted_data,
+				..
+			} = probed_store;
+			let decrypted_data = decrypted_data.context("internal error: decrypted store missing after probe check")?;
+			let (store, pages) = JpegBlockStore::from_bytes_strict(path.clone(), &decrypted_data, key, jpeg_bytes)
+				.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
+			let loaded_store = LoadedStore { pages, store };
+			total_page_capacity = total_page_capacity
+				.checked_add(loaded_store.store.page_capacity())
+				.context("total page capacity overflow while loading JPEG stores")?;
+			decoded_pages.append(loaded_store.pages);
+			stores.push(loaded_store.store);
+		}
+
+		return Ok((stores, decoded_pages, total_page_capacity));
+	}
+
+	eprintln!("{} JPEG store(s) could not be decrypted:", failed_paths.len());
+	for path in &failed_paths {
+		eprintln!("  {}", path.display());
+	}
+	eprintln!("Passphrase wrong or stores not initialized.");
+	eprint!("Type OVERWRITE to initialize empty (possible existing data will be lost), or press Enter to abort: ");
+
+	let stdin = std::io::stdin();
+	let mut input = String::new();
+	stdin
+		.lock()
+		.read_line(&mut input)
+		.context("failed to read confirmation from stdin")?;
+	anyhow::ensure!(
+		input.trim() == "OVERWRITE",
+		"aborted: encrypted JPEG stores could not be decrypted"
+	);
+
+	let overwrite_strategy = prompt_embedding_strategy()?;
+
+	// Re-prompt for the passphrase so the user confirms their intended key
+	// before irreversibly overwriting data.
+	let confirmed = rpassword::prompt_password("confirm passphrase: ")
+		.context("failed to read passphrase confirmation from terminal")?;
+	eprintln!();
+	anyhow::ensure!(
+		confirmed == passphrase,
+		"passphrase confirmation did not match - aborting to avoid data loss"
+	);
 
 	for probed_store in probed_stores {
 		let ProbedStore {
@@ -472,10 +540,13 @@ fn load_or_init_stores(
 			decrypted_data,
 			..
 		} = probed_store;
-		let decrypted_data = decrypted_data.unwrap_or_default();
-		let (store, pages) =
-			JpegBlockStore::from_bytes_or_init_strict(path.clone(), &decrypted_data, jpeg_capacity, key, jpeg_bytes)
-				.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
+		let (store, pages) = match decrypted_data {
+			Some(decrypted_data) => JpegBlockStore::from_bytes_strict(path.clone(), &decrypted_data, key, jpeg_bytes),
+			None => {
+				JpegBlockStore::init_new_with_strategy(path.clone(), jpeg_capacity, key, jpeg_bytes, overwrite_strategy)
+			}
+		}
+		.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
 		let loaded_store = LoadedStore { pages, store };
 		total_page_capacity = total_page_capacity
 			.checked_add(loaded_store.store.page_capacity())
@@ -616,7 +687,13 @@ fn reencode_one(input_path: &Path, input_dir: &Path, output_dir: &Path, pb: &Pro
 	Ok(())
 }
 
-fn run_simulate(input_dir: &Path, output_dir: &Path, skip_existing: bool, seed: Option<u64>) -> anyhow::Result<()> {
+fn run_simulate(
+	input_dir: &Path,
+	output_dir: &Path,
+	skip_existing: bool,
+	seed: Option<u64>,
+	strategy: EmbeddingStrategyId,
+) -> anyhow::Result<()> {
 	let all_paths = discover_jpeg_paths_recursive(input_dir)?;
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
@@ -652,7 +729,7 @@ fn run_simulate(input_dir: &Path, output_dir: &Path, skip_existing: bool, seed: 
 		jpeg_paths
 			.par_iter()
 			.map(|input_path| {
-				let result = simulate_one(input_path, input_dir, output_dir, &pb, seed);
+				let result = simulate_one(input_path, input_dir, output_dir, &pb, seed, strategy);
 				pb.inc(1);
 				result
 			})
@@ -678,6 +755,7 @@ fn simulate_one(
 	output_dir: &Path,
 	pb: &ProgressBar,
 	seed: Option<u64>,
+	strategy: EmbeddingStrategyId,
 ) -> anyhow::Result<()> {
 	let rel = input_path
 		.strip_prefix(input_dir)
@@ -690,7 +768,7 @@ fn simulate_one(
 	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
 
 	let file_seed: Option<u64> = seed.map(|base_seed| {
-		// FNV-1a: https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function
+		// FNV-1a: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
 		let path_hash = rel.to_string_lossy().bytes().fold(0xcbf29ce484222325u64, |h, b| {
 			(h ^ (b as u64)).wrapping_mul(0x100000001b3)
 		});
@@ -700,18 +778,24 @@ fn simulate_one(
 	let mut session = JpegSession::in_memory(jpeg_bytes)
 		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
 
-	let embed_len = JpegBlockStore::persisted_embed_len(session.capacity())
+	session
+		.write_strategy_marker_lsb(u8::from(strategy))
+		.with_context(|| format!("failed to embed strategy marker into {}", input_path.display()))?;
+	let mut embedding_session = session.into_embedding_session(strategy);
+	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.remaining_bytes();
+	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity)
 		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
+	let payload_embed_len = embed_len.saturating_sub(STRATEGY_MARKER_SIZE);
 
-	let mut random_bytes = vec![0u8; embed_len];
+	let mut random_bytes = vec![0u8; payload_embed_len];
 	match file_seed {
 		None => rand::rng().fill_bytes(&mut random_bytes),
 		Some(s) => rand::rngs::StdRng::seed_from_u64(s).fill_bytes(&mut random_bytes),
 	}
-	session
+	embedding_session
 		.write_data(&random_bytes)
 		.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;
-	let output_bytes = session
+	let output_bytes = embedding_session
 		.to_jpeg_bytes()
 		.with_context(|| format!("failed to re-encode JPEG {}", input_path.display()))?;
 
@@ -1064,7 +1148,7 @@ mod tests {
 		std::fs::write(&input_path, TRUNCATED_SOI).expect("failed to write fixture");
 
 		let pb = indicatif::ProgressBar::hidden();
-		let result = simulate_one(&input_path, &dir, &dir, &pb, None);
+		let result = simulate_one(&input_path, &dir, &dir, &pb, None, EmbeddingStrategyId::Lsb);
 		assert!(result.is_err(), "expected an error for a truncated JPEG, got Ok");
 	}
 }

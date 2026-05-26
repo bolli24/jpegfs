@@ -1,15 +1,34 @@
 #![no_main]
 
-use jpegfs::jpeg_file::JpegSession;
 use jpegfs::{
 	jpeg::OwnedJpeg,
+	jpeg_file::BitSlot,
 	lsb::{get_lsb, read_bit_from_bytes, set_lsb, write_bit_to_bytes},
+	zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES},
 };
 use libfuzzer_sys::fuzz_target;
 
+fn collect_bit_slots(owned: &OwnedJpeg) -> Vec<BitSlot> {
+	let mut bit_slots = Vec::new();
+	for (component_index, component) in owned.components.iter().enumerate() {
+		for (block_index, block) in component.blocks.iter().enumerate() {
+			for &coeff_index in ZIGZAG_INDICES.iter().skip(RESERVED_ZIGZAG_COEFFS) {
+				if !matches!(block[coeff_index], -1..=1) {
+					bit_slots.push(BitSlot {
+						component_index,
+						block_index,
+						coeff_index,
+					});
+				}
+			}
+		}
+	}
+	bit_slots
+}
+
 fuzz_target!(|input: (OwnedJpeg, [u8; 8], u16)| {
 	let (mut owned, data, offset_seed) = input;
-	let bit_slots = JpegSession::collect_bit_slots(&owned);
+	let bit_slots = collect_bit_slots(&owned);
 	let capacity_bytes = bit_slots.len() / 8;
 
 	if capacity_bytes < data.len() {

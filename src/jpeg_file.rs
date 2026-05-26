@@ -1,12 +1,13 @@
-use std::io::{Seek, Write};
-use std::path::{Path, PathBuf};
-use std::{fs, fs::File, io, io::Read};
+use std::io::Write;
+use std::path::PathBuf;
+use std::{fs::File, io};
 
-use thiserror::Error;
-
-use crate::jpeg::{JpegError, OwnedJpeg, get_capacity, read_owned_jpeg, write_owned_jpeg};
+use crate::crypto::STRATEGY_MARKER_SIZE;
+use crate::jpeg::{JpegError, OwnedJpeg, read_owned_jpeg, write_owned_jpeg};
 use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
+use crate::strategy::{EmbeddingStrategy, EmbeddingStrategyId, strategy_from_id};
 use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum JpegFileError {
@@ -36,6 +37,8 @@ pub enum JpegFileError {
 	NotByteAligned { bit_offset: usize },
 	#[error("bit offset {bit_offset} exceeds available capacity of {capacity_bits} bits")]
 	BitOffsetOutOfRange { bit_offset: usize, capacity_bits: usize },
+	#[error("byte offset {byte_offset} exceeds available capacity of {capacity_bytes} bytes")]
+	ByteOffsetOutOfRange { byte_offset: usize, capacity_bytes: usize },
 	#[error("requested {requested_bytes} bytes exceeds available capacity of {available_bytes} bytes")]
 	ReadOutOfCapacity {
 		requested_bytes: usize,
@@ -67,27 +70,85 @@ pub enum JpegFileError {
 	},
 }
 
-pub fn init_file(path: &Path) -> Result<JpegFileHandle, JpegFileError> {
-	let mut file = File::open(path).map_err(|source| JpegFileError::OpenInput {
-		path: path.to_owned(),
-		source,
-	})?;
-
-	let content = JpegFileHandle::read_all_from_file(&mut file, path)?;
-	let capacity = get_capacity(&content).map_err(JpegFileError::CapacityComputation)?;
-	println!("Opened file '{}' capacity: {}", path.display(), capacity);
-
-	Ok(JpegFileHandle {
-		file,
-		path: path.to_owned(),
-		capacity,
-	})
+pub struct EmbeddingSession {
+	jpeg: JpegSession,
+	strategy: Box<dyn EmbeddingStrategy>,
+	cursor_bytes: usize,
+	data_start_slot: usize,
 }
 
-pub struct JpegFileHandle {
-	file: File,
-	path: PathBuf,
-	capacity: usize,
+impl EmbeddingSession {
+	pub fn remaining_bytes(&self) -> usize {
+		self.strategy
+			.capacity_bytes(self.data_slot_count())
+			.saturating_sub(self.cursor_bytes)
+	}
+
+	pub fn data_slot_count(&self) -> usize {
+		self.jpeg.bit_slots.len().saturating_sub(self.data_start_slot)
+	}
+
+	pub fn seek(&mut self, byte_offset: usize) -> Result<(), JpegFileError> {
+		let capacity_bytes = self.strategy.capacity_bytes(self.data_slot_count());
+		if byte_offset > capacity_bytes {
+			return Err(JpegFileError::ByteOffsetOutOfRange {
+				byte_offset,
+				capacity_bytes,
+			});
+		}
+		self.cursor_bytes = byte_offset;
+		Ok(())
+	}
+
+	pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
+		if len > self.remaining_bytes() {
+			return Err(JpegFileError::ReadOutOfCapacity {
+				requested_bytes: len,
+				available_bytes: self.remaining_bytes(),
+			});
+		}
+
+		let mut out = vec![0u8; len];
+		let read = self.strategy.read(
+			&self.jpeg.owned_jpeg,
+			&self.jpeg.bit_slots,
+			self.data_start_slot,
+			self.cursor_bytes,
+			&mut out,
+		);
+		debug_assert_eq!(read, len);
+		self.cursor_bytes += read;
+		Ok(out)
+	}
+
+	pub fn write_data(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
+		if data.len() > self.remaining_bytes() {
+			return Err(JpegFileError::WriteOutOfCapacity {
+				requested_bytes: data.len(),
+				available_bytes: self.remaining_bytes(),
+			});
+		}
+
+		let written = self.strategy.write(
+			&mut self.jpeg.owned_jpeg,
+			&self.jpeg.bit_slots,
+			self.data_start_slot,
+			self.cursor_bytes,
+			data,
+		);
+		debug_assert_eq!(written, data.len());
+		self.cursor_bytes += written;
+		self.jpeg.dirty = true;
+		Ok(())
+	}
+
+	pub fn into_jpeg_session(self) -> JpegSession {
+		self.jpeg
+	}
+
+	pub fn to_jpeg_bytes(&self) -> Result<Vec<u8>, JpegFileError> {
+		self.jpeg.to_jpeg_bytes()
+	}
 }
 
 pub struct JpegSession {
@@ -120,17 +181,38 @@ impl JpegSession {
 		})
 	}
 
+	pub fn into_embedding_session(self, embedding_strategy_id: EmbeddingStrategyId) -> EmbeddingSession {
+		EmbeddingSession {
+			jpeg: self,
+			strategy: strategy_from_id(embedding_strategy_id),
+			cursor_bytes: 0,
+			data_start_slot: STRATEGY_MARKER_SIZE * 8,
+		}
+	}
+
 	/// Creates an in-memory session not backed by any file.
 	/// `flush()` must not be called on sessions created this way.
 	pub fn in_memory(source_jpeg: Vec<u8>) -> Result<Self, JpegFileError> {
 		Self::new(PathBuf::new(), source_jpeg)
 	}
 
-	pub fn capacity(&self) -> usize {
-		self.bit_slots.len() / 8
+	pub fn read_strategy_marker_lsb(&mut self) -> Result<u8, JpegFileError> {
+		let cursor_bits = self.cursor_bits;
+		self.seek(0)?;
+		let result = self.read_data(STRATEGY_MARKER_SIZE).map(|data| data[0]);
+		self.cursor_bits = cursor_bits;
+		result
 	}
 
-	pub fn seek_bits(&mut self, bit_offset: usize) -> Result<(), JpegFileError> {
+	pub fn write_strategy_marker_lsb(&mut self, marker: u8) -> Result<(), JpegFileError> {
+		let cursor_bits = self.cursor_bits;
+		self.seek(0)?;
+		let result = self.write_data(&[marker]);
+		self.cursor_bits = cursor_bits;
+		result
+	}
+
+	fn seek_bits(&mut self, bit_offset: usize) -> Result<(), JpegFileError> {
 		if bit_offset > self.bit_slots.len() {
 			return Err(JpegFileError::BitOffsetOutOfRange {
 				bit_offset,
@@ -141,15 +223,15 @@ impl JpegSession {
 		Ok(())
 	}
 
-	pub fn seek(&mut self, byte_offset: usize) -> Result<(), JpegFileError> {
+	fn seek(&mut self, byte_offset: usize) -> Result<(), JpegFileError> {
 		self.seek_bits(byte_offset * 8)
 	}
 
-	pub fn remaining_bytes(&self) -> usize {
+	fn remaining_bytes(&self) -> usize {
 		(self.bit_slots.len().saturating_sub(self.cursor_bits)) / 8
 	}
 
-	pub fn read(&mut self, out: &mut [u8]) -> usize {
+	fn read(&mut self, out: &mut [u8]) -> usize {
 		let n = out.len().min(self.remaining_bytes());
 		out[..n].fill(0);
 
@@ -169,7 +251,7 @@ impl JpegSession {
 		n
 	}
 
-	pub fn write(&mut self, data: &[u8]) -> usize {
+	fn write(&mut self, data: &[u8]) -> usize {
 		let n = data.len().min(self.remaining_bytes());
 
 		for byte_idx in 0..n {
@@ -190,7 +272,7 @@ impl JpegSession {
 		n
 	}
 
-	pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
+	fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
 		ensure_byte_aligned(self.cursor_bits).ok_or(JpegFileError::NotByteAligned {
 			bit_offset: self.cursor_bits,
 		})?;
@@ -207,7 +289,7 @@ impl JpegSession {
 		Ok(out)
 	}
 
-	pub fn write_data(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
+	fn write_data(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
 		ensure_byte_aligned(self.cursor_bits).ok_or(JpegFileError::NotByteAligned {
 			bit_offset: self.cursor_bits,
 		})?;
@@ -254,7 +336,7 @@ impl JpegSession {
 		Ok(())
 	}
 
-	pub fn collect_bit_slots(owned_jpeg: &OwnedJpeg) -> Vec<BitSlot> {
+	fn collect_bit_slots(owned_jpeg: &OwnedJpeg) -> Vec<BitSlot> {
 		let mut bit_slots = Vec::new();
 		for (component_index, component) in owned_jpeg.components.iter().enumerate() {
 			for (block_index, block) in component.blocks.iter().enumerate() {
@@ -273,66 +355,15 @@ impl JpegSession {
 	}
 }
 
-impl JpegFileHandle {
-	pub fn from_parts(file: File, path: PathBuf, capacity: usize) -> Self {
-		Self { file, path, capacity }
-	}
-
-	pub fn capacity(&self) -> usize {
-		self.capacity
-	}
-
-	fn read_all_from_file(file: &mut File, path: &Path) -> Result<Vec<u8>, JpegFileError> {
-		file.rewind().map_err(|source| JpegFileError::RewindInput {
-			path: path.to_owned(),
-			source,
-		})?;
-		let mut content = Vec::<u8>::new();
-		file.read_to_end(&mut content)
-			.map_err(|source| JpegFileError::ReadInput {
-				path: path.to_owned(),
-				source,
-			})?;
-		Ok(content)
-	}
-
-	fn read_all(&mut self) -> Result<Vec<u8>, JpegFileError> {
-		Self::read_all_from_file(&mut self.file, &self.path)
-	}
-
-	pub fn copy_to(&self, target_path: &Path) -> Result<JpegFileHandle, JpegFileError> {
-		fs::copy(&self.path, target_path).map_err(|source| JpegFileError::CopyFile {
-			from: self.path.clone(),
-			to: target_path.to_owned(),
-			source,
-		})?;
-		init_file(target_path)
-	}
-
-	pub fn write_data(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
-		let input_jpeg = self.read_all()?;
-		let mut session = JpegSession::new(self.path.clone(), input_jpeg)?;
-		session.seek(0)?;
-		session.write_data(data)?;
-		session.flush()?;
-
-		Ok(())
-	}
-
-	pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
-		let input_jpeg = self.read_all()?;
-		let mut session = JpegSession::new(self.path.clone(), input_jpeg)?;
-		session.seek(0)?;
-		session.read_data(len)
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::jpeg::OwnedComponent;
-
 	fn dummy_session() -> JpegSession {
+		dummy_session_with_bit_slots(8)
+	}
+
+	fn dummy_session_with_bit_slots(bit_slot_count: usize) -> JpegSession {
 		let component = OwnedComponent {
 			width_in_blocks: 1,
 			height_in_blocks: 1,
@@ -350,7 +381,7 @@ mod tests {
 					block_index: 0,
 					coeff_index: 5,
 				};
-				8
+				bit_slot_count
 			],
 			cursor_bits: 0,
 			dirty: false,
@@ -398,6 +429,48 @@ mod tests {
 			JpegFileError::WriteOutOfCapacity {
 				requested_bytes: 2,
 				available_bytes: 1
+			}
+		));
+	}
+
+	#[test]
+	fn embedding_session_reports_zero_capacity_when_marker_slots_exceed_capacity() {
+		let session = dummy_session_with_bit_slots(STRATEGY_MARKER_SIZE * 8 - 1);
+		let mut embedding_session = session.into_embedding_session(EmbeddingStrategyId::Lsb);
+
+		assert_eq!(embedding_session.data_slot_count(), 0);
+		assert_eq!(embedding_session.remaining_bytes(), 0);
+
+		let seek_err = embedding_session
+			.seek(1)
+			.expect_err("seeking past zero data capacity should fail");
+		assert!(matches!(
+			seek_err,
+			JpegFileError::ByteOffsetOutOfRange {
+				byte_offset: 1,
+				capacity_bytes: 0
+			}
+		));
+
+		let read_err = embedding_session
+			.read_data(1)
+			.expect_err("reading from zero data capacity should fail");
+		assert!(matches!(
+			read_err,
+			JpegFileError::ReadOutOfCapacity {
+				requested_bytes: 1,
+				available_bytes: 0
+			}
+		));
+
+		let write_err = embedding_session
+			.write_data(&[1])
+			.expect_err("writing to zero data capacity should fail");
+		assert!(matches!(
+			write_err,
+			JpegFileError::WriteOutOfCapacity {
+				requested_bytes: 1,
+				available_bytes: 0
 			}
 		));
 	}

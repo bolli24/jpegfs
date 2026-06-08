@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::{fs::File, io};
 
 use crate::crypto::STRATEGY_MARKER_SIZE;
-use crate::jpeg::{JpegError, OwnedJpeg, read_owned_jpeg, write_owned_jpeg};
+use crate::jpeg::{JpegError, OwnedComponent, OwnedJpeg, read_owned_jpeg, write_owned_jpeg};
 use crate::lsb::{ensure_byte_aligned, get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
 use crate::strategy::{EmbeddingStrategy, EmbeddingStrategyId, strategy_from_id};
 use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
@@ -194,6 +194,14 @@ impl JpegSession {
 	/// `flush()` must not be called on sessions created this way.
 	pub fn in_memory(source_jpeg: Vec<u8>) -> Result<Self, JpegFileError> {
 		Self::new(PathBuf::new(), source_jpeg)
+	}
+
+	pub fn components(&self) -> &[OwnedComponent; 3] {
+		&self.owned_jpeg.components
+	}
+
+	pub fn bit_slots(&self) -> &[BitSlot] {
+		&self.bit_slots
 	}
 
 	pub fn read_strategy_marker_lsb(&mut self) -> Result<u8, JpegFileError> {

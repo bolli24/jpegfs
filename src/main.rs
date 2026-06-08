@@ -91,6 +91,11 @@ enum CliCommand {
 		#[arg(long, default_value = "lsb", value_parser = parse_embedding_strategy)]
 		strategy: EmbeddingStrategyId,
 	},
+	#[command(name = "block_stat", about = "Print embeddable coefficient statistics for one JPEG")]
+	BlockStat {
+		#[arg(help = "Input JPEG file")]
+		input_file: PathBuf,
+	},
 }
 
 #[cfg(unix)]
@@ -168,6 +173,9 @@ fn main() -> anyhow::Result<()> {
 	{
 		return run_simulate(&input_dir, &output_dir, skip_existing, seed, strategy);
 	}
+	if let CliCommand::BlockStat { input_file } = cli_args.command {
+		return run_block_stat(&input_file);
+	}
 
 	#[cfg(unix)]
 	return run_mount_or_stat(cli_args);
@@ -185,7 +193,7 @@ fn run_mount_or_stat(cli_args: CliArgs) -> anyhow::Result<()> {
 
 	let jpeg_dir = match &cli_args.command {
 		CliCommand::Mount { jpeg_dir, .. } | CliCommand::Stat { jpeg_dir } => jpeg_dir,
-		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
+		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } | CliCommand::BlockStat { .. } => unreachable!(),
 	};
 	let jpeg_paths = discover_jpeg_paths(jpeg_dir)?;
 	let probed_stores = probe_stores(&jpeg_paths, &passphrase)?;
@@ -193,7 +201,7 @@ fn run_mount_or_stat(cli_args: CliArgs) -> anyhow::Result<()> {
 	let mount_dir = match cli_args.command {
 		CliCommand::Mount { mount_dir, .. } => mount_dir,
 		CliCommand::Stat { .. } => return run_stat(probed_stores),
-		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } => unreachable!(),
+		CliCommand::Reencode { .. } | CliCommand::Simulate { .. } | CliCommand::BlockStat { .. } => unreachable!(),
 	};
 	let (stores, decoded_pages, total_page_capacity) = load_or_init_stores(probed_stores, &passphrase)?;
 	let fs = init_filesystem(decoded_pages, total_page_capacity)?;
@@ -285,12 +293,22 @@ fn prompt_embedding_strategy() -> anyhow::Result<EmbeddingStrategyId> {
 }
 
 fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
+	if let CliCommand::BlockStat { input_file } = &cli_args.command {
+		anyhow::ensure!(
+			input_file.is_file(),
+			"input JPEG does not exist or is not a file: {}",
+			input_file.display()
+		);
+		return Ok(cli_args);
+	}
+
 	let jpeg_dir = match &cli_args.command {
 		#[cfg(unix)]
 		CliCommand::Mount { jpeg_dir, .. } => jpeg_dir,
 		#[cfg(unix)]
 		CliCommand::Stat { jpeg_dir } => jpeg_dir,
 		CliCommand::Reencode { input_dir, .. } | CliCommand::Simulate { input_dir, .. } => input_dir,
+		CliCommand::BlockStat { .. } => unreachable!(),
 	};
 	anyhow::ensure!(
 		jpeg_dir.is_dir(),
@@ -299,6 +317,68 @@ fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
 	);
 
 	Ok(cli_args)
+}
+
+fn run_block_stat(input_file: &Path) -> anyhow::Result<()> {
+	let jpeg_bytes = std::fs::read(input_file).with_context(|| format!("failed to read {}", input_file.display()))?;
+	let jpeg_session = JpegSession::in_memory(jpeg_bytes)
+		.with_context(|| format!("failed to open JPEG session for {}", input_file.display()))?;
+
+	println!("File: {}", input_file.display());
+	println!("Total embeddable slots: {}", jpeg_session.bit_slots().len());
+	println!("LSB capacity: {} bytes", jpeg_session.bit_slots().len() / 8);
+
+	const COMP_NAMES: [&str; 3] = ["Y", "Cb", "Cr"];
+	const MAX_BAR_LENGTH: usize = 40;
+
+	for (component_index, component) in jpeg_session.components().iter().enumerate() {
+		let block_count = component.blocks.len();
+		let mut slots_per_block = vec![0usize; block_count];
+
+		for slot in jpeg_session
+			.bit_slots()
+			.iter()
+			.filter(|slot| slot.component_index == component_index)
+		{
+			slots_per_block[slot.block_index] += 1;
+		}
+
+		let max_slots = slots_per_block.iter().copied().max().unwrap_or(0);
+		let mut histogram = vec![0usize; max_slots + 1];
+		let mut total_slots = 0;
+		let mut non_empty_blocks = 0;
+
+		for &count in &slots_per_block {
+			histogram[count] += 1;
+			total_slots += count;
+			if count > 0 {
+				non_empty_blocks += 1;
+			}
+		}
+
+		let avg_all_blocks = total_slots as f64 / block_count.max(1) as f64;
+		let avg_non_empty_blocks = total_slots as f64 / non_empty_blocks.max(1) as f64;
+		let max_block_count = histogram.iter().max().copied().unwrap_or(1);
+
+		println!("\nComponent {}", COMP_NAMES[component_index]);
+		println!("Blocks: {block_count}");
+		println!("Total embeddable slots: {total_slots}");
+		println!("Blocks with at least one slot: {non_empty_blocks}/{block_count}");
+		println!(
+			"Slots per block: max={max_slots}, avg_all={avg_all_blocks:.2}, avg_non_empty={avg_non_empty_blocks:.2}"
+		);
+		println!("Histogram: embeddable slots per block -> block count");
+
+		for (slot_count, bucket_blocks) in histogram.iter().enumerate() {
+			if *bucket_blocks > 0 {
+				let bar_length = bucket_blocks * MAX_BAR_LENGTH / max_block_count;
+				let bar = "█".repeat(bar_length);
+				println!("{slot_count:2}: {bucket_blocks:6} {bar}");
+			}
+		}
+	}
+
+	Ok(())
 }
 
 #[cfg(unix)]

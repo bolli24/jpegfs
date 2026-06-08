@@ -39,5 +39,12 @@ rpassword = "7"
 [target.'cfg(unix)'.dependencies]
 fuser = { version = "0.17", features = ["serializable"] }
 
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "collect_bit_slots"
+harness = false
+
 [profile.release]
 debug = true

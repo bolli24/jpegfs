@@ -336,7 +336,7 @@ impl JpegSession {
 		Ok(())
 	}
 
-	fn collect_bit_slots(owned_jpeg: &OwnedJpeg) -> Vec<BitSlot> {
+	pub fn collect_bit_slots(owned_jpeg: &OwnedJpeg) -> Vec<BitSlot> {
 		let mut bit_slots = Vec::new();
 		for (component_index, component) in owned_jpeg.components.iter().enumerate() {
 			for (block_index, block) in component.blocks.iter().enumerate() {

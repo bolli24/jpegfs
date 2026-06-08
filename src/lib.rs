@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod crypto;
+pub mod f5_strategy;
 #[cfg(unix)]
 pub mod filesystem;
 pub mod ino;

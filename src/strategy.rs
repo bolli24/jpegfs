@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::crypto::CryptoError;
+use crate::f5_strategy::F5Strategy;
 use crate::jpeg::OwnedJpeg;
 use crate::jpeg_file::BitSlot;
 use crate::lsb::{get_lsb, read_bit_from_bytes, set_lsb};
@@ -10,6 +11,7 @@ use crate::lsb::{get_lsb, read_bit_from_bytes, set_lsb};
 pub enum EmbeddingStrategyId {
 	Lsb = 1,
 	Lsb50 = 2,
+	F5 = 3,
 }
 
 impl TryFrom<u8> for EmbeddingStrategyId {
@@ -19,6 +21,7 @@ impl TryFrom<u8> for EmbeddingStrategyId {
 		match id {
 			1 => Ok(Self::Lsb),
 			2 => Ok(Self::Lsb50),
+			3 => Ok(Self::F5),
 			_ => Err(CryptoError::UnsupportedEmbeddingStrategy { id }),
 		}
 	}
@@ -33,8 +36,9 @@ impl From<EmbeddingStrategyId> for u8 {
 impl fmt::Display for EmbeddingStrategyId {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Lsb => f.write_str("lsb"),
-			Self::Lsb50 => f.write_str("lsb50"),
+			Self::Lsb => write!(f, "lsb"),
+			Self::Lsb50 => write!(f, "lsb50"),
+			Self::F5 => write!(f, "f5"),
 		}
 	}
 }
@@ -46,6 +50,7 @@ impl EmbeddingStrategyId {
 		match self {
 			Self::Lsb => "use every embeddable coefficient",
 			Self::Lsb50 => "use every second embeddable coefficient",
+			Self::F5 => "implementation of F5 algorithm",
 		}
 	}
 }
@@ -54,6 +59,7 @@ pub fn strategy_from_id(id: EmbeddingStrategyId) -> Box<dyn EmbeddingStrategy> {
 	match id {
 		EmbeddingStrategyId::Lsb => Box::new(LsbStrategy),
 		EmbeddingStrategyId::Lsb50 => Box::new(Lsb50Strategy),
+		EmbeddingStrategyId::F5 => Box::new(F5Strategy),
 	}
 }
 

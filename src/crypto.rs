@@ -12,7 +12,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::jpeg::{JpegError, OwnedJpeg, read_owned_jpeg};
 use crate::jpeg_file::{JpegFileError, JpegSession};
 use crate::strategy::EmbeddingStrategyId;
-use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
 
 /// Argon2id memory cost in KiB (19 MiB).
 pub const ARGON2_M_COST: u32 = 19 * 1024;
@@ -34,6 +33,7 @@ struct EncryptedHeaderPlaintext {
 const ENCRYPTED_HEADER_SIZE: usize = size_of::<EncryptedHeaderPlaintext>() + 16;
 
 pub const STRATEGY_MARKER_SIZE: usize = size_of::<u8>();
+pub const STRATEGY_MARKER_SLOTS: usize = STRATEGY_MARKER_SIZE * 8;
 const STRATEGY_MARKER_MASK_LABEL: &[u8] = b"jpegfs strategy marker mask v1";
 
 /// Total bytes added by the encryption layer to any plaintext written into a JPEG.
@@ -62,15 +62,12 @@ pub enum CryptoError {
 	UnsupportedEmbeddingStrategy { id: u8 },
 }
 
-/// Derives a deterministic 32-byte salt from the DCT coefficients that are never
-/// used for embedding: ondices 0–[`RESERVED_ZIGZAG_COEFFS`] (DC + low-frequency AC)
+/// Derives a deterministic 32-byte salt from the DC coefficients which are never
 pub fn derive_salt_from_dct(owned_jpeg: &OwnedJpeg) -> [u8; 32] {
 	let mut hasher = Sha256::new();
 	for component in &owned_jpeg.components {
 		for block in &component.blocks {
-			for &zigzag_idx in ZIGZAG_INDICES.iter().take(RESERVED_ZIGZAG_COEFFS) {
-				hasher.update(block[zigzag_idx].to_le_bytes());
-			}
+			hasher.update(block[0].to_le_bytes());
 		}
 	}
 	hasher.finalize().into()
@@ -156,8 +153,8 @@ pub fn write_encrypted_with_key(
 	let mut ciphertext = encrypted_header;
 	ciphertext.extend_from_slice(&encrypted_data);
 
-	let mut session = JpegSession::in_memory(jpeg_data.to_vec())?;
-	session.write_strategy_marker_lsb(encode_strategy_marker(key, embedding_strategy_id))?;
+	let mut session = JpegSession::new(jpeg_data.to_vec())?;
+	session.write_strategy_marker_lsb(encode_strategy_marker(key, embedding_strategy_id));
 	let mut embedding_session = session.into_embedding_session(embedding_strategy_id);
 	embedding_session.write_data(&ciphertext)?;
 	embedding_session.to_jpeg_bytes().map_err(Into::into)
@@ -168,8 +165,8 @@ pub fn read_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32]) -> Result<Vec<u
 	let nonce_h = derive_nonce(key, HEADER_NONCE_LABEL);
 	let cipher = ChaCha20Poly1305::new(key.into());
 
-	let mut session = JpegSession::in_memory(jpeg_data.to_vec())?;
-	let strategy_marker = session.read_strategy_marker_lsb()?;
+	let session = JpegSession::new(jpeg_data.to_vec())?;
+	let strategy_marker = session.read_strategy_marker_lsb();
 	let strategy_id = decode_strategy_marker(key, strategy_marker)?;
 	let mut embedding_session = session.into_embedding_session(strategy_id);
 

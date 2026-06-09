@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_variables)]
 use crate::{
 	jpeg::OwnedJpeg,
-	jpeg_file::BitSlot,
+	jpeg_file::{BitSlot, BitSlotSearchStart},
 	strategy::{EmbeddingStrategy, EmbeddingStrategyId},
 };
 
@@ -12,29 +12,19 @@ impl EmbeddingStrategy for F5Strategy {
 		EmbeddingStrategyId::F5
 	}
 
+	fn collect_bit_slots(&self, jpeg: &OwnedJpeg, start_slot: BitSlotSearchStart) -> Vec<BitSlot> {
+		todo!();
+	}
+
 	fn capacity_bytes(&self, slots_count: usize) -> usize {
 		todo!()
 	}
 
-	fn read(
-		&self,
-		jpeg: &OwnedJpeg,
-		slots: &[BitSlot],
-		start_slot: usize,
-		byte_offset: usize,
-		out: &mut [u8],
-	) -> usize {
+	fn read(&self, jpeg: &OwnedJpeg, slots: &[BitSlot], byte_offset: usize, out: &mut [u8]) -> usize {
 		todo!()
 	}
 
-	fn write(
-		&self,
-		jpeg: &mut OwnedJpeg,
-		slots: &[BitSlot],
-		start_slot: usize,
-		byte_offset: usize,
-		data: &[u8],
-	) -> usize {
+	fn write(&self, jpeg: &mut OwnedJpeg, slots: &[BitSlot], byte_offset: usize, data: &[u8]) -> usize {
 		todo!()
 	}
 }
@@ -46,7 +36,7 @@ mod test {
 	#[test]
 	pub fn f5_capacity() {
 		let image_bytes = include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg");
-		let jpeg_session = JpegSession::in_memory(image_bytes.to_vec()).unwrap();
+		let jpeg_session = JpegSession::new(image_bytes.to_vec()).unwrap();
 		println!("Loaded image of {} bytes", image_bytes.len());
 
 		let coeff_count = jpeg_session

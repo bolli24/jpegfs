@@ -12,7 +12,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|payload: Vec<u8>| {
 	let key = common::key();
 	let base_jpeg = write_encrypted_with_key(common::TEMPLATE_JPEG, key, &[], EmbeddingStrategyId::Lsb).unwrap();
-	let session = JpegSession::in_memory(base_jpeg).unwrap();
+	let session = JpegSession::new(base_jpeg).unwrap();
 	let mut embedding_session = session.into_embedding_session(EmbeddingStrategyId::Lsb);
 	let capacity = embedding_session.remaining_bytes();
 	let to_write: Vec<u8> = payload.into_iter().take(capacity).collect();

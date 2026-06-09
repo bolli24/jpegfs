@@ -88,13 +88,15 @@ enum CliCommand {
 			help = "Seed for deterministic random data (same seed + same files -> identical jpeg output)"
 		)]
 		seed: Option<u64>,
-		#[arg(long, default_value = "lsb", value_parser = parse_embedding_strategy)]
+		#[arg(long, default_value_t = EmbeddingStrategyId::Lsb)]
 		strategy: EmbeddingStrategyId,
 	},
 	#[command(name = "block_stat", about = "Print embeddable coefficient statistics for one JPEG")]
 	BlockStat {
 		#[arg(help = "Input JPEG file")]
 		input_file: PathBuf,
+		#[arg(long, default_value_t = EmbeddingStrategyId::Lsb)]
+		strategy: EmbeddingStrategyId,
 	},
 }
 
@@ -173,8 +175,8 @@ fn main() -> anyhow::Result<()> {
 	{
 		return run_simulate(&input_dir, &output_dir, skip_existing, seed, strategy);
 	}
-	if let CliCommand::BlockStat { input_file } = cli_args.command {
-		return run_block_stat(&input_file);
+	if let CliCommand::BlockStat { input_file, strategy } = cli_args.command {
+		return run_block_stat(&input_file, strategy);
 	}
 
 	#[cfg(unix)]
@@ -252,16 +254,6 @@ fn parse_cli_args() -> anyhow::Result<CliArgs> {
 	validate_cli_args(CliArgs::parse())
 }
 
-fn parse_embedding_strategy(value: &str) -> Result<EmbeddingStrategyId, String> {
-	match value {
-		"lsb" => Ok(EmbeddingStrategyId::Lsb),
-		"lsb50" => Ok(EmbeddingStrategyId::Lsb50),
-		_ => Err(format!(
-			"unsupported embedding strategy '{value}', expected 'lsb' or 'lsb50'"
-		)),
-	}
-}
-
 #[cfg(unix)]
 fn prompt_embedding_strategy() -> anyhow::Result<EmbeddingStrategyId> {
 	eprintln!("Choose embedding strategy for the newly initialized stores:");
@@ -293,7 +285,7 @@ fn prompt_embedding_strategy() -> anyhow::Result<EmbeddingStrategyId> {
 }
 
 fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
-	if let CliCommand::BlockStat { input_file } = &cli_args.command {
+	if let CliCommand::BlockStat { input_file, .. } = &cli_args.command {
 		anyhow::ensure!(
 			input_file.is_file(),
 			"input JPEG does not exist or is not a file: {}",
@@ -319,23 +311,29 @@ fn validate_cli_args(cli_args: CliArgs) -> anyhow::Result<CliArgs> {
 	Ok(cli_args)
 }
 
-fn run_block_stat(input_file: &Path) -> anyhow::Result<()> {
+fn run_block_stat(input_file: &Path, strategy: EmbeddingStrategyId) -> anyhow::Result<()> {
 	let jpeg_bytes = std::fs::read(input_file).with_context(|| format!("failed to read {}", input_file.display()))?;
-	let jpeg_session = JpegSession::in_memory(jpeg_bytes)
+	let jpeg_session = JpegSession::new(jpeg_bytes)
 		.with_context(|| format!("failed to open JPEG session for {}", input_file.display()))?;
+	let block_counts: Vec<usize> = jpeg_session
+		.components()
+		.iter()
+		.map(|component| component.blocks.len())
+		.collect();
+	let embedding_session = jpeg_session.into_embedding_session(strategy);
 
 	println!("File: {}", input_file.display());
-	println!("Total embeddable slots: {}", jpeg_session.bit_slots().len());
-	println!("LSB capacity: {} bytes", jpeg_session.bit_slots().len() / 8);
+	println!("Strategy: {strategy}");
+	println!("Total embeddable slots: {}", embedding_session.bit_slots().len());
+	println!("Capacity: {} bytes", embedding_session.remaining_bytes());
 
 	const COMP_NAMES: [&str; 3] = ["Y", "Cb", "Cr"];
 	const MAX_BAR_LENGTH: usize = 40;
 
-	for (component_index, component) in jpeg_session.components().iter().enumerate() {
-		let block_count = component.blocks.len();
+	for (component_index, block_count) in block_counts.iter().copied().enumerate() {
 		let mut slots_per_block = vec![0usize; block_count];
 
-		for slot in jpeg_session
+		for slot in embedding_session
 			.bit_slots()
 			.iter()
 			.filter(|slot| slot.component_index == component_index)
@@ -855,12 +853,10 @@ fn simulate_one(
 		base_seed ^ path_hash
 	});
 
-	let mut session = JpegSession::in_memory(jpeg_bytes)
+	let mut session = JpegSession::new(jpeg_bytes)
 		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
 
-	session
-		.write_strategy_marker_lsb(u8::from(strategy))
-		.with_context(|| format!("failed to embed strategy marker into {}", input_path.display()))?;
+	session.write_strategy_marker_lsb(u8::from(strategy));
 	let mut embedding_session = session.into_embedding_session(strategy);
 	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.remaining_bytes();
 	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity)

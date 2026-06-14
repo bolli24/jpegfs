@@ -111,7 +111,7 @@ pub struct JpegSession {
 	embed_search_start: BitSlotSearchStart,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BitSlot {
 	pub component_index: usize,
 	pub block_index: usize,
@@ -120,7 +120,7 @@ pub struct BitSlot {
 
 /// Bit slot index for denoting where to start the search for the new know unused slots
 /// eg. after strategy maker slots have been found
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BitSlotSearchStart {
 	pub component_index: usize,
 	pub block_index: usize,

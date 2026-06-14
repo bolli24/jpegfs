@@ -3,10 +3,47 @@ use std::str::FromStr;
 
 use crate::crypto::CryptoError;
 use crate::f5_strategy::F5Strategy;
-use crate::jpeg::OwnedJpeg;
+use crate::jpeg::{BlockData, OwnedJpeg};
 use crate::jpeg_file::{BitSlot, BitSlotSearchStart};
 use crate::lsb::{get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
 use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
+
+pub fn iter_coefficients<F>(
+	owned_jpeg: &OwnedJpeg,
+	start: BitSlotSearchStart,
+	skip_zigzag_coeffs: usize,
+	mut for_each: F,
+) where
+	F: FnMut(&BlockData, usize, usize, usize) -> bool,
+{
+	let components = &owned_jpeg.components;
+
+	'outer: for component_index in start.component_index..components.len() {
+		let component = &components[component_index];
+
+		let block_start = if component_index == start.component_index {
+			start.block_index
+		} else {
+			0
+		};
+
+		for block_index in block_start..component.blocks.len() {
+			let block = &component.blocks[block_index];
+
+			let zigzag_start = if component_index == start.component_index && block_index == start.block_index {
+				usize::max(skip_zigzag_coeffs, start.zigzag_index)
+			} else {
+				skip_zigzag_coeffs
+			};
+
+			for &coeff_index in ZIGZAG_INDICES.iter().skip(zigzag_start) {
+				if (!for_each(block, component_index, block_index, coeff_index)) {
+					break 'outer;
+				}
+			}
+		}
+	}
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -201,39 +238,29 @@ fn write_lsb_with_stride(
 
 pub fn collect_lsb_bit_slots(owned_jpeg: &OwnedJpeg, start: BitSlotSearchStart, limit: usize) -> Vec<BitSlot> {
 	let mut bit_slots = Vec::new();
-	let components = &owned_jpeg.components;
 
-	for component_index in start.component_index..components.len() {
-		let component = &components[component_index];
-
-		let block_start = if component_index == start.component_index {
-			start.block_index
-		} else {
-			0
-		};
-
-		for block_index in block_start..component.blocks.len() {
-			let block = &component.blocks[block_index];
-
-			let zigzag_start = if component_index == start.component_index && block_index == start.block_index {
-				usize::max(RESERVED_ZIGZAG_COEFFS, start.zigzag_index)
-			} else {
-				RESERVED_ZIGZAG_COEFFS
-			};
-
-			for &coeff_index in ZIGZAG_INDICES.iter().skip(zigzag_start) {
-				if is_embeddable_coeff(block[coeff_index]) {
-					bit_slots.push(BitSlot {
-						component_index,
-						block_index,
-						coeff_index,
-					});
-					if limit != 0 && bit_slots.len() == limit {
-						return bit_slots;
-					}
+	iter_coefficients(
+		owned_jpeg,
+		start,
+		RESERVED_ZIGZAG_COEFFS,
+		|block: &BlockData, component_index: usize, block_index: usize, coeff_index: usize| -> bool {
+			if is_embeddable_coeff(block[coeff_index]) {
+				bit_slots.push(BitSlot {
+					component_index,
+					block_index,
+					coeff_index,
+				});
+				if limit != 0 && bit_slots.len() == limit {
+					return false;
 				}
 			}
-		}
+			true
+		},
+	);
+
+	if limit != 0 {
+		bit_slots.truncate(limit);
 	}
+
 	bit_slots
 }

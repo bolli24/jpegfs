@@ -158,7 +158,6 @@ impl JpegBlockStore {
 	}
 
 	pub fn page_capacity_for_jpeg_capacity(jpeg_capacity: usize) -> Result<usize, Error> {
-		todo!("Take into account embedding overhead depending on strategy (eg f5 has 32bit addional overhead)");
 		let plaintext_capacity = jpeg_capacity.saturating_sub(CRYPTO_OVERHEAD);
 		if plaintext_capacity < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(plaintext_capacity));

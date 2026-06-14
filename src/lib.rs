@@ -1,7 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod crypto;
-pub mod f5_strategy;
 #[cfg(unix)]
 pub mod filesystem;
 pub mod ino;
@@ -9,6 +8,7 @@ pub mod inode;
 pub mod jpeg;
 pub mod jpeg_file;
 pub mod lsb;
+pub mod matrix_strategy;
 pub mod pager;
 pub mod pager_error;
 pub mod persistence;

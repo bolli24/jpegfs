@@ -78,3 +78,10 @@ path = "src/encrypted_read_no_panic.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "matrix_roundtrip"
+path = "src/matrix_roundtrip.rs"
+test = false
+doc = false
+bench = false

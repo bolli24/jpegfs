@@ -2,10 +2,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::crypto::CryptoError;
-use crate::f5_strategy::F5Strategy;
 use crate::jpeg::{BlockData, OwnedJpeg};
 use crate::jpeg_file::{BitSlot, BitSlotSearchStart};
 use crate::lsb::{get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
+use crate::matrix_strategy::MatrixStrategy;
 use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
 
 pub fn iter_coefficients<F>(
@@ -37,7 +37,7 @@ pub fn iter_coefficients<F>(
 			};
 
 			for &coeff_index in ZIGZAG_INDICES.iter().skip(zigzag_start) {
-				if (!for_each(block, component_index, block_index, coeff_index)) {
+				if !for_each(block, component_index, block_index, coeff_index) {
 					break 'outer;
 				}
 			}
@@ -50,7 +50,7 @@ pub fn iter_coefficients<F>(
 pub enum EmbeddingStrategyId {
 	Lsb = 1,
 	Lsb50 = 2,
-	F5 = 3,
+	Matrix = 3,
 }
 
 impl TryFrom<u8> for EmbeddingStrategyId {
@@ -60,7 +60,7 @@ impl TryFrom<u8> for EmbeddingStrategyId {
 		match id {
 			1 => Ok(Self::Lsb),
 			2 => Ok(Self::Lsb50),
-			3 => Ok(Self::F5),
+			3 => Ok(Self::Matrix),
 			_ => Err(CryptoError::UnsupportedEmbeddingStrategy { id }),
 		}
 	}
@@ -73,7 +73,7 @@ impl TryFrom<&str> for EmbeddingStrategyId {
 		match value {
 			"lsb" => Ok(EmbeddingStrategyId::Lsb),
 			"lsb50" => Ok(EmbeddingStrategyId::Lsb50),
-			"f5" => Ok(EmbeddingStrategyId::F5),
+			"matrix" => Ok(EmbeddingStrategyId::Matrix),
 			_ => Err(format!("unsupported embedding strategy '{value}'")),
 		}
 	}
@@ -98,7 +98,7 @@ impl fmt::Display for EmbeddingStrategyId {
 		match self {
 			Self::Lsb => write!(f, "lsb"),
 			Self::Lsb50 => write!(f, "lsb50"),
-			Self::F5 => write!(f, "f5"),
+			Self::Matrix => write!(f, "matrix"),
 		}
 	}
 }
@@ -110,7 +110,7 @@ impl EmbeddingStrategyId {
 		match self {
 			Self::Lsb => "use every embeddable coefficient",
 			Self::Lsb50 => "use every second embeddable coefficient",
-			Self::F5 => "implementation of F5 algorithm",
+			Self::Matrix => "matrix encoding strategy",
 		}
 	}
 }
@@ -119,7 +119,7 @@ pub fn strategy_from_id(id: EmbeddingStrategyId) -> Box<dyn EmbeddingStrategy> {
 	match id {
 		EmbeddingStrategyId::Lsb => Box::new(LsbStrategy),
 		EmbeddingStrategyId::Lsb50 => Box::new(Lsb50Strategy),
-		EmbeddingStrategyId::F5 => Box::new(F5Strategy),
+		EmbeddingStrategyId::Matrix => Box::new(MatrixStrategy),
 	}
 }
 

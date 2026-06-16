@@ -1,4 +1,6 @@
 #![allow(dead_code, unused_variables)]
+use crate::jpeg::BlockData;
+use crate::strategy::iter_coefficients;
 use crate::{
 	jpeg::{OwnedComponent, OwnedJpeg},
 	jpeg_file::{BitSlot, BitSlotSearchStart, JpegSession},
@@ -6,35 +8,213 @@ use crate::{
 };
 use rand::seq::SliceRandom;
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
+use sha2::{Digest, Sha256};
 
-const MATRIX_POC_SEED: u64 = 9391839189381839;
-const MATRIX_MUTATION_SEED: u64 = 0x4d47_5258;
+const MATRIX_PERMUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix permutation v1";
+const MATRIX_WHITENING_SEED_LABEL: &[u8] = b"jpegfs matrix whitening v1";
+const MATRIX_MUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix mutation v1";
 
-pub struct MatrixStrategy;
+// # Optimization
+// Baseline: 105ms
+// index permutation vec + code_word: Vec<BitSlot>: 114ms
+// index permutation vec + code_word: Vec<&BitSlot>: 120ms
+// codeword: Vec<BitSlot>: 106ms
+// Bitslot u32,u32,u32: 94ms
+// Bitslot u16,u16,u32: 97ms
 
-impl EmbeddingStrategy for MatrixStrategy {
-	fn id(&self) -> EmbeddingStrategyId {
-		EmbeddingStrategyId::Matrix
-	}
+pub struct MatrixStrategy(pub MatrixMode, pub [u8; 32]);
 
-	fn collect_bit_slots(&self, jpeg: &OwnedJpeg, start_slot: BitSlotSearchStart) -> Vec<BitSlot> {
-		todo!();
-	}
-
-	fn capacity_bytes(&self, slots_count: usize) -> usize {
-		todo!()
-	}
-
-	fn read(&self, jpeg: &OwnedJpeg, slots: &[BitSlot], byte_offset: usize, out: &mut [u8]) -> usize {
-		todo!()
-	}
-
-	fn write(&self, jpeg: &mut OwnedJpeg, slots: &[BitSlot], byte_offset: usize, data: &[u8]) -> usize {
-		todo!()
+impl MatrixStrategy {
+	fn rng(&self, label: &[u8]) -> StdRng {
+		let mut hasher = Sha256::new();
+		hasher.update(label);
+		hasher.update(self.1);
+		hasher.update([self.0.k as u8]);
+		StdRng::from_seed(hasher.finalize().into())
 	}
 }
 
-fn permutation<T: Rng>(length: usize, rng: &mut T) -> Vec<usize> {
+impl EmbeddingStrategy for MatrixStrategy {
+	fn id(&self) -> EmbeddingStrategyId {
+		match self.0.k {
+			2 => EmbeddingStrategyId::Matrix2,
+			3 => EmbeddingStrategyId::Matrix3,
+			4 => EmbeddingStrategyId::Matrix4,
+			5 => EmbeddingStrategyId::Matrix5,
+			6 => EmbeddingStrategyId::Matrix6,
+			7 => EmbeddingStrategyId::Matrix7,
+			_ => unreachable!("MatrixMode only allows k=2..=7"),
+		}
+	}
+
+	fn collect_bit_slots(&self, jpeg: &OwnedJpeg, start_slot: BitSlotSearchStart) -> Vec<BitSlot> {
+		let mut bit_slots = Vec::new();
+
+		iter_coefficients(
+			jpeg,
+			start_slot,
+			1,
+			|block: &BlockData, component_index: usize, block_index: usize, coeff_index: usize| -> bool {
+				if block[coeff_index] != 0 {
+					bit_slots.push(BitSlot {
+						component_index: component_index as u32,
+						block_index: block_index as u32,
+						coeff_index: coeff_index as u32,
+					});
+				}
+				true
+			},
+		);
+
+		bit_slots
+	}
+
+	fn capacity_bytes(&self, slots_count: usize) -> usize {
+		self.0.capacity_bytes(slots_count)
+	}
+
+	fn slots_for_bytes(&self, byte_count: usize) -> usize {
+		self.0.slots_for_bytes(byte_count)
+	}
+
+	fn read(&self, jpeg: &OwnedJpeg, slots: &[BitSlot], out: &mut [u8]) -> usize {
+		let mut permutation_rng = self.rng(MATRIX_PERMUTATION_SEED_LABEL);
+		let mut slots = slots.to_vec();
+		slots.shuffle(&mut permutation_rng);
+
+		let mut extracted_byte = 0u8;
+		let mut available_extracted_bits = 0usize;
+		let mut rng = self.rng(MATRIX_WHITENING_SEED_LABEL);
+		let MatrixMode { k, n } = self.0;
+
+		let mut start_of_n = 0;
+		let mut read_bytes = 0usize;
+
+		while read_bytes < out.len() {
+			if start_of_n + n > slots.len() {
+				break;
+			}
+
+			let code_word = &slots[start_of_n..start_of_n + n];
+			let mut hash = 0usize;
+			for i in 0..n {
+				let slot = code_word[i];
+				let coeff = jpeg.components[slot.component_index as usize].blocks[slot.block_index as usize]
+					[slot.coeff_index as usize];
+
+				if matrix_bit(coeff) == 1 {
+					hash ^= i + 1;
+				}
+			}
+			start_of_n += n;
+
+			for i in 0..k {
+				let bit = (hash >> i) & 1;
+
+				extracted_byte |= ((bit & 1) as u8) << available_extracted_bits;
+				available_extracted_bits += 1;
+
+				if available_extracted_bits == 8 {
+					extracted_byte ^= rng.random::<u8>();
+					out[read_bytes] = extracted_byte;
+					read_bytes += 1;
+					extracted_byte = 0;
+					available_extracted_bits = 0;
+
+					if read_bytes == out.len() {
+						break;
+					}
+				}
+			}
+		}
+
+		read_bytes
+	}
+
+	fn write(&self, jpeg: &mut OwnedJpeg, slots: &[BitSlot], data: &[u8]) -> usize {
+		let mut permutation_rng = self.rng(MATRIX_PERMUTATION_SEED_LABEL);
+		let mut slots = slots.to_vec();
+		slots.shuffle(&mut permutation_rng);
+
+		let mut byte_to_embed = 0u8;
+		let mut available_bits_to_embed = 0;
+		let mut bytes = data.iter();
+		let mut mutation_rng = self.rng(MATRIX_MUTATION_SEED_LABEL);
+		let mut rng = self.rng(MATRIX_WHITENING_SEED_LABEL);
+		let MatrixMode { k, n } = self.0;
+
+		let mut start_of_n = 0;
+		let mut written_bits = 0usize;
+
+		loop {
+			let mut k_bits_to_embed = 0usize;
+			let mut bits_in_group = 0usize;
+			let mut is_done = false;
+
+			for i in 0..k {
+				if available_bits_to_embed == 0 {
+					let Some(next_byte) = bytes.next() else {
+						is_done = true;
+						break;
+					};
+					byte_to_embed = *next_byte;
+					byte_to_embed ^= rng.random::<u8>();
+					available_bits_to_embed = 8;
+				}
+				let next_bit_to_embed = (byte_to_embed & 1) as usize;
+				byte_to_embed >>= 1;
+				available_bits_to_embed -= 1;
+				k_bits_to_embed |= next_bit_to_embed << i;
+				bits_in_group += 1;
+			}
+			if bits_in_group == 0 {
+				break;
+			}
+
+			if start_of_n + n > slots.len() {
+				break;
+			}
+
+			loop {
+				let code_word = &slots[start_of_n..start_of_n + n];
+
+				let mut hash = 0;
+				for i in 0..n {
+					let slot = code_word[i];
+					let coeff = jpeg.components[slot.component_index as usize].blocks[slot.block_index as usize]
+						[slot.coeff_index as usize];
+					if matrix_bit(coeff) == 1 {
+						hash ^= i + 1;
+					}
+				}
+
+				let mut i = hash ^ k_bits_to_embed;
+				if i == 0 {
+					break; // embedded without change
+				}
+				i -= 1;
+
+				let slot = code_word[i];
+				let coeff = &mut jpeg.components[slot.component_index as usize].blocks[slot.block_index as usize]
+					[slot.coeff_index as usize];
+
+				*coeff = balanced_matrix_flip(*coeff, &mut mutation_rng)
+					.expect("non-zero coefficient has a matrix-bit flip");
+				break;
+			}
+			start_of_n += n;
+			written_bits += bits_in_group;
+
+			if is_done {
+				break;
+			}
+		}
+
+		written_bits / 8
+	}
+}
+
+fn index_permutation<T: Rng>(length: usize, rng: &mut T) -> Vec<usize> {
 	let mut vec: Vec<usize> = (0..length).collect();
 	vec.shuffle(rng);
 	vec
@@ -53,6 +233,10 @@ impl MatrixMode {
 
 	pub fn capacity_bytes(self, usable_coefficients: usize) -> usize {
 		(usable_coefficients / self.n * self.k) / 8
+	}
+
+	pub fn slots_for_bytes(self, byte_count: usize) -> usize {
+		(byte_count * 8).div_ceil(self.k) * self.n
 	}
 }
 
@@ -106,29 +290,6 @@ fn matrix_capacity_bytes(usable_coefficients: usize, mode: MatrixMode) -> usize 
 	mode.capacity_bytes(usable_coefficients)
 }
 
-fn print_expected_capacity(usable_coefficients: usize, one: usize, large: usize) {
-	for i in 1..8 {
-		let n = (1 << i) - 1;
-		let usable = matrix_capacity_bytes(usable_coefficients, MatrixMode { k: i, n });
-		let mut changed = large - large % (n + 1);
-		changed = (changed + one + one / 2 - one / (n + 1)) / (n + 1);
-
-		if usable == 0 {
-			break;
-		}
-		print!("(1, {n}, {i})");
-
-		println!(
-			" code: {usable} bytes (efficiency {:.1} bits per change)",
-			(usable * 8) as f64 / changed as f64
-		)
-	}
-}
-
-fn print_mode(mode: MatrixMode) {
-	println!("using (1, {}, {}) code", mode.n, mode.k);
-}
-
 fn matrix_bit(coeff: i16) -> usize {
 	if coeff > 0 {
 		(coeff & 1) as usize
@@ -157,284 +318,43 @@ fn balanced_matrix_flip<T: Rng>(coeff: i16, rng: &mut T) -> Option<i16> {
 	}
 }
 
-fn encode_payload<T: Rng>(
-	coeff: &mut [i16],
-	permutation: &[usize],
-	data: &[u8],
-	mode: MatrixMode,
-	rng: &mut T,
-) -> MatrixStats {
-	let mut byte_to_embed = 0u8;
-	let mut available_bits_to_embed = 0;
-	let mut stats = MatrixStats::default();
-	let mut bytes = data.iter();
-	let mut mutation_rng = StdRng::seed_from_u64(MATRIX_MUTATION_SEED);
-	let MatrixMode { k, n } = mode;
-
-	let mut code_word = vec![0usize; n];
-	let mut start_of_n = 0;
-
-	loop {
-		let mut k_bits_to_embed = 0usize;
-		let mut bits_in_group = 0usize;
-		let mut is_done = false;
-
-		for i in 0..k {
-			if available_bits_to_embed == 0 {
-				let Some(next_byte) = bytes.next() else {
-					is_done = true;
-					break;
-				};
-				byte_to_embed = *next_byte;
-				byte_to_embed ^= rng.random::<u8>();
-				available_bits_to_embed = 8;
-			}
-			let next_bit_to_embed = (byte_to_embed & 1) as usize;
-			byte_to_embed >>= 1;
-			available_bits_to_embed -= 1;
-			k_bits_to_embed |= next_bit_to_embed << i;
-			bits_in_group += 1;
-			stats.embedded += 1;
-		}
-		if bits_in_group == 0 {
-			break;
-		}
-
-		let end_of_n;
-		loop {
-			let mut j = start_of_n;
-			let mut i = 0usize;
-			while i < n {
-				if j >= coeff.len() {
-					return stats;
-				}
-				let shuffled_index = permutation[j];
-				j += 1;
-
-				if shuffled_index % 64 == 0 {
-					continue; // Skip DC
-				}
-				if coeff[shuffled_index] == 0 {
-					continue; // Skip zeroes
-				}
-				code_word[i] = shuffled_index;
-				i += 1;
-			}
-			end_of_n = j;
-			let mut hash = 0;
-			for i in 0..n {
-				if matrix_bit(coeff[code_word[i]]) == 1 {
-					hash ^= i + 1;
-				}
-			}
-
-			let mut i = hash ^ k_bits_to_embed;
-			if i == 0 {
-				break; // embedded without change
-			}
-			i -= 1;
-
-			coeff[code_word[i]] = balanced_matrix_flip(coeff[code_word[i]], &mut mutation_rng)
-				.expect("non-zero coefficient has a matrix-bit flip");
-			stats.changed += 1;
-			break;
-		}
-		start_of_n = end_of_n;
-
-		if is_done {
-			break;
-		}
-	}
-
-	stats
-}
-
-fn push_decoded_bit<T: Rng>(
-	out: &mut Vec<u8>,
-	out_len: usize,
-	extracted_byte: &mut u8,
-	available_extracted_bits: &mut usize,
-	bit: usize,
-	rng: &mut T,
-) -> bool {
-	*extracted_byte |= ((bit & 1) as u8) << *available_extracted_bits;
-	*available_extracted_bits += 1;
-
-	if *available_extracted_bits == 8 {
-		*extracted_byte ^= rng.random::<u8>();
-		out.push(*extracted_byte);
-		*extracted_byte = 0;
-		*available_extracted_bits = 0;
-	}
-
-	out.len() == out_len
-}
-
-fn decode_payload<T: Rng>(
-	coeff: &[i16],
-	permutation: &[usize],
-	out_len: usize,
-	mode: MatrixMode,
-	rng: &mut T,
-) -> Vec<u8> {
-	let mut out = Vec::with_capacity(out_len);
-	let mut extracted_byte = 0u8;
-	let mut available_extracted_bits = 0usize;
-	let MatrixMode { k, n } = mode;
-
-	let mut start_of_n = 0;
-
-	loop {
-		let mut hash = 0usize;
-		let mut j = start_of_n;
-		let mut code = 1usize;
-
-		while code <= n {
-			if j >= coeff.len() {
-				return out;
-			}
-
-			let shuffled_index = permutation[j];
-			j += 1;
-
-			if shuffled_index % 64 == 0 {
-				continue; // Skip DC
-			}
-			if coeff[shuffled_index] == 0 {
-				continue; // Skip zeroes
-			}
-
-			if matrix_bit(coeff[shuffled_index]) == 1 {
-				hash ^= code;
-			}
-			code += 1;
-		}
-
-		start_of_n = j;
-		for i in 0..k {
-			if push_decoded_bit(
-				&mut out,
-				out_len,
-				&mut extracted_byte,
-				&mut available_extracted_bits,
-				(hash >> i) & 1,
-				rng,
-			) {
-				return out;
-			}
-		}
-	}
-}
-
-pub fn matrix_poc_roundtrip(owned_jpeg: &OwnedJpeg, data: &[u8], mode: MatrixMode) -> Option<Vec<u8>> {
-	let mut coeff = flatten_owned_jpeg(owned_jpeg);
-	let coeff_count = coeff.len();
-	let (_, _, _, usable) = coefficient_counts(&coeff);
-	if data.len() > matrix_capacity_bytes(usable, mode) {
-		return None;
-	}
-
-	let mut encode_rng = StdRng::seed_from_u64(MATRIX_POC_SEED);
-	let shuffled = permutation(coeff_count, &mut encode_rng);
-	let stats = encode_payload(&mut coeff, &shuffled, data, mode, &mut encode_rng);
-	if stats.embedded / 8 < data.len() {
-		return None;
-	}
-
-	let mut decode_rng = StdRng::seed_from_u64(MATRIX_POC_SEED);
-	let decode_permutation = permutation(coeff_count, &mut decode_rng);
-	Some(decode_payload(
-		&coeff,
-		&decode_permutation,
-		data.len(),
-		mode,
-		&mut decode_rng,
-	))
-}
-
-fn embed(mode: MatrixMode) -> Vec<u8> {
-	let mut rng = StdRng::seed_from_u64(MATRIX_POC_SEED);
-	let data = b"Hello, this is a test to embed data with matrix encoding in Rust";
-
-	let image_bytes = include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg");
-	let jpeg_session = JpegSession::new(image_bytes.to_vec()).unwrap();
-	println!("Loaded image of {} bytes", image_bytes.len());
-
-	let mut coeff = flatten_coefficients(&jpeg_session);
-	let coeff_count = coeff.len();
-	let (zero, one, large, usable) = coefficient_counts(&coeff);
-
-	println!("zero={zero}\tone={one}\tlarge={large}");
-	println!("usable capacity: {usable} bits");
-	println!("expected capacity with");
-	print_expected_capacity(usable, one, large);
-
-	println!("permutation starts");
-	let shuffled = permutation(coeff_count, &mut rng);
-
-	println!("Embedding of {} bits", data.len() * 8);
-	assert!(data.len() <= matrix_capacity_bytes(usable, mode));
-	print_mode(mode);
-
-	let stats = encode_payload(&mut coeff, &shuffled, data, mode, &mut rng);
-
-	println!("{} coefficients examined", stats.examined);
-	if stats.changed > 0 {
-		println!(
-			"{} coefficients changed (efficiency {:.1} bits per change)",
-			stats.changed,
-			stats.embedded as f64 / stats.changed as f64
-		);
-	} else {
-		println!("{} coefficients changed", stats.changed);
-	}
-	println!("{} coefficients thrown (zeroed)", stats.thrown);
-	println!("{} bits ({} bytes) embeded", stats.embedded, stats.embedded / 8);
-
-	let mut decode_rng = StdRng::seed_from_u64(MATRIX_POC_SEED);
-	let decode_permutation = permutation(coeff_count, &mut decode_rng);
-	let decoded = decode_payload(&coeff, &decode_permutation, data.len(), mode, &mut decode_rng);
-
-	decoded
-}
-
 #[cfg(test)]
 mod test {
-	use rand::{RngExt, SeedableRng, rngs::StdRng};
-
-	use super::{MatrixMode, balanced_matrix_flip, embed, encode_payload, matrix_bit, permutation};
-
-	#[test]
-	pub fn matrix_permutation_handles_empty_and_singleton() {
-		let mut rng = StdRng::seed_from_u64(1234);
-		assert_eq!(permutation(0, &mut rng), Vec::<usize>::new());
-		assert_eq!(permutation(1, &mut rng), vec![0]);
-	}
+	use super::{balanced_matrix_flip, matrix_bit};
+	use crate::{jpeg_file::JpegSession, strategy::EmbeddingStrategyId};
+	use rand::{SeedableRng, rngs::StdRng};
 
 	#[test]
-	pub fn matrix_permutation_contains_each_index_once() {
-		let mut rng = StdRng::seed_from_u64(1234);
-		let length = 1024;
-		let mut permuted = permutation(length, &mut rng);
-		permuted.sort_unstable();
+	fn matrix_strategy_read_write_roundtrip() {
+		let image_bytes = include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg");
+		let payload = b"matrix strategy roundtrip";
 
-		assert_eq!(permuted, (0..length).collect::<Vec<_>>());
-	}
+		for strategy in [
+			EmbeddingStrategyId::Matrix2,
+			EmbeddingStrategyId::Matrix3,
+			EmbeddingStrategyId::Matrix4,
+			EmbeddingStrategyId::Matrix5,
+			EmbeddingStrategyId::Matrix6,
+			EmbeddingStrategyId::Matrix7,
+		] {
+			let session = JpegSession::new(image_bytes.to_vec()).unwrap();
+			let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
+			embedding_session.write_data(payload).unwrap();
+			let encoded = embedding_session.to_jpeg_bytes().unwrap();
 
-	#[test]
-	fn matrix_embed() {
-		let decoded = embed(MatrixMode::new(7).expect("valid matrix mode"));
-		assert_eq!(
-			decoded,
-			b"Hello, this is a test to embed data with matrix encoding in Rust"
-		);
+			let session = JpegSession::new(encoded).unwrap();
+			let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
+			let decoded = embedding_session.read_data(payload.len()).unwrap();
+
+			assert_eq!(decoded, payload);
+		}
 	}
 
 	#[test]
 	fn matrix_balanced_flip_never_creates_zero_and_flips_bit() {
 		let mut rng = StdRng::seed_from_u64(1234);
 
-		for coeff in -16..=16 {
+		for coeff in i16::MIN..=i16::MAX {
 			if coeff == 0 {
 				continue;
 			}
@@ -445,46 +365,4 @@ mod test {
 			assert_ne!(matrix_bit(coeff), matrix_bit(flipped));
 		}
 	}
-
-	#[test]
-	fn matrix_repeated_random_embeds_keep_capacity_stable() {
-		let mode = MatrixMode { k: 3, n: 7 };
-		let mut coeff = (0..4096)
-			.map(|i| {
-				if i % 64 == 0 {
-					0
-				} else if i % 2 == 0 {
-					1
-				} else {
-					-1
-				}
-			})
-			.collect::<Vec<_>>();
-		let initial = capacity_and_shape(&coeff, mode);
-
-		for iteration in 0..3 {
-			let payload = random_payload(initial.0, iteration);
-			let mut encode_rng = StdRng::seed_from_u64(MATRIX_SAMPLE_SEED);
-			let shuffled = permutation(coeff.len(), &mut encode_rng);
-			let stats = encode_payload(&mut coeff, &shuffled, &payload, mode, &mut encode_rng);
-			let after = capacity_and_shape(&coeff, mode);
-
-			assert_eq!(stats.thrown, 0);
-			assert_eq!(after, initial);
-		}
-	}
-
-	fn capacity_and_shape(coeff: &[i16], mode: MatrixMode) -> (usize, usize, usize) {
-		let (zero, one, large, usable) = super::coefficient_counts(coeff);
-		let capacity_bytes = super::matrix_capacity_bytes(usable, mode);
-
-		(capacity_bytes, zero, one + large)
-	}
-
-	fn random_payload(len: usize, iteration: usize) -> Vec<u8> {
-		let mut rng = StdRng::seed_from_u64(0xF5CA_0000 | ((iteration as u64) << 32) | len as u64);
-		(0..len).map(|_| rng.random::<u8>()).collect()
-	}
-
-	const MATRIX_SAMPLE_SEED: u64 = 0xF500_51A7;
 }

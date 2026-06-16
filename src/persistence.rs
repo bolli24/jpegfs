@@ -3,7 +3,8 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use crate::crypto::{self, CRYPTO_OVERHEAD, CryptoError};
+use crate::crypto::{self, CRYPTO_OVERHEAD, CryptoError, STRATEGY_MARKER_SIZE};
+use crate::jpeg_file::JpegSession;
 use crate::pager::BLOCK_SIZE;
 use crate::pager::{DecodedPages, PageId, Pager};
 use crate::pager_error::PagerCodecError;
@@ -113,7 +114,7 @@ impl JpegBlockStore {
 			Err(err) => return Err(err),
 		};
 
-		Self::from_existing_bytes(path, decrypted_data, header, key, jpeg_bytes)
+		Self::from_existing_bytes(path, decrypted_data, header, key, jpeg_bytes, embedding_strategy_id)
 	}
 
 	/// Like [`Self::from_bytes_or_init_strict`] but requires the header magic to be present.
@@ -125,8 +126,18 @@ impl JpegBlockStore {
 		key: [u8; 32],
 		jpeg_bytes: Vec<u8>,
 	) -> Result<(Self, DecodedPages), Error> {
+		Self::from_bytes_strict_with_strategy(path, decrypted_data, key, jpeg_bytes, EmbeddingStrategyId::Lsb)
+	}
+
+	pub fn from_bytes_strict_with_strategy(
+		path: PathBuf,
+		decrypted_data: &[u8],
+		key: [u8; 32],
+		jpeg_bytes: Vec<u8>,
+		embedding_strategy_id: EmbeddingStrategyId,
+	) -> Result<(Self, DecodedPages), Error> {
 		let header = Self::decode_header_strict(decrypted_data)?;
-		Self::from_existing_bytes(path, decrypted_data, header, key, jpeg_bytes)
+		Self::from_existing_bytes(path, decrypted_data, header, key, jpeg_bytes, embedding_strategy_id)
 	}
 
 	/// Decodes the header and page blocks from already-decrypted plaintext, returning the page capacity
@@ -159,11 +170,30 @@ impl JpegBlockStore {
 
 	pub fn page_capacity_for_jpeg_capacity(jpeg_capacity: usize) -> Result<usize, Error> {
 		let plaintext_capacity = jpeg_capacity.saturating_sub(CRYPTO_OVERHEAD);
+		Self::page_capacity_for_plaintext_capacity(plaintext_capacity)
+	}
+
+	fn page_capacity_for_plaintext_capacity(plaintext_capacity: usize) -> Result<usize, Error> {
 		if plaintext_capacity < FILE_HEADER_SIZE {
 			return Err(Error::InputBufferTooSmall(plaintext_capacity));
 		}
 
 		Ok(((plaintext_capacity - FILE_HEADER_SIZE) / BLOCK_SIZE).min(usize::from(u16::MAX)))
+	}
+
+	fn page_capacity_for_strategy(
+		jpeg_bytes: &[u8],
+		key: [u8; 32],
+		embedding_strategy_id: EmbeddingStrategyId,
+	) -> Result<usize, Error> {
+		let session = JpegSession::new(jpeg_bytes.to_vec())
+			.map_err(CryptoError::from)
+			.map_err(Error::JpegEncrypt)?;
+		let embedding_session = session.into_embedding_session(embedding_strategy_id, key);
+		let encrypted_data_capacity = embedding_session.remaining_bytes();
+		let encrypted_data_overhead = CRYPTO_OVERHEAD - STRATEGY_MARKER_SIZE;
+		let plaintext_capacity = encrypted_data_capacity.saturating_sub(encrypted_data_overhead);
+		Self::page_capacity_for_plaintext_capacity(plaintext_capacity)
 	}
 
 	/// Returns the exact number of bytes `persist_blocks` embeds into the JPEG for a store given `jpeg_capacity`
@@ -191,6 +221,7 @@ impl JpegBlockStore {
 		header: FileHeaderV1,
 		key: [u8; 32],
 		jpeg_bytes: Vec<u8>,
+		embedding_strategy_id: EmbeddingStrategyId,
 	) -> Result<(Self, DecodedPages), Error> {
 		if header.pages_used > header.page_capacity {
 			return Err(Error::InvalidPageCount {
@@ -226,7 +257,7 @@ impl JpegBlockStore {
 				header,
 				path,
 				key,
-				embedding_strategy_id: EmbeddingStrategyId::Lsb,
+				embedding_strategy_id,
 				jpeg_bytes,
 				pages_map,
 				persisted_blocks,
@@ -247,12 +278,12 @@ impl JpegBlockStore {
 
 	pub fn init_new_with_strategy(
 		path: PathBuf,
-		jpeg_capacity: usize,
+		_jpeg_capacity: usize,
 		key: [u8; 32],
 		jpeg_bytes: Vec<u8>,
 		embedding_strategy_id: EmbeddingStrategyId,
 	) -> Result<(Self, DecodedPages), Error> {
-		let page_capacity = Self::page_capacity_for_jpeg_capacity(jpeg_capacity)?
+		let page_capacity = Self::page_capacity_for_strategy(&jpeg_bytes, key, embedding_strategy_id)?
 			.try_into()
 			.expect("page capacity is clamped to u16::MAX");
 		let payload_len = usize::from(page_capacity) * BLOCK_SIZE;
@@ -712,6 +743,26 @@ mod tests {
 	}
 
 	#[test]
+	fn strict_load_preserves_embedding_strategy() {
+		let data = encode_store_bytes(&[], 1);
+		let path = temp_path();
+
+		let (store, _) = JpegBlockStore::from_bytes_strict_with_strategy(
+			path.clone(),
+			&data,
+			DUMMY_KEY,
+			Vec::new(),
+			EmbeddingStrategyId::Matrix5,
+		)
+		.expect("load should succeed");
+
+		assert_eq!(store.embedding_strategy_id, EmbeddingStrategyId::Matrix5);
+
+		drop(store);
+		fs::remove_file(path).expect("temp file should be removed");
+	}
+
+	#[test]
 	fn from_bytes_or_init_strict_accepts_valid_store_with_extra_capacity_after_header_payload() {
 		let data = encode_store_bytes(&[], 2);
 		let mut expanded = data[..FILE_HEADER_SIZE + 2 * BLOCK_SIZE].to_vec();
@@ -737,16 +788,48 @@ mod tests {
 
 	#[test]
 	fn page_capacity_for_jpeg_capacity_matches_initialized_store() {
-		let jpeg_capacity = FILE_HEADER_SIZE + BLOCK_SIZE * 3 + CRYPTO_OVERHEAD;
+		let path = temp_path();
+		fs::copy("test/CRW_2609(FIN-Gebaeude).jpg", &path).expect("jpeg fixture should copy");
+		let jpeg_bytes = fs::read(&path).expect("fixture should be readable");
+		let jpeg_capacity = get_capacity(&jpeg_bytes).expect("jpeg capacity should compute");
 		let expected = JpegBlockStore::page_capacity_for_jpeg_capacity(jpeg_capacity)
 			.expect("theoretical page capacity should compute");
-		let path = temp_path();
-		let (store, pages) =
-			JpegBlockStore::init_new(path.clone(), jpeg_capacity, DUMMY_KEY, Vec::new()).expect("store should init");
+		let (store, pages) = JpegBlockStore::init_new_with_strategy(
+			path.clone(),
+			jpeg_capacity,
+			DUMMY_KEY,
+			jpeg_bytes,
+			EmbeddingStrategyId::Lsb,
+		)
+		.expect("store should init");
 
-		assert_eq!(expected, 3);
 		assert_eq!(store.page_capacity(), expected);
 		assert!(pages.is_empty());
+
+		fs::remove_file(path).expect("temp file should be removed");
+	}
+
+	#[test]
+	fn matrix_strategy_initializes_to_effective_capacity() {
+		let path = temp_path();
+		fs::copy("test/CRW_2609(FIN-Gebaeude).jpg", &path).expect("jpeg fixture should copy");
+		let jpeg_bytes = fs::read(&path).expect("fixture should be readable");
+		let jpeg_capacity = get_capacity(&jpeg_bytes).expect("jpeg capacity should compute");
+		let lsb_capacity = JpegBlockStore::page_capacity_for_jpeg_capacity(jpeg_capacity)
+			.expect("theoretical page capacity should compute");
+
+		let (mut store, pages) = JpegBlockStore::init_new_with_strategy(
+			path.clone(),
+			jpeg_capacity,
+			DUMMY_KEY,
+			jpeg_bytes,
+			EmbeddingStrategyId::Matrix5,
+		)
+		.expect("matrix store should init");
+
+		assert!(store.page_capacity() <= lsb_capacity);
+		assert!(pages.is_empty());
+		store.persist_blocks(&[]).expect("empty matrix store should persist");
 
 		fs::remove_file(path).expect("temp file should be removed");
 	}

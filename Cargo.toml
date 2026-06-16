@@ -46,5 +46,14 @@ criterion = "0.8"
 name = "collect_bit_slots"
 harness = false
 
-[profile.release]
+[[bench]]
+name = "lsb_embedding"
+harness = false
+
+[[bench]]
+name = "matrix5_simulate"
+harness = false
+
+[profile.profiling]
+inherits = "release"
 debug = true

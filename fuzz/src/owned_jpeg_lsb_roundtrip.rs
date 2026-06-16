@@ -15,9 +15,9 @@ fn collect_bit_slots(owned: &OwnedJpeg) -> Vec<BitSlot> {
 			for &coeff_index in ZIGZAG_INDICES.iter().skip(RESERVED_ZIGZAG_COEFFS) {
 				if !matches!(block[coeff_index], -1..=1) {
 					bit_slots.push(BitSlot {
-						component_index,
-						block_index,
-						coeff_index,
+						component_index: component_index as u32,
+						block_index: block_index as u32,
+						coeff_index: coeff_index as u32,
 					});
 				}
 			}
@@ -42,14 +42,16 @@ fuzz_target!(|input: (OwnedJpeg, [u8; 8], u16)| {
 	for data_bit in 0..(data.len() * 8) {
 		let slot = bit_slots[start_bit + data_bit];
 		let bit = read_bit_from_bytes(&data, data_bit).unwrap_or(0);
-		let coeff = &mut owned.components[slot.component_index].blocks[slot.block_index][slot.coeff_index];
+		let coeff = &mut owned.components[slot.component_index as usize].blocks[slot.block_index as usize]
+			[slot.coeff_index as usize];
 		*coeff = set_lsb(*coeff, bit);
 	}
 
 	let mut read_back = vec![0u8; data.len()];
 	for data_bit in 0..(data.len() * 8) {
 		let slot = bit_slots[start_bit + data_bit];
-		let coeff = owned.components[slot.component_index].blocks[slot.block_index][slot.coeff_index];
+		let coeff = owned.components[slot.component_index as usize].blocks[slot.block_index as usize]
+			[slot.coeff_index as usize];
 		let bit = get_lsb(coeff);
 		write_bit_to_bytes(&mut read_back, data_bit, bit);
 	}

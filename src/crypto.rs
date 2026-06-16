@@ -155,20 +155,23 @@ pub fn write_encrypted_with_key(
 
 	let mut session = JpegSession::new(jpeg_data.to_vec())?;
 	session.write_strategy_marker_lsb(encode_strategy_marker(key, embedding_strategy_id));
-	let mut embedding_session = session.into_embedding_session(embedding_strategy_id);
+	let mut embedding_session = session.into_embedding_session(embedding_strategy_id, *key);
 	embedding_session.write_data(&ciphertext)?;
 	embedding_session.to_jpeg_bytes().map_err(Into::into)
 }
 
 /// Core decryption: reads and decrypts ciphertext embedded in `jpeg_data`.
-pub fn read_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
+pub fn read_encrypted_with_key_and_strategy(
+	jpeg_data: &[u8],
+	key: &[u8; 32],
+) -> Result<(Vec<u8>, EmbeddingStrategyId), CryptoError> {
 	let nonce_h = derive_nonce(key, HEADER_NONCE_LABEL);
 	let cipher = ChaCha20Poly1305::new(key.into());
 
 	let session = JpegSession::new(jpeg_data.to_vec())?;
 	let strategy_marker = session.read_strategy_marker_lsb();
 	let strategy_id = decode_strategy_marker(key, strategy_marker)?;
-	let mut embedding_session = session.into_embedding_session(strategy_id);
+	let mut embedding_session = session.into_embedding_session(strategy_id, *key);
 
 	// Read and decrypt header to recover the data nonce and payload length.
 	let encrypted_header = embedding_session.read_data(ENCRYPTED_HEADER_SIZE)?;
@@ -180,9 +183,14 @@ pub fn read_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32]) -> Result<Vec<u
 
 	// Read and decrypt payload.
 	let encrypted_data = embedding_session.read_data(header_plaintext.data_len as usize + 16)?;
-	cipher
+	let plaintext = cipher
 		.decrypt(Nonce::from_slice(&header_plaintext.nonce_data), encrypted_data.as_ref())
-		.map_err(|_| CryptoError::Aead)
+		.map_err(|_| CryptoError::Aead)?;
+	Ok((plaintext, strategy_id))
+}
+
+pub fn read_encrypted_with_key(jpeg_data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
+	read_encrypted_with_key_and_strategy(jpeg_data, key).map(|(plaintext, _)| plaintext)
 }
 
 /// Encrypts `plaintext` and embeds the ciphertext into the JPEG file at `path`.
@@ -311,9 +319,12 @@ mod tests {
 	#[test]
 	fn strategy_marker_roundtrip_encodes_strategy() {
 		let key = derive_key_for_jpeg(OTHER_JPEG, "secret").unwrap();
-		let encoded = encode_strategy_marker(&key, EmbeddingStrategyId::Lsb);
 
-		assert_ne!(encoded, EmbeddingStrategyId::Lsb as u8);
-		assert_eq!(decode_strategy_marker(&key, encoded).unwrap(), EmbeddingStrategyId::Lsb);
+		for strategy in EmbeddingStrategyId::ALL {
+			let encoded = encode_strategy_marker(&key, strategy);
+
+			assert_ne!(encoded, u8::from(strategy));
+			assert_eq!(decode_strategy_marker(&key, encoded).unwrap(), strategy);
+		}
 	}
 }

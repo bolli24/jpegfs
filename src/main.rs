@@ -23,7 +23,7 @@ use rayon::prelude::*;
 
 use jpegfs::crypto::STRATEGY_MARKER_SIZE;
 #[cfg(unix)]
-use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key};
+use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key_and_strategy};
 #[cfg(unix)]
 use jpegfs::filesystem::FileSystem;
 #[cfg(unix)]
@@ -139,8 +139,8 @@ impl PersistOnDrop {
 		if self.persisted {
 			return Ok(());
 		}
-		persist_filesystem(&mut self.stores, &self.fs, self.total_page_capacity)?;
 		self.persisted = true;
+		persist_filesystem(&mut self.stores, &self.fs, self.total_page_capacity)?;
 		Ok(())
 	}
 }
@@ -320,7 +320,7 @@ fn run_block_stat(input_file: &Path, strategy: EmbeddingStrategyId) -> anyhow::R
 		.iter()
 		.map(|component| component.blocks.len())
 		.collect();
-	let embedding_session = jpeg_session.into_embedding_session(strategy);
+	let embedding_session = jpeg_session.into_embedding_session(strategy, [0u8; 32]);
 
 	println!("File: {}", input_file.display());
 	println!("Strategy: {strategy}");
@@ -336,9 +336,9 @@ fn run_block_stat(input_file: &Path, strategy: EmbeddingStrategyId) -> anyhow::R
 		for slot in embedding_session
 			.bit_slots()
 			.iter()
-			.filter(|slot| slot.component_index == component_index)
+			.filter(|slot| slot.component_index as usize == component_index)
 		{
-			slots_per_block[slot.block_index] += 1;
+			slots_per_block[slot.block_index as usize] += 1;
 		}
 
 		let max_slots = slots_per_block.iter().copied().max().unwrap_or(0);
@@ -498,6 +498,7 @@ struct ProbedStore {
 	jpeg_bytes: Vec<u8>,
 	key: [u8; 32],
 	decrypted_data: Option<Vec<u8>>,
+	decrypted_strategy_id: Option<EmbeddingStrategyId>,
 }
 
 #[cfg(unix)]
@@ -563,11 +564,19 @@ fn load_or_init_stores(
 				jpeg_bytes,
 				key,
 				decrypted_data,
+				decrypted_strategy_id,
 				..
 			} = probed_store;
-			let decrypted_data = decrypted_data.context("internal error: decrypted store missing after probe check")?;
-			let (store, pages) = JpegBlockStore::from_bytes_strict(path.clone(), &decrypted_data, key, jpeg_bytes)
-				.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
+			let decrypted_data = decrypted_data.expect("data must be valid after probe check");
+			let decrypted_strategy_id = decrypted_strategy_id.expect("id must be valid if data was read");
+			let (store, pages) = JpegBlockStore::from_bytes_strict_with_strategy(
+				path.clone(),
+				&decrypted_data,
+				key,
+				jpeg_bytes,
+				decrypted_strategy_id,
+			)
+			.with_context(|| format!("failed to load persisted pages from {}", path.display()))?;
 			let loaded_store = LoadedStore { pages, store };
 			total_page_capacity = total_page_capacity
 				.checked_add(loaded_store.store.page_capacity())
@@ -616,10 +625,20 @@ fn load_or_init_stores(
 			jpeg_bytes,
 			key,
 			decrypted_data,
+			decrypted_strategy_id,
 			..
 		} = probed_store;
 		let (store, pages) = match decrypted_data {
-			Some(decrypted_data) => JpegBlockStore::from_bytes_strict(path.clone(), &decrypted_data, key, jpeg_bytes),
+			Some(decrypted_data) => {
+				let decrypted_strategy_id = decrypted_strategy_id.expect("id must be valid if data was read");
+				JpegBlockStore::from_bytes_strict_with_strategy(
+					path.clone(),
+					&decrypted_data,
+					key,
+					jpeg_bytes,
+					decrypted_strategy_id,
+				)
+			}
 			None => {
 				JpegBlockStore::init_new_with_strategy(path.clone(), jpeg_capacity, key, jpeg_bytes, overwrite_strategy)
 			}
@@ -649,9 +668,9 @@ fn probe_one_store(index: usize, path: &Path, passphrase: &str) -> anyhow::Resul
 	let key = derive_key_for_jpeg(&jpeg_bytes, passphrase)
 		.with_context(|| format!("failed to derive encryption key for {}", path.display()))?;
 
-	let decrypted_data = match read_encrypted_with_key(&jpeg_bytes, &key) {
-		Ok(data) => Some(data),
-		Err(CryptoError::Aead | CryptoError::UnsupportedEmbeddingStrategy { .. }) => None,
+	let (decrypted_data, decrypted_strategy_id) = match read_encrypted_with_key_and_strategy(&jpeg_bytes, &key) {
+		Ok((data, strategy_id)) => (Some(data), Some(strategy_id)),
+		Err(CryptoError::Aead | CryptoError::UnsupportedEmbeddingStrategy { .. }) => (None, None),
 		Err(e) => return Err(e).context(format!("unexpected error decrypting {}", path.display())),
 	};
 
@@ -663,6 +682,7 @@ fn probe_one_store(index: usize, path: &Path, passphrase: &str) -> anyhow::Resul
 		jpeg_bytes,
 		key,
 		decrypted_data,
+		decrypted_strategy_id,
 	})
 }
 
@@ -802,17 +822,35 @@ fn run_simulate(
 		return Ok(());
 	}
 
-	let (pool, pb, label) = jpeg_operation_setup("simulate", jpeg_paths.len())?;
-	let results: Vec<anyhow::Result<()>> = pool.install(|| {
+	let threads = configured_jpeg_threads();
+	eprintln!("[simulate] {} file(s), {threads} worker thread(s)", jpeg_paths.len());
+	let pb = jpeg_progress_bar(jpeg_paths.len());
+	let results: Vec<anyhow::Result<()>> = if threads == 1 {
 		jpeg_paths
-			.par_iter()
+			.iter()
 			.map(|input_path| {
 				let result = simulate_one(input_path, input_dir, output_dir, &pb, seed, strategy);
 				pb.inc(1);
 				result
 			})
 			.collect()
-	});
+	} else {
+		let pool = rayon::ThreadPoolBuilder::new()
+			.num_threads(threads)
+			.build()
+			.context("failed to build JPEG worker thread pool")?;
+		pool.install(|| {
+			jpeg_paths
+				.par_iter()
+				.map(|input_path| {
+					let result = simulate_one(input_path, input_dir, output_dir, &pb, seed, strategy);
+					pb.inc(1);
+					result
+				})
+				.collect()
+		})
+	};
+	let label = "simulate";
 	eprintln!("[{label}] done in {:.1?}", pb.elapsed());
 	pb.finish_and_clear();
 
@@ -857,7 +895,7 @@ fn simulate_one(
 		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
 
 	session.write_strategy_marker_lsb(u8::from(strategy));
-	let mut embedding_session = session.into_embedding_session(strategy);
+	let mut embedding_session = session.into_embedding_session(strategy, [0u8; 32]);
 	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.remaining_bytes();
 	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity)
 		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
@@ -1169,6 +1207,11 @@ fn jpeg_operation_setup(label: &'static str, count: usize) -> anyhow::Result<(Th
 		.num_threads(threads)
 		.build()
 		.context("failed to build JPEG worker thread pool")?;
+	let pb = jpeg_progress_bar(count);
+	Ok((pool, pb, label))
+}
+
+fn jpeg_progress_bar(count: usize) -> ProgressBar {
 	let pb = ProgressBar::new(count as u64);
 	pb.set_style(
 		ProgressStyle::with_template("{spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} elapsed:{elapsed} eta:{eta}")
@@ -1177,7 +1220,7 @@ fn jpeg_operation_setup(label: &'static str, count: usize) -> anyhow::Result<(Th
 	);
 	pb.enable_steady_tick(Duration::from_millis(100));
 	pb.tick();
-	Ok((pool, pb, label))
+	pb
 }
 
 fn configured_jpeg_threads() -> usize {
@@ -1234,6 +1277,7 @@ mod unix_tests {
 	use super::*;
 
 	fn probed_store(path: &str, theoretical_page_capacity: usize, decrypted_data: Option<Vec<u8>>) -> ProbedStore {
+		let decrypted_strategy_id = decrypted_data.as_ref().map(|_| EmbeddingStrategyId::Lsb);
 		ProbedStore {
 			index: 0,
 			path: PathBuf::from(path),
@@ -1242,6 +1286,7 @@ mod unix_tests {
 			jpeg_bytes: Vec::new(),
 			key: [0; 32],
 			decrypted_data,
+			decrypted_strategy_id,
 		}
 	}
 

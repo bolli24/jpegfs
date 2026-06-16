@@ -14,8 +14,6 @@ pub enum JpegFileError {
 		required_slots: usize,
 		available_slots: usize,
 	},
-	#[error("byte offset {byte_offset} exceeds available capacity of {capacity_bytes} bytes")]
-	ByteOffsetOutOfRange { byte_offset: usize, capacity_bytes: usize },
 	#[error("requested {requested_bytes} bytes exceeds available capacity of {available_bytes} bytes")]
 	ReadOutOfCapacity {
 		requested_bytes: usize,
@@ -50,18 +48,6 @@ impl EmbeddingSession {
 		&self.bit_slots
 	}
 
-	pub fn seek(&mut self, byte_offset: usize) -> Result<(), JpegFileError> {
-		let capacity_bytes = self.strategy.capacity_bytes(self.data_slot_count());
-		if byte_offset > capacity_bytes {
-			return Err(JpegFileError::ByteOffsetOutOfRange {
-				byte_offset,
-				capacity_bytes,
-			});
-		}
-		self.cursor_bytes = byte_offset;
-		Ok(())
-	}
-
 	pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
 		if len > self.remaining_bytes() {
 			return Err(JpegFileError::ReadOutOfCapacity {
@@ -71,9 +57,10 @@ impl EmbeddingSession {
 		}
 
 		let mut out = vec![0u8; len];
+		let slot_offset = self.strategy.slots_for_bytes(self.cursor_bytes);
 		let read = self
 			.strategy
-			.read(&self.jpeg.owned_jpeg, &self.bit_slots, self.cursor_bytes, &mut out);
+			.read(&self.jpeg.owned_jpeg, &self.bit_slots[slot_offset..], &mut out);
 		debug_assert_eq!(read, len);
 		self.cursor_bytes += read;
 		Ok(out)
@@ -87,9 +74,10 @@ impl EmbeddingSession {
 			});
 		}
 
+		let slot_offset = self.strategy.slots_for_bytes(self.cursor_bytes);
 		let written = self
 			.strategy
-			.write(&mut self.jpeg.owned_jpeg, &self.bit_slots, self.cursor_bytes, data);
+			.write(&mut self.jpeg.owned_jpeg, &self.bit_slots[slot_offset..], data);
 		debug_assert_eq!(written, data.len());
 		self.cursor_bytes += written;
 		Ok(())
@@ -113,9 +101,9 @@ pub struct JpegSession {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BitSlot {
-	pub component_index: usize,
-	pub block_index: usize,
-	pub coeff_index: usize,
+	pub component_index: u32,
+	pub block_index: u32,
+	pub coeff_index: u32,
 }
 
 /// Bit slot index for denoting where to start the search for the new know unused slots
@@ -139,8 +127,12 @@ impl JpegSession {
 		})
 	}
 
-	pub fn into_embedding_session(self, embedding_strategy_id: EmbeddingStrategyId) -> EmbeddingSession {
-		let strategy = strategy_from_id(embedding_strategy_id);
+	pub fn into_embedding_session(
+		self,
+		embedding_strategy_id: EmbeddingStrategyId,
+		seed: [u8; 32],
+	) -> EmbeddingSession {
+		let strategy = strategy_from_id(embedding_strategy_id, seed);
 		EmbeddingSession {
 			bit_slots: strategy.collect_bit_slots(&self.owned_jpeg, self.embed_search_start),
 			jpeg: self,
@@ -158,7 +150,8 @@ impl JpegSession {
 		let mut out_byte = 0u8;
 		for bit_in_byte in 0..8usize {
 			let slot = self.strategy_marker_slots[bit_in_byte];
-			let coeff = self.owned_jpeg.components[slot.component_index].blocks[slot.block_index][slot.coeff_index];
+			let coeff = self.owned_jpeg.components[slot.component_index as usize].blocks[slot.block_index as usize]
+				[slot.coeff_index as usize];
 			let bit = get_lsb(coeff);
 			if bit == 1 {
 				out_byte |= 1 << (7 - bit_in_byte);
@@ -172,8 +165,8 @@ impl JpegSession {
 		for bit_in_byte in 0..8usize {
 			let slot = self.strategy_marker_slots[bit_in_byte];
 			let bit = (marker >> (7 - bit_in_byte)) & 1;
-			let coeff =
-				&mut self.owned_jpeg.components[slot.component_index].blocks[slot.block_index][slot.coeff_index];
+			let coeff = &mut self.owned_jpeg.components[slot.component_index as usize].blocks
+				[slot.block_index as usize][slot.coeff_index as usize];
 			*coeff = set_lsb(*coeff, bit);
 		}
 	}
@@ -184,8 +177,8 @@ impl JpegSession {
 		Ok(unsafe { write_owned_jpeg(&self.source_jpeg, &self.owned_jpeg)? })
 	}
 
-	/// Returns exactly the required ammount of bit slots for the purpose of embedding the stragy marker
-	/// and where it is safe to start searching for new bitslots eg. for the actual embedding
+	/// Returns exactly the required amount of bit slots for the purpose of embedding the strategy marker
+	/// and where it is safe to start searching for new bitslots e.g. for the actual embedding
 	/// Errors if not enough bit slots could be found.
 	fn strategy_marker_bitslots(
 		jpeg: &OwnedJpeg,
@@ -206,14 +199,14 @@ impl JpegSession {
 
 		let last_zigzag_index = ZIGZAG_INDICES
 			.iter()
-			.position(|&idx| idx == last.coeff_index)
+			.position(|&idx| idx == last.coeff_index as usize)
 			.expect("marker slot came from zigzag indices");
 
 		let embed_search_start = BitSlotSearchStart {
-			component_index: last.component_index,
-			block_index: last.block_index,
+			component_index: last.component_index as usize,
+			block_index: last.block_index as usize,
 			zigzag_index: last_zigzag_index + 1,
 		};
-		return Ok((slots, embed_search_start));
+		Ok((slots, embed_search_start))
 	}
 }

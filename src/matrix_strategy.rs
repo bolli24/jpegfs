@@ -14,14 +14,6 @@ const MATRIX_PERMUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix permutation v1";
 const MATRIX_WHITENING_SEED_LABEL: &[u8] = b"jpegfs matrix whitening v1";
 const MATRIX_MUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix mutation v1";
 
-// # Optimization
-// Baseline: 105ms
-// index permutation vec + code_word: Vec<BitSlot>: 114ms
-// index permutation vec + code_word: Vec<&BitSlot>: 120ms
-// codeword: Vec<BitSlot>: 106ms
-// Bitslot u32,u32,u32: 94ms
-// Bitslot u16,u16,u32: 97ms
-
 pub struct MatrixStrategy(pub MatrixMode, pub [u8; 32]);
 
 impl MatrixStrategy {
@@ -65,6 +57,8 @@ impl EmbeddingStrategy for MatrixStrategy {
 				true
 			},
 		);
+		let mut permutation_rng = self.rng(MATRIX_PERMUTATION_SEED_LABEL);
+		bit_slots.shuffle(&mut permutation_rng);
 
 		bit_slots
 	}
@@ -78,10 +72,6 @@ impl EmbeddingStrategy for MatrixStrategy {
 	}
 
 	fn read(&self, jpeg: &OwnedJpeg, slots: &[BitSlot], out: &mut [u8]) -> usize {
-		let mut permutation_rng = self.rng(MATRIX_PERMUTATION_SEED_LABEL);
-		let mut slots = slots.to_vec();
-		slots.shuffle(&mut permutation_rng);
-
 		let mut extracted_byte = 0u8;
 		let mut available_extracted_bits = 0usize;
 		let mut rng = self.rng(MATRIX_WHITENING_SEED_LABEL);
@@ -132,10 +122,6 @@ impl EmbeddingStrategy for MatrixStrategy {
 	}
 
 	fn write(&self, jpeg: &mut OwnedJpeg, slots: &[BitSlot], data: &[u8]) -> usize {
-		let mut permutation_rng = self.rng(MATRIX_PERMUTATION_SEED_LABEL);
-		let mut slots = slots.to_vec();
-		slots.shuffle(&mut permutation_rng);
-
 		let mut byte_to_embed = 0u8;
 		let mut available_bits_to_embed = 0;
 		let mut bytes = data.iter();
@@ -175,32 +161,27 @@ impl EmbeddingStrategy for MatrixStrategy {
 				break;
 			}
 
-			loop {
-				let code_word = &slots[start_of_n..start_of_n + n];
+			let code_word = &slots[start_of_n..start_of_n + n];
 
-				let mut hash = 0;
-				for i in 0..n {
-					let slot = code_word[i];
-					let coeff = jpeg.components[slot.component_index as usize].blocks[slot.block_index as usize]
-						[slot.coeff_index as usize];
-					if matrix_bit(coeff) == 1 {
-						hash ^= i + 1;
-					}
+			let mut hash = 0;
+			for i in 0..n {
+				let slot = code_word[i];
+				let coeff = jpeg.components[slot.component_index as usize].blocks[slot.block_index as usize]
+					[slot.coeff_index as usize];
+				if matrix_bit(coeff) == 1 {
+					hash ^= i + 1;
 				}
+			}
 
-				let mut i = hash ^ k_bits_to_embed;
-				if i == 0 {
-					break; // embedded without change
-				}
+			let mut i = hash ^ k_bits_to_embed;
+			if i != 0 {
 				i -= 1;
 
 				let slot = code_word[i];
 				let coeff = &mut jpeg.components[slot.component_index as usize].blocks[slot.block_index as usize]
 					[slot.coeff_index as usize];
 
-				*coeff = balanced_matrix_flip(*coeff, &mut mutation_rng)
-					.expect("non-zero coefficient has a matrix-bit flip");
-				break;
+				*coeff = balanced_matrix_flip(*coeff, &mut mutation_rng);
 			}
 			start_of_n += n;
 			written_bits += bits_in_group;
@@ -298,23 +279,14 @@ fn matrix_bit(coeff: i16) -> usize {
 	}
 }
 
-fn balanced_matrix_flip<T: Rng>(coeff: i16, rng: &mut T) -> Option<i16> {
-	let current_bit = matrix_bit(coeff);
-	let is_valid = |candidate: i16| candidate != 0 && matrix_bit(candidate) != current_bit;
-	let down = coeff.checked_sub(1).filter(|&candidate| is_valid(candidate));
-	let up = coeff.checked_add(1).filter(|&candidate| is_valid(candidate));
-
-	match (down, up) {
-		(Some(down), Some(up)) => {
-			if rng.random::<bool>() {
-				Some(down)
-			} else {
-				Some(up)
-			}
-		}
-		(Some(down), None) => Some(down),
-		(None, Some(up)) => Some(up),
-		(None, None) => None,
+fn balanced_matrix_flip<T: Rng>(coeff: i16, rng: &mut T) -> i16 {
+	match coeff {
+		1 => 2,
+		-1 => -2,
+		i16::MIN => i16::MIN + 1,
+		i16::MAX => i16::MAX - 1,
+		_ if rng.random::<bool>() => coeff - 1,
+		_ => coeff + 1,
 	}
 }
 
@@ -358,7 +330,7 @@ mod test {
 			if coeff == 0 {
 				continue;
 			}
-			let flipped = balanced_matrix_flip(coeff, &mut rng).expect("non-zero coefficient should be flippable");
+			let flipped = balanced_matrix_flip(coeff, &mut rng);
 
 			assert_ne!(flipped, 0);
 			assert_eq!((coeff - flipped).abs(), 1);

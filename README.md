@@ -9,16 +9,37 @@ cargo run -- mount <jpeg_directory> <mount_directory>
 If the mount directory does not exist, jpegfs creates it and removes it again on shutdown. Pre-existing mount
 directories are left in place.
 
-Print info about a file system:
+## Other commands:
+
+- `cargo run -- stat <jpeg_directory>`: print info about a file system (passphrase optional)
+- `reencode <input_directory> <output_directory>`: re-encode JPEGs without embedding filesystem data
+- `simulate <input_directory> <output_directory>`: embed random bytes of the correct length to simulate persistence
+  output
+- `block_stat <input_file>`: print embeddable coefficient statistics for one JPEG
+
+## Strategies
+
+jpegfs stores the embedding strategy in each JPEG, so existing files are read with the strategy they were written with.
+When mounting initializes new store or overwrites unreadable stores after confirmation, it prompts for the strategy.
+
+Available strategies:
+
+- `lsb`: uses every embeddable coefficient
+- `lsb50`: uses every second embeddable coefficient
+- `matrix2`-`matrix7`: matrix encoding with `k=2` through `k=7`, embeds `k` bits in `2^k -1` coefficients with maximum
+  of one change per `2^k -1` bits
+
+Set the strategy for simulation or capacity stats with `--strategy` (Defaults to `lsb`):
 
 ```bash
-cargo run -- stat <jpeg_directory>
+cargo run -- simulate <input_directory> <output_directory> --strategy matrix5
+cargo run -- block_stat <input_file> --strategy lsb50
 ```
 
 ## Config
 
 By default jpegfs uses all available hardware threads to decode and encode jpeg files in parallel. Use
-`JPEGFS_JPEG_THREADS` environment variable to override.
+`JPEGFS_THREADS` environment variable to override.
 
 ## Fuzzing
 
@@ -65,7 +86,7 @@ iteration:
 cargo fuzz run --target x86_64-unknown-linux-gnu filesystem_state_machine --sanitizer none
 ```
 
-Minimize all copora:
+Minimize all corpora:
 
 ```bash
 ./fuzz/cmin-all.sh --target x86_64-unknown-linux-gnu

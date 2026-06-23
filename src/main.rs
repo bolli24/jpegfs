@@ -1229,12 +1229,12 @@ fn configured_jpeg_threads() -> usize {
 		.unwrap_or(1);
 	let max_threads = auto_threads.max(1);
 
-	match std::env::var("JPEGFS_JPEG_THREADS") {
+	match std::env::var("JPEGFS_THREADS") {
 		Ok(raw) => match raw.parse::<usize>() {
 			Ok(parsed) if parsed > 0 => parsed,
 			_ => {
 				warn!(
-					"invalid JPEGFS_JPEG_THREADS='{}'; using auto thread count ({})",
+					"invalid JPEGFS_THREADS='{}'; using auto thread count ({})",
 					raw, max_threads
 				);
 				max_threads
@@ -1242,7 +1242,7 @@ fn configured_jpeg_threads() -> usize {
 		},
 		Err(std::env::VarError::NotPresent) => max_threads,
 		Err(err) => {
-			warn!("failed reading JPEGFS_JPEG_THREADS ({err}); using auto thread count ({max_threads})");
+			warn!("failed reading JPEGFS_THREADS ({err}); using auto thread count ({max_threads})");
 			max_threads
 		}
 	}

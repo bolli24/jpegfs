@@ -14,6 +14,38 @@ const MATRIX_PERMUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix permutation v1";
 const MATRIX_WHITENING_SEED_LABEL: &[u8] = b"jpegfs matrix whitening v1";
 const MATRIX_MUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix mutation v1";
 
+/// |   k |   n | Capacity of slots | Expected changes/group | Changes/embedded bit |
+/// | ---:| ---:| -----------------:| ----------------------:| --------------------:|
+/// |   2 |   3 |            66.67% |                 0.7500 |               0.3750 |
+/// |   3 |   7 |            42.86% |                 0.8750 |               0.2917 |
+/// |   4 |  15 |            26.67% |                 0.9375 |               0.2344 |
+/// |   5 |  31 |            16.13% |                 0.9688 |               0.1938 |
+/// |   6 |  63 |             9.52% |                 0.9844 |               0.1641 |
+/// |   7 | 127 |             5.51% |                 0.9922 |               0.1417 |
+///
+/// n = 2^k - 1, capacity = k / (2^k - 1),
+/// expected changes/group = n / 2^k.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MatrixMode {
+	pub k: usize,
+	pub n: usize,
+}
+
+impl MatrixMode {
+	pub fn new(k: usize) -> Option<Self> {
+		(2..8).contains(&k).then(|| Self { k, n: (1 << k) - 1 })
+	}
+
+	pub fn capacity_bytes(self, usable_coefficients: usize) -> usize {
+		(usable_coefficients / self.n * self.k) / 8
+	}
+
+	pub fn slots_for_bytes(self, byte_count: usize) -> usize {
+		(byte_count * 8).div_ceil(self.k) * self.n
+	}
+}
+
 pub struct MatrixStrategy(pub MatrixMode, pub [u8; 32]);
 
 impl MatrixStrategy {
@@ -199,26 +231,6 @@ fn index_permutation<T: Rng>(length: usize, rng: &mut T) -> Vec<usize> {
 	let mut vec: Vec<usize> = (0..length).collect();
 	vec.shuffle(rng);
 	vec
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MatrixMode {
-	pub k: usize,
-	pub n: usize,
-}
-
-impl MatrixMode {
-	pub fn new(k: usize) -> Option<Self> {
-		(2..8).contains(&k).then(|| Self { k, n: (1 << k) - 1 })
-	}
-
-	pub fn capacity_bytes(self, usable_coefficients: usize) -> usize {
-		(usable_coefficients / self.n * self.k) / 8
-	}
-
-	pub fn slots_for_bytes(self, byte_count: usize) -> usize {
-		(byte_count * 8).div_ceil(self.k) * self.n
-	}
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

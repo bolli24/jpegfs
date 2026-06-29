@@ -1,5 +1,5 @@
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use rand::{Rng, SeedableRng};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -42,7 +42,11 @@ mod tui;
 const MIN_BOOTSTRAP_PAGES: usize = 2;
 
 #[derive(Debug, Eq, Parser, PartialEq)]
-#[command(name = "jpegfs", about = "JPEG-backed steganographic filesystem")]
+#[command(
+	name = "jpegfs",
+	about = "JPEG-backed steganographic filesystem",
+	after_long_help = "Environment:\n  JPEGFS_PASSPHRASE  Passphrase for mount/stat; prompts if unset.\n  JPEGFS_THREADS     JPEG worker threads; defaults to available CPUs."
+)]
 struct CliArgs {
 	#[command(subcommand)]
 	command: CliCommand,
@@ -251,7 +255,17 @@ fn resolve_passphrase() -> anyhow::Result<String> {
 }
 
 fn parse_cli_args() -> anyhow::Result<CliArgs> {
-	validate_cli_args(CliArgs::parse())
+	if std::env::args_os().len() == 1 {
+		let mut command = CliArgs::command();
+		command.print_long_help()?;
+		println!();
+		std::process::exit(0);
+	}
+
+	match CliArgs::try_parse() {
+		Ok(cli_args) => validate_cli_args(cli_args),
+		Err(err) => err.exit(),
+	}
 }
 
 #[cfg(unix)]

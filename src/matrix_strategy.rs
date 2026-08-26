@@ -1,4 +1,5 @@
 #![allow(dead_code, unused_variables)]
+
 use crate::jpeg::BlockData;
 use crate::strategy::iter_coefficients;
 use crate::{
@@ -6,6 +7,7 @@ use crate::{
 	jpeg_file::{BitSlot, BitSlotSearchStart, JpegSession},
 	strategy::{EmbeddingStrategy, EmbeddingStrategyId},
 };
+use arrayvec::ArrayVec;
 use rand::seq::SliceRandom;
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
@@ -241,7 +243,7 @@ struct MatrixStats {
 	examined: usize,
 }
 
-fn flatten_components(components: &[OwnedComponent; 3]) -> Vec<i16> {
+fn flatten_components(components: &ArrayVec<OwnedComponent, 3>) -> Vec<i16> {
 	components
 		.iter()
 		.flat_map(|comp| comp.blocks.iter())
@@ -310,27 +312,40 @@ mod test {
 
 	#[test]
 	fn matrix_strategy_read_write_roundtrip() {
-		let image_bytes = include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg");
 		let payload = b"matrix strategy roundtrip";
 
-		for strategy in [
-			EmbeddingStrategyId::Matrix2,
-			EmbeddingStrategyId::Matrix3,
-			EmbeddingStrategyId::Matrix4,
-			EmbeddingStrategyId::Matrix5,
-			EmbeddingStrategyId::Matrix6,
-			EmbeddingStrategyId::Matrix7,
+		for (image_name, image_bytes) in [
+			(
+				"color",
+				include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg").as_slice(),
+			),
+			(
+				"grayscale",
+				include_bytes!("../test/CRW_2614_grayscale_384x287.jpg").as_slice(),
+			),
 		] {
-			let session = JpegSession::new(image_bytes.to_vec()).unwrap();
-			let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
-			embedding_session.write_data(payload).unwrap();
-			let encoded = embedding_session.to_jpeg_bytes().unwrap();
+			for strategy in [
+				EmbeddingStrategyId::Matrix2,
+				EmbeddingStrategyId::Matrix3,
+				EmbeddingStrategyId::Matrix4,
+				EmbeddingStrategyId::Matrix5,
+				EmbeddingStrategyId::Matrix6,
+				EmbeddingStrategyId::Matrix7,
+			] {
+				let session = JpegSession::new(image_bytes.to_vec()).unwrap();
+				let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
+				embedding_session.write_data(payload).unwrap();
+				let encoded = embedding_session.to_jpeg_bytes().unwrap();
 
-			let session = JpegSession::new(encoded).unwrap();
-			let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
-			let decoded = embedding_session.read_data(payload.len()).unwrap();
+				let session = JpegSession::new(encoded).unwrap();
+				let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
+				let decoded = embedding_session.read_data(payload.len()).unwrap();
 
-			assert_eq!(decoded, payload);
+				assert_eq!(
+					decoded, payload,
+					"failed for {image_name} image with strategy {strategy}"
+				);
+			}
 		}
 	}
 

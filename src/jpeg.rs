@@ -1,6 +1,7 @@
 use std::ptr;
 
 use arbitrary::{Arbitrary, Unstructured};
+use arrayvec::ArrayVec;
 use libc::{c_uchar, c_ulong, c_void, free};
 use mozjpeg_sys::*;
 use thiserror::Error;
@@ -24,13 +25,15 @@ impl OwnedComponent {
 
 #[derive(Clone, Debug)]
 pub struct OwnedJpeg {
-	pub components: [OwnedComponent; 3],
+	pub components: ArrayVec<OwnedComponent, 3>,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum JpegError {
-	#[error("only 3-component JPEGs are supported, found {found}")]
+	#[error("only 1 and 3-component JPEGs are supported, found {found}")]
 	UnsupportedComponentCount { found: i32 },
+	#[error("expected {expected}-component JPEG, found {found}")]
+	ComponentCountMismatch { found: i32, expected: usize },
 	#[error(
 		"component {component_index} dimensions mismatch: template={template_width}x{template_height}, owned={owned_width}x{owned_height}"
 	)]
@@ -64,13 +67,14 @@ impl<'a> Arbitrary<'a> for OwnedComponent {
 
 impl<'a> Arbitrary<'a> for OwnedJpeg {
 	fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-		Ok(Self {
-			components: [
-				OwnedComponent::arbitrary(u)?,
-				OwnedComponent::arbitrary(u)?,
-				OwnedComponent::arbitrary(u)?,
-			],
-		})
+		let component_count = *u.choose(&[1_usize, 3])?;
+		let mut components = ArrayVec::new();
+
+		for _ in 0..component_count {
+			components.push(OwnedComponent::arbitrary(u)?);
+		}
+
+		Ok(Self { components })
 	}
 }
 
@@ -84,24 +88,11 @@ impl OwnedJpeg {
 			.sum::<usize>();
 		total_bits / 8
 	}
-
-	pub fn component_capacity(&self) -> [usize; 3] {
-		let mut component_bits = [0usize; 3];
-		for (idx, component) in self.components.iter().enumerate() {
-			component_bits[idx] = component.blocks.iter().map(block_capacity_bits).sum::<usize>() / 8;
-		}
-		component_bits
-	}
 }
 
 pub fn get_capacity(jpeg_data: &[u8]) -> Result<usize, JpegError> {
 	let owned = unsafe { read_owned_jpeg(jpeg_data)? };
 	Ok(owned.capacity())
-}
-
-pub fn get_component_capacity(jpeg_data: &[u8]) -> Result<[usize; 3], JpegError> {
-	let owned = unsafe { read_owned_jpeg(jpeg_data)? };
-	Ok(owned.component_capacity())
 }
 
 // ---------- platform error-handling strategy ----------
@@ -326,22 +317,24 @@ pub unsafe fn read_owned_jpeg(jpeg_data: &[u8]) -> Result<OwnedJpeg, JpegError> 
 		jpeg_data,
 		|_| {},
 		|srcinfo, coef_arrays| {
-			if srcinfo.num_components != 3 {
+			if srcinfo.num_components != 1 && srcinfo.num_components != 3 {
 				return Err(JpegError::UnsupportedComponentCount {
 					found: srcinfo.num_components,
 				});
 			}
 
-			let mut components = std::array::from_fn(|comp_idx| {
-				let comp_info = srcinfo.comp_info.add(comp_idx);
+			let mut components = ArrayVec::new();
+
+			for comp_idx in 0..srcinfo.num_components {
+				let comp_info = srcinfo.comp_info.add(comp_idx as usize);
 				let width_in_blocks = (*comp_info).width_in_blocks as usize;
 				let height_in_blocks = (*comp_info).height_in_blocks as usize;
-				OwnedComponent {
+				components.push(OwnedComponent {
 					width_in_blocks,
 					height_in_blocks,
 					blocks: vec![[0; 64]; width_in_blocks * height_in_blocks],
-				}
-			});
+				})
+			}
 
 			for_each_block_ptr(
 				srcinfo,
@@ -369,13 +362,20 @@ pub unsafe fn write_owned_jpeg(template_jpeg: &[u8], owned_jpeg: &OwnedJpeg) -> 
 			}
 		},
 		|srcinfo, coef_arrays| {
-			if srcinfo.num_components != 3 {
+			if srcinfo.num_components as usize != owned_jpeg.components.len() {
+				return Err(JpegError::ComponentCountMismatch {
+					expected: owned_jpeg.components.len(),
+					found: srcinfo.num_components,
+				});
+			}
+
+			if srcinfo.num_components != 1 && srcinfo.num_components != 3 {
 				return Err(JpegError::UnsupportedComponentCount {
 					found: srcinfo.num_components,
 				});
 			}
 
-			for comp_idx in 0..3usize {
+			for comp_idx in 0..srcinfo.num_components as usize {
 				let comp_info = srcinfo.comp_info.add(comp_idx);
 				let width_in_blocks = (*comp_info).width_in_blocks as usize;
 				let height_in_blocks = (*comp_info).height_in_blocks as usize;
@@ -478,7 +478,24 @@ unsafe fn for_each_block_ptr<F>(
 mod tests {
 	use super::*;
 
+	const GRAYSCALE_JPEG: &[u8] = include_bytes!("../test/CRW_2614_grayscale_384x287.jpg");
 	const TINY_JPEG: &[u8] = include_bytes!("../fuzz/fixtures/tiny_crw_2609_16x8.jpg");
+
+	#[test]
+	fn grayscale_read_write_roundtrip_preserves_coefficients() {
+		let original = unsafe { read_owned_jpeg(GRAYSCALE_JPEG) }.unwrap();
+		assert_eq!(original.components.len(), 1);
+
+		let encoded = unsafe { write_owned_jpeg(GRAYSCALE_JPEG, &original) }.unwrap();
+		let decoded = unsafe { read_owned_jpeg(&encoded) }.unwrap();
+		assert_eq!(decoded.components.len(), 1);
+
+		let original_component = &original.components[0];
+		let decoded_component = &decoded.components[0];
+		assert_eq!(decoded_component.width_in_blocks, original_component.width_in_blocks);
+		assert_eq!(decoded_component.height_in_blocks, original_component.height_in_blocks);
+		assert_eq!(decoded_component.blocks, original_component.blocks);
+	}
 
 	#[test]
 	fn malformed_jpeg_empty() {

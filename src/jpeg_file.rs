@@ -3,6 +3,7 @@ use crate::jpeg::{JpegError, OwnedComponent, OwnedJpeg, read_owned_jpeg, write_o
 use crate::lsb::{get_lsb, set_lsb};
 use crate::strategy::{EmbeddingStrategy, EmbeddingStrategyId, collect_lsb_bit_slots, strategy_from_id};
 use crate::zigzag::ZIGZAG_INDICES;
+use arrayvec::ArrayVec;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -141,7 +142,7 @@ impl JpegSession {
 		}
 	}
 
-	pub fn components(&self) -> &[OwnedComponent; 3] {
+	pub fn components(&self) -> &ArrayVec<OwnedComponent, 3> {
 		&self.owned_jpeg.components
 	}
 

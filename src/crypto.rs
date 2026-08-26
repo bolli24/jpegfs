@@ -221,8 +221,25 @@ mod tests {
 	use super::*;
 	use crate::jpeg::read_owned_jpeg;
 
+	const GRAYSCALE_JPEG: &[u8] = include_bytes!("../test/CRW_2614_grayscale_384x287.jpg");
 	const TINY_JPEG: &[u8] = include_bytes!("../fuzz/fixtures/tiny_crw_2609_16x8.jpg");
 	const OTHER_JPEG: &[u8] = include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg");
+
+	#[test]
+	fn grayscale_encrypt_decrypt_roundtrip_lsb_strategies() {
+		let key = [42; 32];
+		let plaintext = b"grayscale encrypted roundtrip";
+
+		for strategy in [EmbeddingStrategyId::Lsb, EmbeddingStrategyId::Lsb50] {
+			let encoded = write_encrypted_with_key(GRAYSCALE_JPEG, &key, plaintext, strategy).unwrap();
+			let encoded_jpeg = unsafe { read_owned_jpeg(&encoded) }.unwrap();
+			assert_eq!(encoded_jpeg.components.len(), 1);
+
+			let recovered = read_encrypted_with_key(&encoded, &key)
+				.unwrap_or_else(|err| panic!("failed to decrypt with strategy {strategy}: {err}"));
+			assert_eq!(recovered, plaintext, "failed with strategy {strategy}");
+		}
+	}
 
 	#[test]
 	fn derived_key_is_deterministic() {

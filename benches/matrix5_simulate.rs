@@ -12,7 +12,7 @@ fn payload_embed_len() -> usize {
 	let mut session = JpegSession::new(FIXTURE.to_vec()).expect("fixture should parse");
 	session.write_strategy_marker_lsb(u8::from(STRATEGY));
 	let embedding_session = session.into_embedding_session(STRATEGY, [0u8; 32]);
-	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.remaining_bytes();
+	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.capacity();
 	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity).expect("fixture should have store capacity");
 	embed_len.saturating_sub(STRATEGY_MARKER_SIZE)
 }
@@ -22,7 +22,7 @@ fn encode_random_payload(jpeg_bytes: Vec<u8>, random_bytes: &[u8]) -> Vec<u8> {
 	session.write_strategy_marker_lsb(u8::from(STRATEGY));
 	let mut embedding_session = session.into_embedding_session(STRATEGY, [0u8; 32]);
 	embedding_session
-		.write_data(random_bytes)
+		.write(random_bytes)
 		.expect("random payload should fit");
 	embedding_session.to_jpeg_bytes().expect("fixture should re-encode")
 }

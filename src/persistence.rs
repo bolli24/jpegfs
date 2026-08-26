@@ -190,7 +190,7 @@ impl JpegBlockStore {
 			.map_err(CryptoError::from)
 			.map_err(Error::JpegEncrypt)?;
 		let embedding_session = session.into_embedding_session(embedding_strategy_id, key);
-		let encrypted_data_capacity = embedding_session.remaining_bytes();
+		let encrypted_data_capacity = embedding_session.capacity();
 		let encrypted_data_overhead = CRYPTO_OVERHEAD - STRATEGY_MARKER_SIZE;
 		let plaintext_capacity = encrypted_data_capacity.saturating_sub(encrypted_data_overhead);
 		Self::page_capacity_for_plaintext_capacity(plaintext_capacity)
@@ -836,47 +836,65 @@ mod tests {
 
 	#[test]
 	fn persist_blocks_roundtrips_store_payload() {
-		use crate::crypto::{derive_key_for_jpeg, read_encrypted_with_key};
+		use crate::crypto::{derive_key_for_jpeg, read_encrypted_with_key_and_strategy};
 
 		let unique = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
 			.expect("clock should be after unix epoch")
 			.as_nanos();
-		let path = std::env::temp_dir().join(format!("jpegfs-persistence-roundtrip-{unique}.jpg"));
-		fs::copy("test/CRW_2609(FIN-Gebaeude).jpg", &path).expect("jpeg fixture should copy");
-
-		let jpeg_bytes = fs::read(&path).expect("fixture should be readable");
-		let key = derive_key_for_jpeg(&jpeg_bytes, "test_passphrase").expect("key derivation should succeed");
-		let jpeg_capacity = get_capacity(&jpeg_bytes).expect("jpeg capacity should compute");
-
-		let decrypted = read_encrypted_with_key(&jpeg_bytes, &key).unwrap_or_else(|_| Vec::new());
-		let (mut store, _) =
-			JpegBlockStore::from_bytes_or_init_strict(path.clone(), &decrypted, jpeg_capacity, key, jpeg_bytes)
-				.expect("store should initialize");
-
+		let source_jpeg = fs::read("test/CRW_2613(Sitzflaeche).jpg").expect("fixture should be readable");
+		let key = derive_key_for_jpeg(&source_jpeg, "test_passphrase").expect("key derivation should succeed");
+		let jpeg_capacity = get_capacity(&source_jpeg).expect("jpeg capacity should compute");
 		let mut pager = Pager::new(8);
 		pager
 			.bytes_write(ino_from_u64(99), 0, b"payload")
 			.expect("write should succeed");
 		let encoded = pager.encode_blocks().expect("encoding should succeed");
-		let wrote = store.persist_blocks(&encoded).expect("persist should succeed");
-		assert!(wrote > 0, "changed blocks should be persisted");
-		let wrote_again = store
-			.persist_blocks(&encoded)
-			.expect("idempotent persist should succeed");
-		assert!(wrote_again == 0, "unchanged blocks should not be persisted");
-		drop(store);
 
-		let jpeg_bytes2 = fs::read(&path).expect("persisted jpeg should be readable");
-		let key2 = derive_key_for_jpeg(&jpeg_bytes2, "test_passphrase").expect("key derivation should succeed");
-		let jpeg_capacity2 = get_capacity(&jpeg_bytes2).expect("jpeg capacity should compute");
-		let decrypted2 = read_encrypted_with_key(&jpeg_bytes2, &key2).expect("decryption should succeed after write");
-		let (_reloaded, pages) =
-			JpegBlockStore::from_bytes_or_init_strict(path.clone(), &decrypted2, jpeg_capacity2, key2, jpeg_bytes2)
-				.expect("store should reload");
-		assert_eq!(pages.len(), encoded.len());
+		for strategy in EmbeddingStrategyId::ALL {
+			let path = std::env::temp_dir().join(format!("jpegfs-persistence-roundtrip-{unique}-{strategy}.jpg"));
+			fs::write(&path, &source_jpeg).expect("jpeg fixture should copy");
+			let (mut store, _) = JpegBlockStore::from_bytes_or_init_strict_with_strategy(
+				path.clone(),
+				&[],
+				jpeg_capacity,
+				key,
+				source_jpeg.clone(),
+				strategy,
+			)
+			.expect("store should initialize");
 
-		fs::remove_file(path).expect("temp jpeg should be removed");
+			let wrote = store
+				.persist_blocks(&encoded)
+				.unwrap_or_else(|err| panic!("persist should succeed with {strategy}: {err}"));
+			assert!(wrote > 0, "changed blocks should be persisted with {strategy}");
+			let wrote_again = store
+				.persist_blocks(&encoded)
+				.expect("idempotent persist should succeed");
+			assert_eq!(
+				wrote_again, 0,
+				"unchanged blocks should not be persisted with {strategy}"
+			);
+			drop(store);
+
+			let jpeg_bytes2 = fs::read(&path).expect("persisted jpeg should be readable");
+			let jpeg_capacity2 = get_capacity(&jpeg_bytes2).expect("jpeg capacity should compute");
+			let (decrypted2, decoded_strategy) = read_encrypted_with_key_and_strategy(&jpeg_bytes2, &key)
+				.expect("decryption should succeed after write");
+			assert_eq!(decoded_strategy, strategy);
+			let (_reloaded, pages) = JpegBlockStore::from_bytes_or_init_strict_with_strategy(
+				path.clone(),
+				&decrypted2,
+				jpeg_capacity2,
+				key,
+				jpeg_bytes2,
+				decoded_strategy,
+			)
+			.expect("store should reload");
+			assert_eq!(pages.len(), encoded.len(), "page count mismatch with {strategy}");
+
+			fs::remove_file(path).expect("temp jpeg should be removed");
+		}
 	}
 
 	#[test]

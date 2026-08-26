@@ -156,7 +156,7 @@ pub fn write_encrypted_with_key(
 	let mut session = JpegSession::new(jpeg_data.to_vec())?;
 	session.write_strategy_marker_lsb(encode_strategy_marker(key, embedding_strategy_id));
 	let mut embedding_session = session.into_embedding_session(embedding_strategy_id, *key);
-	embedding_session.write_data(&ciphertext)?;
+	embedding_session.write(&ciphertext)?;
 	embedding_session.to_jpeg_bytes().map_err(Into::into)
 }
 
@@ -171,20 +171,22 @@ pub fn read_encrypted_with_key_and_strategy(
 	let session = JpegSession::new(jpeg_data.to_vec())?;
 	let strategy_marker = session.read_strategy_marker_lsb();
 	let strategy_id = decode_strategy_marker(key, strategy_marker)?;
-	let mut embedding_session = session.into_embedding_session(strategy_id, *key);
+	let embedding_session = session.into_embedding_session(strategy_id, *key);
 
 	// Read and decrypt header to recover the data nonce and payload length.
-	let encrypted_header = embedding_session.read_data(ENCRYPTED_HEADER_SIZE)?;
+	let encrypted_header = embedding_session.read(ENCRYPTED_HEADER_SIZE)?;
 	let header_plaintext_bytes = cipher
 		.decrypt(Nonce::from_slice(&nonce_h), encrypted_header.as_ref())
 		.map_err(|_| CryptoError::Aead)?;
 
 	let header_plaintext = EncryptedHeaderPlaintext::read_from_bytes(&header_plaintext_bytes).expect("size is checked");
 
-	// Read and decrypt payload.
-	let encrypted_data = embedding_session.read_data(header_plaintext.data_len as usize + 16)?;
+	// Read the complete ciphertext from the beginning, then slice off the header.
+	let encrypted_data_len = header_plaintext.data_len as usize + 16;
+	let ciphertext = embedding_session.read(ENCRYPTED_HEADER_SIZE + encrypted_data_len)?;
+	let encrypted_data = &ciphertext[ENCRYPTED_HEADER_SIZE..];
 	let plaintext = cipher
-		.decrypt(Nonce::from_slice(&header_plaintext.nonce_data), encrypted_data.as_ref())
+		.decrypt(Nonce::from_slice(&header_plaintext.nonce_data), encrypted_data)
 		.map_err(|_| CryptoError::Aead)?;
 	Ok((plaintext, strategy_id))
 }
@@ -226,11 +228,11 @@ mod tests {
 	const OTHER_JPEG: &[u8] = include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg");
 
 	#[test]
-	fn grayscale_encrypt_decrypt_roundtrip_lsb_strategies() {
+	fn grayscale_encrypt_decrypt_roundtrip_all_strategies() {
 		let key = [42; 32];
 		let plaintext = b"grayscale encrypted roundtrip";
 
-		for strategy in [EmbeddingStrategyId::Lsb, EmbeddingStrategyId::Lsb50] {
+		for strategy in EmbeddingStrategyId::ALL {
 			let encoded = write_encrypted_with_key(GRAYSCALE_JPEG, &key, plaintext, strategy).unwrap();
 			let encoded_jpeg = unsafe { read_owned_jpeg(&encoded) }.unwrap();
 			assert_eq!(encoded_jpeg.components.len(), 1);

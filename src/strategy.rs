@@ -1,12 +1,12 @@
-use std::fmt;
-use std::str::FromStr;
-
 use crate::crypto::CryptoError;
 use crate::jpeg::{BlockData, OwnedJpeg};
 use crate::jpeg_file::{BitSlot, BitSlotSearchStart};
 use crate::lsb::{get_lsb, is_embeddable_coeff, read_bit_from_bytes, set_lsb};
 use crate::matrix_strategy::{MatrixMode, MatrixStrategy};
 use crate::zigzag::{RESERVED_ZIGZAG_COEFFS, ZIGZAG_INDICES};
+use arbitrary::Arbitrary;
+use std::fmt;
+use std::str::FromStr;
 
 pub fn iter_coefficients<F>(
 	owned_jpeg: &OwnedJpeg,
@@ -82,7 +82,7 @@ pub fn iter_coefficients_mut<F>(
 	}
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Arbitrary)]
 #[repr(u8)]
 pub enum EmbeddingStrategyId {
 	Lsb = 1,
@@ -217,8 +217,6 @@ pub trait EmbeddingStrategy {
 
 	fn capacity_bytes(&self, slots_count: usize) -> usize;
 
-	fn slots_for_bytes(&self, byte_count: usize) -> usize;
-
 	fn collect_bit_slots(&self, jpeg: &OwnedJpeg, start_slot: BitSlotSearchStart) -> Vec<BitSlot>;
 
 	fn read(&self, jpeg: &OwnedJpeg, slots: &[BitSlot], out: &mut [u8]) -> usize;
@@ -235,10 +233,6 @@ impl EmbeddingStrategy for LsbStrategy {
 
 	fn capacity_bytes(&self, slot_count: usize) -> usize {
 		lsb_capacity_bytes(slot_count, 1)
-	}
-
-	fn slots_for_bytes(&self, byte_count: usize) -> usize {
-		lsb_slots_for_bytes(byte_count, 1)
 	}
 
 	fn collect_bit_slots(&self, jpeg: &OwnedJpeg, start_slot: BitSlotSearchStart) -> Vec<BitSlot> {
@@ -265,10 +259,6 @@ impl EmbeddingStrategy for Lsb50Strategy {
 		lsb_capacity_bytes(slot_count, 2)
 	}
 
-	fn slots_for_bytes(&self, byte_count: usize) -> usize {
-		lsb_slots_for_bytes(byte_count, 2)
-	}
-
 	fn collect_bit_slots(&self, jpeg: &OwnedJpeg, start_slot: BitSlotSearchStart) -> Vec<BitSlot> {
 		collect_lsb_bit_slots(jpeg, start_slot, 0)
 	}
@@ -284,10 +274,6 @@ impl EmbeddingStrategy for Lsb50Strategy {
 
 fn lsb_capacity_bytes(slot_count: usize, stride: usize) -> usize {
 	slot_count / (8 * stride)
-}
-
-fn lsb_slots_for_bytes(byte_count: usize, stride: usize) -> usize {
-	byte_count * 8 * stride
 }
 
 fn read_lsb_with_stride(jpeg: &OwnedJpeg, slots: &[BitSlot], out: &mut [u8], stride: usize) -> usize {

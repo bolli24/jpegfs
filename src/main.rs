@@ -339,7 +339,7 @@ fn run_block_stat(input_file: &Path, strategy: EmbeddingStrategyId) -> anyhow::R
 	println!("File: {}", input_file.display());
 	println!("Strategy: {strategy}");
 	println!("Total embeddable slots: {}", embedding_session.bit_slots().len());
-	println!("Capacity: {} bytes", embedding_session.remaining_bytes());
+	println!("Capacity: {} bytes", embedding_session.capacity());
 
 	const COMP_NAMES: [&str; 3] = ["Y", "Cb", "Cr"];
 	const MAX_BAR_LENGTH: usize = 40;
@@ -910,7 +910,7 @@ fn simulate_one(
 
 	session.write_strategy_marker_lsb(u8::from(strategy));
 	let mut embedding_session = session.into_embedding_session(strategy, [0u8; 32]);
-	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.remaining_bytes();
+	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.capacity();
 	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity)
 		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
 	let payload_embed_len = embed_len.saturating_sub(STRATEGY_MARKER_SIZE);
@@ -921,7 +921,7 @@ fn simulate_one(
 		Some(s) => rand::rngs::StdRng::seed_from_u64(s).fill_bytes(&mut random_bytes),
 	}
 	embedding_session
-		.write_data(&random_bytes)
+		.write(&random_bytes)
 		.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;
 	let output_bytes = embedding_session
 		.to_jpeg_bytes()

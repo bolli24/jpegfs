@@ -31,14 +31,11 @@ pub struct EmbeddingSession {
 	jpeg: JpegSession,
 	strategy: Box<dyn EmbeddingStrategy>,
 	bit_slots: Vec<BitSlot>,
-	cursor_bytes: usize,
 }
 
 impl EmbeddingSession {
-	pub fn remaining_bytes(&self) -> usize {
-		self.strategy
-			.capacity_bytes(self.data_slot_count())
-			.saturating_sub(self.cursor_bytes)
+	pub fn capacity(&self) -> usize {
+		self.strategy.capacity_bytes(self.data_slot_count())
 	}
 
 	pub fn data_slot_count(&self) -> usize {
@@ -49,38 +46,34 @@ impl EmbeddingSession {
 		&self.bit_slots
 	}
 
-	pub fn read_data(&mut self, len: usize) -> Result<Vec<u8>, JpegFileError> {
-		if len > self.remaining_bytes() {
+	/// Read len bytes from the beginning
+	pub fn read(&self, len: usize) -> Result<Vec<u8>, JpegFileError> {
+		let capacity = self.capacity();
+		if len > capacity {
 			return Err(JpegFileError::ReadOutOfCapacity {
 				requested_bytes: len,
-				available_bytes: self.remaining_bytes(),
+				available_bytes: capacity,
 			});
 		}
 
 		let mut out = vec![0u8; len];
-		let slot_offset = self.strategy.slots_for_bytes(self.cursor_bytes);
-		let read = self
-			.strategy
-			.read(&self.jpeg.owned_jpeg, &self.bit_slots[slot_offset..], &mut out);
+		let read = self.strategy.read(&self.jpeg.owned_jpeg, &self.bit_slots, &mut out);
 		debug_assert_eq!(read, len);
-		self.cursor_bytes += read;
 		Ok(out)
 	}
 
-	pub fn write_data(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
-		if data.len() > self.remaining_bytes() {
+	/// Write data bytes to the beginning
+	pub fn write(&mut self, data: &[u8]) -> Result<(), JpegFileError> {
+		let capacity = self.capacity();
+		if data.len() > capacity {
 			return Err(JpegFileError::WriteOutOfCapacity {
 				requested_bytes: data.len(),
-				available_bytes: self.remaining_bytes(),
+				available_bytes: capacity,
 			});
 		}
 
-		let slot_offset = self.strategy.slots_for_bytes(self.cursor_bytes);
-		let written = self
-			.strategy
-			.write(&mut self.jpeg.owned_jpeg, &self.bit_slots[slot_offset..], data);
+		let written = self.strategy.write(&mut self.jpeg.owned_jpeg, &self.bit_slots, data);
 		debug_assert_eq!(written, data.len());
-		self.cursor_bytes += written;
 		Ok(())
 	}
 
@@ -138,7 +131,6 @@ impl JpegSession {
 			bit_slots: strategy.collect_bit_slots(&self.owned_jpeg, self.embed_search_start),
 			jpeg: self,
 			strategy,
-			cursor_bytes: 0,
 		}
 	}
 

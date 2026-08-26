@@ -7,10 +7,11 @@ use jpegfs::jpeg_file::JpegFileError;
 use jpegfs::strategy::EmbeddingStrategyId;
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|plaintext: Vec<u8>| {
+fuzz_target!(|input: (Vec<u8>, EmbeddingStrategyId)| {
+	let (plaintext, strategy) = input;
 	let key = common::key();
 
-	let new_jpeg = match write_encrypted_with_key(common::TEMPLATE_JPEG, key, &plaintext, EmbeddingStrategyId::Lsb) {
+	let new_jpeg = match write_encrypted_with_key(common::TEMPLATE_JPEG, key, &plaintext, strategy) {
 		Ok(j) => j,
 		// Plaintext too large for this cover image — not a bug.
 		Err(CryptoError::JpegFile(JpegFileError::WriteOutOfCapacity { .. })) => return,

@@ -42,10 +42,6 @@ impl MatrixMode {
 	pub fn capacity_bytes(self, usable_coefficients: usize) -> usize {
 		(usable_coefficients / self.n * self.k) / 8
 	}
-
-	pub fn slots_for_bytes(self, byte_count: usize) -> usize {
-		(byte_count * 8).div_ceil(self.k) * self.n
-	}
 }
 
 pub struct MatrixStrategy(pub MatrixMode, pub [u8; 32]);
@@ -99,10 +95,6 @@ impl EmbeddingStrategy for MatrixStrategy {
 
 	fn capacity_bytes(&self, slots_count: usize) -> usize {
 		self.0.capacity_bytes(slots_count)
-	}
-
-	fn slots_for_bytes(&self, byte_count: usize) -> usize {
-		self.0.slots_for_bytes(byte_count)
 	}
 
 	fn read(&self, jpeg: &OwnedJpeg, slots: &[BitSlot], out: &mut [u8]) -> usize {
@@ -334,12 +326,12 @@ mod test {
 			] {
 				let session = JpegSession::new(image_bytes.to_vec()).unwrap();
 				let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
-				embedding_session.write_data(payload).unwrap();
+				embedding_session.write(payload).unwrap();
 				let encoded = embedding_session.to_jpeg_bytes().unwrap();
 
 				let session = JpegSession::new(encoded).unwrap();
-				let mut embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
-				let decoded = embedding_session.read_data(payload.len()).unwrap();
+				let embedding_session = session.into_embedding_session(strategy, [7u8; 32]);
+				let decoded = embedding_session.read(payload.len()).unwrap();
 
 				assert_eq!(
 					decoded, payload,

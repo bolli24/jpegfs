@@ -3,8 +3,10 @@ use std::path::Path;
 use std::{fs, io};
 
 use argon2::Argon2;
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -20,31 +22,30 @@ pub const ARGON2_T_COST: u32 = 2;
 /// Argon2id parallelism.
 pub const ARGON2_P_COST: u32 = 1;
 
-/// Plaintext of the encrypted header: the per-write data nonce and the payload length.
-/// Stored only as AEAD ciphertext - never in plaintext in the JPEG.
+/// Public per-write nonce and masked little-endian payload length.
+/// Authenticated as payload AAD; untrusted until payload verification succeeds.
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
-struct EncryptedHeaderPlaintext {
+struct Header {
 	nonce_data: [u8; 12],
-	data_len: u32,
+	masked_data_len: [u8; 4],
 }
 
-/// Size of the encrypted header: [`EncryptedHeaderPlaintext`] + 16-byte AEAD tag.
-const ENCRYPTED_HEADER_SIZE: usize = size_of::<EncryptedHeaderPlaintext>() + 16;
+const HEADER_SIZE: usize = size_of::<Header>();
 
 pub const STRATEGY_MARKER_SIZE: usize = size_of::<u8>();
 pub const STRATEGY_MARKER_SLOTS: usize = STRATEGY_MARKER_SIZE * 8;
 const STRATEGY_MARKER_MASK_LABEL: &[u8] = b"jpegfs strategy marker mask v1";
 
 /// Total bytes added by the encryption layer to any plaintext written into a JPEG.
-/// Consists of the 1-byte embedding-strategy marker, the 32-byte encrypted header,
+/// Consists of the 1-byte embedding-strategy marker, the 16-byte header,
 /// and the 16-byte AEAD tag on the payload.
-pub const CRYPTO_OVERHEAD: usize = STRATEGY_MARKER_SIZE + ENCRYPTED_HEADER_SIZE + 16;
-const _: () = assert!(CRYPTO_OVERHEAD == 49);
+pub const CRYPTO_OVERHEAD: usize = STRATEGY_MARKER_SIZE + HEADER_SIZE + 16;
+const _: () = assert!(CRYPTO_OVERHEAD == 33);
 
-const HEADER_NONCE_LABEL: &[u8] = b"jpegfs header nonce v1";
+const LENGTH_MASK_LABEL: &[u8] = b"jpegfs length masking v1";
 
-const _: () = assert!(size_of::<EncryptedHeaderPlaintext>() == 16);
+const _: () = assert!(HEADER_SIZE == 16);
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -58,6 +59,8 @@ pub enum CryptoError {
 	Io(#[from] io::Error),
 	#[error("AEAD encryption/decryption failed")]
 	Aead,
+	#[error("payload length exceeds the u32 format limit")]
+	PayloadTooLarge,
 	#[error("unsupported embedding strategy id {id}")]
 	UnsupportedEmbeddingStrategy { id: u8 },
 }
@@ -92,12 +95,19 @@ pub fn derive_key_for_jpeg(jpeg_data: &[u8], passphrase: &str) -> Result<[u8; 32
 	Ok(key)
 }
 
-/// Derives a 12-byte nonce by hashing the key with a domain label.
-fn derive_nonce(key: &[u8; 32], label: &[u8]) -> [u8; 12] {
-	let mut h = Sha256::new();
-	h.update(key);
-	h.update(label);
-	h.finalize()[..12].try_into().unwrap()
+/// XOR is symmetric: apply to either the encoded length or its masked bytes.
+fn mask_data_len(key: &[u8; 32], nonce: &[u8; 12], mut bytes: [u8; 4]) -> [u8; 4] {
+	let mut masking_key = [0u8; 32];
+	Hkdf::<Sha256>::new(None, key)
+		.expand(LENGTH_MASK_LABEL, &mut masking_key)
+		.expect("32 bytes is a valid HKDF-SHA256 output length");
+	let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&masking_key).expect("HMAC accepts a 32-byte key");
+	mac.update(nonce);
+	let mask = mac.finalize().into_bytes();
+	for (byte, mask_byte) in bytes.iter_mut().zip(mask.iter()) {
+		*byte ^= mask_byte;
+	}
+	bytes
 }
 
 fn derive_strategy_marker_mask(key: &[u8; 32]) -> u8 {
@@ -119,11 +129,11 @@ fn decode_strategy_marker(key: &[u8; 32], encoded: u8) -> Result<EmbeddingStrate
 
 /// Encrypts `plaintext` and embeds the ciphertext into `jpeg_data`
 ///
-/// Nothing written into the JPEG is in plaintext. Layout:
+/// Layout (incompatible with the former separately encrypted header):
 /// ```text
 /// [ embedding strategy marker : 1 byte ]
-/// [ AEAD(key, nonce_h, rand_nonce_data[12] || len_u32[4]) : 32 bytes ]
-/// [ AEAD(key, rand_nonce_data, plaintext)                 : len + 16 bytes ]
+/// [ header = rand_nonce_data[12] || masked_len_le[4] : 16 bytes ]
+/// [ AEAD(key, rand_nonce_data, plaintext, AAD=header) : len + 16 bytes ]
 /// ```
 pub fn write_encrypted_with_key(
 	jpeg_data: &[u8],
@@ -131,27 +141,28 @@ pub fn write_encrypted_with_key(
 	plaintext: &[u8],
 	embedding_strategy_id: EmbeddingStrategyId,
 ) -> Result<Vec<u8>, CryptoError> {
-	let nonce_header = derive_nonce(key, HEADER_NONCE_LABEL);
+	let data_len = u32::try_from(plaintext.len()).map_err(|_| CryptoError::PayloadTooLarge)?;
 	let nonce_data: [u8; 12] = rand::random();
 
 	let cipher = ChaCha20Poly1305::new(key.into());
 
-	// Encrypt header: random data nonce + payload length.
-	let header_plaintext = EncryptedHeaderPlaintext {
+	let header = Header {
 		nonce_data,
-		data_len: plaintext.len() as u32,
+		masked_data_len: mask_data_len(key, &nonce_data, data_len.to_le_bytes()),
 	};
-	let encrypted_header = cipher
-		.encrypt(Nonce::from_slice(&nonce_header), header_plaintext.as_bytes())
-		.map_err(|_| CryptoError::Aead)?;
-	debug_assert_eq!(encrypted_header.len(), ENCRYPTED_HEADER_SIZE);
 
-	// Encrypt payload.
+	// Authenticate the exact stored header along with the encrypted payload.
 	let encrypted_data = cipher
-		.encrypt(Nonce::from_slice(&nonce_data), plaintext)
+		.encrypt(
+			Nonce::from_slice(&nonce_data),
+			Payload {
+				msg: plaintext,
+				aad: header.as_bytes(),
+			},
+		)
 		.map_err(|_| CryptoError::Aead)?;
 
-	let mut ciphertext = encrypted_header;
+	let mut ciphertext = header.as_bytes().to_vec();
 	ciphertext.extend_from_slice(&encrypted_data);
 
 	let mut session = JpegSession::new(jpeg_data.to_vec())?;
@@ -166,7 +177,6 @@ pub fn read_encrypted_with_key_and_strategy(
 	jpeg_data: &[u8],
 	key: &[u8; 32],
 ) -> Result<(Vec<u8>, EmbeddingStrategyId), CryptoError> {
-	let nonce_h = derive_nonce(key, HEADER_NONCE_LABEL);
 	let cipher = ChaCha20Poly1305::new(key.into());
 
 	let session = JpegSession::new(jpeg_data.to_vec())?;
@@ -174,20 +184,26 @@ pub fn read_encrypted_with_key_and_strategy(
 	let strategy_id = decode_strategy_marker(key, strategy_marker)?;
 	let embedding_session = session.into_embedding_session(strategy_id, *key);
 
-	// Read and decrypt header to recover the data nonce and payload length.
-	let encrypted_header = embedding_session.read(ENCRYPTED_HEADER_SIZE)?;
-	let header_plaintext_bytes = cipher
-		.decrypt(Nonce::from_slice(&nonce_h), encrypted_header.as_ref())
-		.map_err(|_| CryptoError::Aead)?;
-
-	let header_plaintext = EncryptedHeaderPlaintext::read_from_bytes(&header_plaintext_bytes).expect("size is checked");
-
-	// Read the complete ciphertext from the beginning, then slice off the header.
-	let encrypted_data_len = header_plaintext.data_len as usize + 16;
-	let ciphertext = embedding_session.read(ENCRYPTED_HEADER_SIZE + encrypted_data_len)?;
-	let encrypted_data = &ciphertext[ENCRYPTED_HEADER_SIZE..];
+	let header_bytes = embedding_session.read(HEADER_SIZE)?;
+	let header = Header::read_from_bytes(&header_bytes).expect("size is checked");
+	let data_len = u32::from_le_bytes(mask_data_len(key, &header.nonce_data, header.masked_data_len));
+	// The header is not authenticated yet. Reject impossible lengths before allocation,
+	// using the same error as authentication failure (including for wrong keys).
+	let total_len = usize::try_from(data_len)
+		.ok()
+		.and_then(|len| len.checked_add(HEADER_SIZE + 16))
+		.filter(|&len| len <= embedding_session.capacity())
+		.ok_or(CryptoError::Aead)?;
+	let ciphertext = embedding_session.read(total_len)?;
+	let encrypted_data = &ciphertext[HEADER_SIZE..];
 	let plaintext = cipher
-		.decrypt(Nonce::from_slice(&header_plaintext.nonce_data), encrypted_data)
+		.decrypt(
+			Nonce::from_slice(&header.nonce_data),
+			Payload {
+				msg: encrypted_data,
+				aad: &header_bytes,
+			},
+		)
 		.map_err(|_| CryptoError::Aead)?;
 	Ok((plaintext, strategy_id))
 }
@@ -227,6 +243,79 @@ mod tests {
 	const GRAYSCALE_JPEG: &[u8] = include_bytes!("../test/CRW_2614_grayscale_384x287.jpg");
 	const TINY_JPEG: &[u8] = include_bytes!("../fuzz/fixtures/tiny_crw_2609_16x8.jpg");
 	const OTHER_JPEG: &[u8] = include_bytes!("../test/CRW_2614_(Elsterflutbecken).jpg");
+
+	#[test]
+	fn empty_payload_roundtrip_all_strategies() {
+		for strategy in EmbeddingStrategyId::ALL {
+			let encoded = write_encrypted_with_key(GRAYSCALE_JPEG, &[42; 32], b"", strategy).unwrap();
+			assert!(read_encrypted_with_key(&encoded, &[42; 32]).unwrap().is_empty());
+		}
+	}
+
+	#[test]
+	fn tampered_header_and_payload_are_rejected() {
+		let key = [42; 32];
+		let data = b"authenticated payload";
+		for strategy in EmbeddingStrategyId::ALL {
+			let encoded = write_encrypted_with_key(GRAYSCALE_JPEG, &key, data, strategy).unwrap();
+			// Flip each nonce/length byte, a payload byte, and a tag byte.
+			for offset in (0..HEADER_SIZE).chain([HEADER_SIZE, HEADER_SIZE + data.len()]) {
+				let mut session = JpegSession::new(encoded.clone())
+					.unwrap()
+					.into_embedding_session(strategy, key);
+				let mut bytes = session.read(HEADER_SIZE + data.len() + 16).unwrap();
+				bytes[offset] ^= 1;
+				session.write(&bytes).unwrap();
+				let tampered = session.to_jpeg_bytes().unwrap();
+				assert!(
+					matches!(read_encrypted_with_key(&tampered, &key), Err(CryptoError::Aead)),
+					"strategy {strategy}, offset {offset}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn oversized_header_length_is_rejected() {
+		let key = [42; 32];
+		let header = Header {
+			nonce_data: [0; 12],
+			masked_data_len: mask_data_len(&key, &[0; 12], u32::MAX.to_le_bytes()),
+		};
+		let mut session = JpegSession::new(GRAYSCALE_JPEG.to_vec()).unwrap();
+		session.write_strategy_marker_lsb(encode_strategy_marker(&key, EmbeddingStrategyId::Lsb));
+		let mut session = session.into_embedding_session(EmbeddingStrategyId::Lsb, key);
+		session.write(header.as_bytes()).unwrap();
+		assert!(matches!(
+			read_encrypted_with_key(&session.to_jpeg_bytes().unwrap(), &key),
+			Err(CryptoError::Aead)
+		));
+	}
+
+	#[test]
+	fn payload_tag_must_authenticate_stored_header() {
+		let key = [42; 32];
+		let data = b"payload";
+		let header = Header {
+			nonce_data: [0; 12],
+			masked_data_len: mask_data_len(&key, &[0; 12], (data.len() as u32).to_le_bytes()),
+		};
+		let cipher = ChaCha20Poly1305::new((&key).into());
+		// Valid nonce, length, and payload tag, but missing the header binding.
+		let encrypted = cipher
+			.encrypt(Nonce::from_slice(&header.nonce_data), data.as_slice())
+			.unwrap();
+		let mut bytes = header.as_bytes().to_vec();
+		bytes.extend_from_slice(&encrypted);
+		let mut session = JpegSession::new(GRAYSCALE_JPEG.to_vec()).unwrap();
+		session.write_strategy_marker_lsb(encode_strategy_marker(&key, EmbeddingStrategyId::Lsb));
+		let mut session = session.into_embedding_session(EmbeddingStrategyId::Lsb, key);
+		session.write(&bytes).unwrap();
+		assert!(matches!(
+			read_encrypted_with_key(&session.to_jpeg_bytes().unwrap(), &key),
+			Err(CryptoError::Aead)
+		));
+	}
 
 	#[test]
 	fn grayscale_encrypt_decrypt_roundtrip_all_strategies() {

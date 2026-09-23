@@ -107,7 +107,8 @@ fn derive_strategy_marker_mask(key: &[u8; 32]) -> u8 {
 	h.finalize()[0]
 }
 
-fn encode_strategy_marker(key: &[u8; 32], strategy_id: EmbeddingStrategyId) -> u8 {
+/// Masks the strategy ID with the embedding key for storage in the JPEG.
+pub fn encode_strategy_marker(key: &[u8; 32], strategy_id: EmbeddingStrategyId) -> u8 {
 	(u8::from(strategy_id)) ^ derive_strategy_marker_mask(key)
 }
 
@@ -120,7 +121,7 @@ fn decode_strategy_marker(key: &[u8; 32], encoded: u8) -> Result<EmbeddingStrate
 ///
 /// Nothing written into the JPEG is in plaintext. Layout:
 /// ```text
-/// [ embedding strategy marker : 8 bytes]
+/// [ embedding strategy marker : 1 byte ]
 /// [ AEAD(key, nonce_h, rand_nonce_data[12] || len_u32[4]) : 32 bytes ]
 /// [ AEAD(key, rand_nonce_data, plaintext)                 : len + 16 bytes ]
 /// ```

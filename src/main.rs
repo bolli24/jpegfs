@@ -21,9 +21,9 @@ use log::{error, info, warn};
 use rayon::ThreadPool;
 use rayon::prelude::*;
 
-use jpegfs::crypto::STRATEGY_MARKER_SIZE;
 #[cfg(unix)]
 use jpegfs::crypto::{CryptoError, derive_key_for_jpeg, read_encrypted_with_key_and_strategy};
+use jpegfs::crypto::{STRATEGY_MARKER_SIZE, encode_strategy_marker};
 #[cfg(unix)]
 use jpegfs::filesystem::FileSystem;
 #[cfg(unix)]
@@ -908,18 +908,21 @@ fn simulate_one(
 	let mut session = JpegSession::new(jpeg_bytes)
 		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
 
-	session.write_strategy_marker_lsb(u8::from(strategy));
-	let mut embedding_session = session.into_embedding_session(strategy, [0u8; 32]);
+	let mut rng = match file_seed {
+		Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+		None => rand::rngs::StdRng::from_rng(&mut rand::rng()),
+	};
+	let mut embedding_key = [0u8; 32];
+	rng.fill_bytes(&mut embedding_key);
+	session.write_strategy_marker_lsb(encode_strategy_marker(&embedding_key, strategy));
+	let mut embedding_session = session.into_embedding_session(strategy, embedding_key);
 	let jpeg_capacity = STRATEGY_MARKER_SIZE + embedding_session.capacity();
 	let embed_len = JpegBlockStore::persisted_embed_len(jpeg_capacity)
 		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
 	let payload_embed_len = embed_len.saturating_sub(STRATEGY_MARKER_SIZE);
 
 	let mut random_bytes = vec![0u8; payload_embed_len];
-	match file_seed {
-		None => rand::rng().fill_bytes(&mut random_bytes),
-		Some(s) => rand::rngs::StdRng::seed_from_u64(s).fill_bytes(&mut random_bytes),
-	}
+	rng.fill_bytes(&mut random_bytes);
 	embedding_session
 		.write(&random_bytes)
 		.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;

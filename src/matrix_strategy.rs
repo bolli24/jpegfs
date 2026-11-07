@@ -13,7 +13,6 @@ use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
 
 const MATRIX_PERMUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix permutation v1";
-const MATRIX_WHITENING_SEED_LABEL: &[u8] = b"jpegfs matrix whitening v1";
 const MATRIX_MUTATION_SEED_LABEL: &[u8] = b"jpegfs matrix mutation v1";
 
 /// |   k |   n | Capacity of slots | Expected changes/group | Changes/embedded bit |
@@ -100,7 +99,6 @@ impl EmbeddingStrategy for MatrixStrategy {
 	fn read(&self, jpeg: &OwnedJpeg, slots: &[BitSlot], out: &mut [u8]) -> usize {
 		let mut extracted_byte = 0u8;
 		let mut available_extracted_bits = 0usize;
-		let mut rng = self.rng(MATRIX_WHITENING_SEED_LABEL);
 		let MatrixMode { k, n } = self.0;
 
 		let mut start_of_n = 0;
@@ -131,7 +129,6 @@ impl EmbeddingStrategy for MatrixStrategy {
 				available_extracted_bits += 1;
 
 				if available_extracted_bits == 8 {
-					extracted_byte ^= rng.random::<u8>();
 					out[read_bytes] = extracted_byte;
 					read_bytes += 1;
 					extracted_byte = 0;
@@ -152,7 +149,6 @@ impl EmbeddingStrategy for MatrixStrategy {
 		let mut available_bits_to_embed = 0;
 		let mut bytes = data.iter();
 		let mut mutation_rng = self.rng(MATRIX_MUTATION_SEED_LABEL);
-		let mut rng = self.rng(MATRIX_WHITENING_SEED_LABEL);
 		let MatrixMode { k, n } = self.0;
 
 		let mut start_of_n = 0;
@@ -170,7 +166,6 @@ impl EmbeddingStrategy for MatrixStrategy {
 						break;
 					};
 					byte_to_embed = *next_byte;
-					byte_to_embed ^= rng.random::<u8>();
 					available_bits_to_embed = 8;
 				}
 				let next_bit_to_embed = (byte_to_embed & 1) as usize;

@@ -6,31 +6,30 @@ edition = "2024"
 [dependencies]
 thiserror = "2.0"
 anyhow = "1.0"
-log = "0.4"
-arbitrary = { version = "1.4", features = ["derive"] }
+log = { version = "0.4", features = ["std"] }
+arbitrary = { version = "1.5", features = ["derive"] }
 
 arrayvec = "0.7"
 
 mozjpeg-sys = "2.2"
 libc = "0.2"
 
-argon2 = { version = "0.5", features = ["std"] }
+argon2 = { version = "0.6" }
 sha2 = "0.11"
 hkdf = "0.13"
 hmac = "0.13"
 rand = "0.10"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 
 serde = { version = "1.0", features = ["derive"] }
-postcard = { version = "1.1", features = [
+postcard = { version = "1.2", features = [
     "use-std",
     "use-crc",
 ] } # When updating it must be made sure that the binary format does not change
 crc = "3.4"
 zerocopy = { version = "0.8", features = ["derive"] }
 
-parking_lot = "0.12"
-simplelog = "0.12"
+parking_lot = "0.13"
 ctrlc = "3.5"
 ratatui = "0.30"
 crossterm = "0.29"
@@ -41,7 +40,7 @@ clap = { version = "4.6", features = ["derive"] }
 rpassword = "7"
 
 [target.'cfg(unix)'.dependencies]
-fuser = { version = "0.17", features = ["serializable"] }
+fuser = { version = "0.19", features = ["serializable"] }
 
 [dev-dependencies]
 criterion = "0.8"

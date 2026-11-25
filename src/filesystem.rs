@@ -1252,6 +1252,7 @@ impl Filesystem for FileSystem {
 		chgtime: Option<SystemTime>,
 		_bkuptime: Option<SystemTime>,
 		_flags: Option<BsdFileFlags>,
+		_kill_suid_gid: bool,
 		reply: ReplyAttr,
 	) {
 		info!("setattr(pid={}, ino={ino:?})", req.pid());
@@ -1352,7 +1353,17 @@ impl Filesystem for FileSystem {
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, rdev: u32, reply: ReplyEntry) {
+	fn mknod(
+		&self,
+		req: &Request,
+		parent: INodeNo,
+		name: &OsStr,
+		mode: u32,
+		umask: u32,
+		rdev: u32,
+		_owner: Owner,
+		reply: ReplyEntry,
+	) {
 		info!("mknod(pid={}, parent={parent:?}, name={name:?})", req.pid());
 		warn!(
 			"[Not Implemented] mknod(parent: {parent:#x?}, name: {name:?}, \
@@ -1361,13 +1372,22 @@ impl Filesystem for FileSystem {
 		reply.error(Errno::ENOSYS);
 	}
 
-	fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
+	fn mkdir(
+		&self,
+		req: &Request,
+		parent: INodeNo,
+		name: &OsStr,
+		mode: u32,
+		umask: u32,
+		owner: Owner,
+		reply: ReplyEntry,
+	) {
 		info!(
 			"mkdir(pid={}, parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})",
 			req.pid()
 		);
 		let mut state = self.state.write();
-		match state.op_mkdir(parent, name, mode, umask, req.uid(), req.gid()) {
+		match state.op_mkdir(parent, name, mode, umask, owner.uid, owner.gid) {
 			Ok((ino, inode)) => reply.entry(&FUSE_TTL, &Inode::to_file_attr(ino, &inode), Generation(0)),
 			Err(err) => reply.error(err),
 		}
@@ -1391,12 +1411,22 @@ impl Filesystem for FileSystem {
 		}
 	}
 
-	fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+	fn symlink(
+		&self,
+		req: &Request,
+		parent: INodeNo,
+		link_name: &OsStr,
+		target: &Path,
+		owner: Owner,
+		reply: ReplyEntry,
+	) {
 		info!(
-			"symlink(pid={}, parent={parent:?}, link_name={link_name:?}, target={target:?})",
+			"symlink(pid={}, parent={parent:?}, link_name={link_name:?}, target={target:?}, owner={owner:?})",
 			req.pid()
 		);
-		warn!("[Not Implemented] symlink(parent: {parent:#x?}, link_name: {link_name:?}, target: {target:?})",);
+		warn!(
+			"[Not Implemented] symlink(parent: {parent:#x?}, link_name: {link_name:?}, target: {target:?}, owner={owner:?})",
+		);
 		reply.error(Errno::EPERM);
 	}
 
@@ -1408,10 +1438,11 @@ impl Filesystem for FileSystem {
 		newparent: INodeNo,
 		newname: &OsStr,
 		flags: RenameFlags,
+		owner: Option<Owner>,
 		reply: ReplyEmpty,
 	) {
 		info!(
-			"rename(pid={}, parent={parent:?}, name={name:?}, newparent={newparent:?}, newname={newname:?}, flags={flags:?})",
+			"rename(pid={}, parent={parent:?}, name={name:?}, newparent={newparent:?}, newname={newname:?}, flags={flags:?}, owner={owner:?})",
 			req.pid()
 		);
 		let mut state = self.state.write();
@@ -1430,7 +1461,7 @@ impl Filesystem for FileSystem {
 		reply.error(Errno::EPERM);
 	}
 
-	fn open(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+	fn open(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, _kill_suid_gid: bool, reply: ReplyOpen) {
 		info!("open(pid={}, ino={ino:?})", req.pid());
 		let mut state = self.state.write();
 		match state.op_open(ino) {
@@ -1632,14 +1663,16 @@ impl Filesystem for FileSystem {
 		mode: u32,
 		umask: u32,
 		_flags: i32,
+		_kill_suid_gid: bool,
+		owner: Owner,
 		reply: ReplyCreate,
 	) {
 		info!(
-			"create(pid={}, parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o})",
+			"create(pid={}, parent={parent:?}, name={name:?}, mode={mode:#o}, umask={umask:#o}, owner={owner:?})",
 			req.pid()
 		);
 		let mut state = self.state.write();
-		match state.op_create(parent, name, mode, umask, req.uid(), req.gid()) {
+		match state.op_create(parent, name, mode, umask, owner.uid, owner.gid) {
 			Ok((ino, new_inode, file_handle)) => reply.created(
 				&FUSE_TTL,
 				&Inode::to_file_attr(ino, &new_inode),

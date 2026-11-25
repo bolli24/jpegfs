@@ -9,8 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1.4", features = ["derive"] }
-fuser = "0.17"
+arbitrary = { version = "1.5", features = ["derive"] }
+fuser = "0.19"
 zerocopy = "0.8"
 
 [dependencies.jpegfs]

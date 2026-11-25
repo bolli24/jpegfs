@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 #[cfg(unix)]
-use fuser::{Config as FuseConfig, MountOption, spawn_mount2};
+use fuser::{Config as FuseConfig, MountOption, spawn_mount};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use rayon::ThreadPool;
@@ -237,7 +237,7 @@ fn run_mount_or_stat(cli_args: CliArgs) -> anyhow::Result<()> {
 
 	let _mount_dir_state = prepare_mount_dir(&mount_dir)?;
 
-	let session = spawn_mount2(persistence.fs.clone(), &mount_dir, &config).context("failed to mount file system")?;
+	let session = spawn_mount(persistence.fs.clone(), &mount_dir, &config).context("failed to mount file system")?;
 	let (shutdown_tx, shutdown_rx) = mpsc::channel();
 	ctrlc::set_handler(move || {
 		let _ = shutdown_tx.send(());
@@ -917,6 +917,10 @@ struct SimulateIterations {
 	size: usize,
 }
 
+impl SimulateIterations {
+	pub const SINGLE: Self = Self { count: 0, size: 1 };
+}
+
 /// `output_dir/<rel parent>/<stem>_iter<passes>.<ext>`
 fn iteration_output_path(output_dir: &Path, rel: &Path, passes: usize) -> Option<PathBuf> {
 	let mut file_name = rel.file_stem()?.to_owned();
@@ -1346,7 +1350,15 @@ mod tests {
 		std::fs::write(&input_path, TRUNCATED_SOI).expect("failed to write fixture");
 
 		let pb = indicatif::ProgressBar::hidden();
-		let result = simulate_one(&input_path, &dir, &dir, &pb, None, EmbeddingStrategyId::Lsb);
+		let result = simulate_one(
+			&input_path,
+			&dir,
+			&dir,
+			&pb,
+			None,
+			EmbeddingStrategyId::Lsb,
+			SimulateIterations::SINGLE,
+		);
 		assert!(result.is_err(), "expected an error for a truncated JPEG, got Ok");
 	}
 }

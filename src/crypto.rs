@@ -154,7 +154,7 @@ pub fn write_encrypted_with_key(
 	// Authenticate the exact stored header along with the encrypted payload.
 	let encrypted_data = cipher
 		.encrypt(
-			Nonce::from_slice(&nonce_data),
+			&Nonce::from(nonce_data),
 			Payload {
 				msg: plaintext,
 				aad: header.as_bytes(),
@@ -198,7 +198,7 @@ pub fn read_encrypted_with_key_and_strategy(
 	let encrypted_data = &ciphertext[HEADER_SIZE..];
 	let plaintext = cipher
 		.decrypt(
-			Nonce::from_slice(&header.nonce_data),
+			&Nonce::from(header.nonce_data),
 			Payload {
 				msg: encrypted_data,
 				aad: &header_bytes,
@@ -303,7 +303,7 @@ mod tests {
 		let cipher = ChaCha20Poly1305::new((&key).into());
 		// Valid nonce, length, and payload tag, but missing the header binding.
 		let encrypted = cipher
-			.encrypt(Nonce::from_slice(&header.nonce_data), data.as_slice())
+			.encrypt(&Nonce::from(header.nonce_data), data.as_slice())
 			.unwrap();
 		let mut bytes = header.as_bytes().to_vec();
 		bytes.extend_from_slice(&encrypted);

@@ -94,6 +94,14 @@ enum CliCommand {
 		seed: Option<u64>,
 		#[arg(long, default_value_t = EmbeddingStrategyId::Lsb)]
 		strategy: EmbeddingStrategyId,
+		#[arg(
+			long,
+			default_value_t = 0,
+			help = "Number of iterations; if > 0, repeatedly embed into the same file and write a snapshot `<name>_iter<n>.<ext>` after each iteration"
+		)]
+		iterations: usize,
+		#[arg(long, default_value_t = 1, help = "Number of embeds per iteration")]
+		iteration_size: usize,
 	},
 	#[command(name = "block_stat", about = "Print embeddable coefficient statistics for one JPEG")]
 	BlockStat {
@@ -175,9 +183,15 @@ fn main() -> anyhow::Result<()> {
 		skip_existing,
 		seed,
 		strategy,
+		iterations,
+		iteration_size,
 	} = cli_args.command
 	{
-		return run_simulate(&input_dir, &output_dir, skip_existing, seed, strategy);
+		let iterations = SimulateIterations {
+			count: iterations,
+			size: iteration_size,
+		};
+		return run_simulate(&input_dir, &output_dir, skip_existing, seed, strategy, iterations);
 	}
 	if let CliCommand::BlockStat { input_file, strategy } = cli_args.command {
 		return run_block_stat(&input_file, strategy);
@@ -805,7 +819,12 @@ fn run_simulate(
 	skip_existing: bool,
 	seed: Option<u64>,
 	strategy: EmbeddingStrategyId,
+	iterations: SimulateIterations,
 ) -> anyhow::Result<()> {
+	anyhow::ensure!(
+		iterations.count == 0 || iterations.size > 0,
+		"--iteration-size must be at least 1 when --iterations is set"
+	);
 	let all_paths = discover_jpeg_paths_recursive(input_dir)?;
 	std::fs::create_dir_all(output_dir)
 		.with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
@@ -815,9 +834,14 @@ fn run_simulate(
 		let remaining: Vec<PathBuf> = all_paths
 			.into_iter()
 			.filter(|p| {
+				// In iteration mode, a file counts as done only once its last snapshot exists.
 				let exists = p
 					.strip_prefix(input_dir)
-					.map(|rel| output_dir.join(rel).exists())
+					.map(|rel| match iterations.count {
+						0 => output_dir.join(rel).exists(),
+						n => iteration_output_path(output_dir, rel, n * iterations.size)
+							.is_some_and(|path| path.exists()),
+					})
 					.unwrap_or(false);
 				!exists
 			})
@@ -838,15 +862,13 @@ fn run_simulate(
 
 	let threads = configured_jpeg_threads();
 	eprintln!("[simulate] {} file(s), {threads} worker thread(s)", jpeg_paths.len());
-	let pb = jpeg_progress_bar(jpeg_paths.len());
+	// One tick per written snapshot (a single one per file when not iterating).
+	let snapshots_per_file = iterations.count.max(1);
+	let pb = jpeg_progress_bar(jpeg_paths.len() * snapshots_per_file);
 	let results: Vec<anyhow::Result<()>> = if threads == 1 {
 		jpeg_paths
 			.iter()
-			.map(|input_path| {
-				let result = simulate_one(input_path, input_dir, output_dir, &pb, seed, strategy);
-				pb.inc(1);
-				result
-			})
+			.map(|input_path| simulate_one(input_path, input_dir, output_dir, &pb, seed, strategy, iterations))
 			.collect()
 	} else {
 		let pool = rayon::ThreadPoolBuilder::new()
@@ -856,11 +878,7 @@ fn run_simulate(
 		pool.install(|| {
 			jpeg_paths
 				.par_iter()
-				.map(|input_path| {
-					let result = simulate_one(input_path, input_dir, output_dir, &pb, seed, strategy);
-					pb.inc(1);
-					result
-				})
+				.map(|input_path| simulate_one(input_path, input_dir, output_dir, &pb, seed, strategy, iterations))
 				.collect()
 		})
 	};
@@ -879,6 +897,37 @@ fn run_simulate(
 	Ok(())
 }
 
+fn fnv(base_seed: u64, bytes: &[u8]) -> u64 {
+	// FNV-1a: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
+	let path_hash = bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
+		(h ^ ((*b) as u64)).wrapping_mul(0x100000001b3)
+	});
+	base_seed ^ path_hash
+}
+
+fn file_seed(base_seed: u64, path: &Path) -> u64 {
+	fnv(base_seed, path.to_string_lossy().as_bytes())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SimulateIterations {
+	/// Number of snapshots to write; 0 means a single embed written under the original file name.
+	count: usize,
+	/// Number of embeds between snapshots.
+	size: usize,
+}
+
+/// `output_dir/<rel parent>/<stem>_iter<passes>.<ext>`
+fn iteration_output_path(output_dir: &Path, rel: &Path, passes: usize) -> Option<PathBuf> {
+	let mut file_name = rel.file_stem()?.to_owned();
+	file_name.push(format!("_iter{passes}"));
+	if let Some(ext) = rel.extension() {
+		file_name.push(".");
+		file_name.push(ext);
+	}
+	Some(output_dir.join(rel.with_file_name(file_name)))
+}
+
 fn simulate_one(
 	input_path: &Path,
 	input_dir: &Path,
@@ -886,24 +935,18 @@ fn simulate_one(
 	pb: &ProgressBar,
 	seed: Option<u64>,
 	strategy: EmbeddingStrategyId,
+	iterations: SimulateIterations,
 ) -> anyhow::Result<()> {
 	let rel = input_path
 		.strip_prefix(input_dir)
 		.with_context(|| format!("path {} is not under {}", input_path.display(), input_dir.display()))?;
-	let output_path = output_dir.join(rel);
-	if let Some(parent) = output_path.parent() {
+	if let Some(parent) = output_dir.join(rel).parent() {
 		std::fs::create_dir_all(parent).with_context(|| format!("failed to create directory {}", parent.display()))?;
 	}
 
 	let jpeg_bytes = std::fs::read(input_path).with_context(|| format!("failed to read {}", input_path.display()))?;
 
-	let file_seed: Option<u64> = seed.map(|base_seed| {
-		// FNV-1a: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
-		let path_hash = rel.to_string_lossy().bytes().fold(0xcbf29ce484222325u64, |h, b| {
-			(h ^ (b as u64)).wrapping_mul(0x100000001b3)
-		});
-		base_seed ^ path_hash
-	});
+	let file_seed: Option<u64> = seed.map(|base_seed| file_seed(base_seed, rel));
 
 	let mut session = JpegSession::new(jpeg_bytes)
 		.with_context(|| format!("failed to open JPEG session for {}", input_path.display()))?;
@@ -921,24 +964,43 @@ fn simulate_one(
 		.with_context(|| format!("failed to compute embed length for {}", input_path.display()))?;
 	let payload_embed_len = embed_len.saturating_sub(STRATEGY_MARKER_SIZE);
 
+	// (embeds before this snapshot, output path) for each file to write.
+	let snapshots: Vec<(usize, PathBuf)> = if iterations.count == 0 {
+		vec![(1, output_dir.join(rel))]
+	} else {
+		(1..=iterations.count)
+			.map(|iteration| {
+				let passes = iteration * iterations.size;
+				iteration_output_path(output_dir, rel, passes)
+					.map(|path| (iterations.size, path))
+					.with_context(|| format!("file {} does not have a file name", input_path.display()))
+			})
+			.collect::<anyhow::Result<_>>()?
+	};
+
 	let mut random_bytes = vec![0u8; payload_embed_len];
-	rng.fill_bytes(&mut random_bytes);
-	embedding_session
-		.write(&random_bytes)
-		.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;
-	let output_bytes = embedding_session
-		.to_jpeg_bytes()
-		.with_context(|| format!("failed to re-encode JPEG {}", input_path.display()))?;
+	for (passes, output_path) in snapshots {
+		for _ in 0..passes {
+			rng.fill_bytes(&mut random_bytes);
+			embedding_session
+				.write(&random_bytes)
+				.with_context(|| format!("failed to embed random bytes into {}", input_path.display()))?;
+		}
+		let output_bytes = embedding_session
+			.to_jpeg_bytes()
+			.with_context(|| format!("failed to re-encode JPEG {}", input_path.display()))?;
 
-	std::fs::write(&output_path, &output_bytes)
-		.with_context(|| format!("failed to write {}", output_path.display()))?;
+		std::fs::write(&output_path, &output_bytes)
+			.with_context(|| format!("failed to write {}", output_path.display()))?;
 
-	pb.println(format!(
-		"Simulated '{}' -> '{}' ({}KiB)",
-		input_path.display(),
-		output_path.display(),
-		output_bytes.len() / 1024
-	));
+		pb.println(format!(
+			"Simulated '{}' -> '{}' ({}KiB)",
+			input_path.display(),
+			output_path.display(),
+			output_bytes.len() / 1024
+		));
+		pb.inc(1);
+	}
 	Ok(())
 }
 

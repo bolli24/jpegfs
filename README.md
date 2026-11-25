@@ -17,6 +17,22 @@ directories are left in place.
   output
 - `block_stat <input_file>`: print embeddable coefficient statistics for one JPEG
 
+### Simulate options
+
+- `--seed <u64>`: deterministic random data (same seed + same files -> identical output)
+- `--skip-existing`: skip files whose output already exists
+- `--iterations <n>` (default `0`): repeatedly embed into the same file and write a snapshot after each iteration
+- `--iteration-size <m>` (default `1`): number of embeds per iteration
+
+With `--iterations 0`, each JPEG is embedded once and written under its original name. With `--iterations n`, each JPEG is embedded `n * m` times and a snapshot `<name>_iter<k>.<ext>` is written after every `m` embeds, where `k` is the total number of embeds so far:
+
+```bash
+# writes photo_iter10.jpg, photo_iter20.jpg, photo_iter30.jpg for each input photo.jpg
+cargo run -- simulate <input_directory> <output_directory> --iterations 3 --iteration-size 10
+```
+
+In iteration mode, `--skip-existing` only skips a file once its last snapshot exists.
+
 ## Strategies
 
 jpegfs stores the embedding strategy in each JPEG, so existing files are read with the strategy they were written with.
